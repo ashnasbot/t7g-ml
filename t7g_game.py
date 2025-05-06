@@ -1,6 +1,14 @@
+import time
+
 import gymnasium
 from gymnasium import Env
 import numpy
+from PIL import Image
+from term_image.image import AutoImage
+
+BLUE = [0, 0, 1]
+GREEN = [0, 1, 0]
+CLEAR = [0, 0, 0]
 
 
 def count_cells(observation):
@@ -16,28 +24,50 @@ def count_cells(observation):
     return blue, green
 
 
+def show_board(observation):
+    img_arr = numpy.copy(observation)
+    img_arr[img_arr == 1] = 255
+    img = Image.fromarray(img_arr, 'RGB')
+    #img = img.resize((100, 100), Image.Resampling.BOX)
+    AutoImage(img).draw(h_align="left")
+    time.sleep(0.1)
+
+
 class MicroscopeEnv(Env):
 
-    def __init__(self, cell_id):
+    def __init__(self):
         super().__init__()
         self.proc = None
         self.loaded = False
         self.games_played = 0
-        self.cell_id = cell_id
-        self.opponent_id = numpy.array([0,1, 1]).subtract(cell_id)
+        self.turn = True  # Blue = True, Green = False - Blue starts
 
         self.blue_cells = None
         self.green_cells = None
 
-        self.observation_space = gymnasium.spaces.Box(0, 1, shape=(7, 7, 3), dtype=int)
+        self.observation_space = gymnasium.spaces.Dict({
+            "board": gymnasium.spaces.Box(0, 1, shape=(7, 7, 3), dtype=bool),
+            "turn": gymnasium.spaces.Discrete(2)
+        })
         self.action_space = gymnasium.spaces.Discrete(49 * 25)
 
     def _get_obs(self):
-        return self.game_grid
+        return {
+            "board": self.game_grid,
+            "turn": self.turn
+        }
 
     def step(self, action):
         reward = 0
         terminated = False
+
+        if self.turn:
+            player_cell = BLUE
+            opponent_cell = GREEN
+        else:
+            player_cell = GREEN
+            opponent_cell = BLUE
+        t = "B:" if self.turn else "G:"
 
         piece = action // 25
         move = action % 25
@@ -49,44 +79,86 @@ class MicroscopeEnv(Env):
         to_x = from_x + mv_x
         to_y = from_y + mv_y
 
-        print(f"[{from_x}, {from_y}] => [{to_x}, {to_y}]: ", end="")
+        #print(f"{t} [{from_x}, {from_y}]=> [{to_x}, {to_y}]")
         if self.is_action_valid(action):
-            self.game_grid[from_x, from_y] = [0, 0, 0]
-            self.game_grid[from_x, from_y] = self.cell_id
+            if mv_x == 2 or mv_y == 2:
+                self.game_grid[from_y, from_x] = CLEAR
+            self.game_grid[to_y, to_x] = player_cell
 
             for x in range(3):
                 for y in range(3):
-                    if self.game_grid[to_x - 1 + x, to_y - 1 + y] == self.opponent_id:
-                        self.game_grid[to_x - 1 + x, to_y - 1 + y] == self.cell_id
+                    x2 = to_x - 1 + x
+                    y2 = to_y - 1 + y
+                    if 0 <= x2 < 7 and\
+                       0 <= y2 < 7:
+
+                        if numpy.array_equal(self.game_grid[y2, x2], opponent_cell):
+                            self.game_grid[y2, x2] = player_cell
 
         else:
-            print("==INVALID ACTION==")
-            print(f"[{from_x}, {from_y}]=> [{to_x}, {to_y}]")
-            print("==================")
             terminated = True
-            reward = -5
+            if numpy.any(self.action_masks()):
+                print("==INVALID ACTION==")
+                print(f"{t} [{from_x}, {from_y}]=> [{to_x}, {to_y}]")
+                reward = -5
+                show_board(self._get_obs()["board"])
+                print("==================")
+            # else no valid moves remain, end game
 
         observation = self._get_obs()
 
         # Round over - how did we do?
-        new_blue, new_green = count_cells(observation)
-        print(f"(B: {new_blue}, G: {new_green})", end="")
+        new_blue, new_green = count_cells(observation["board"])
 
-        if new_blue == 0:
-            # We have lost
-            reward = -5
-            self.games_played += 1
-            terminated = True
-        elif new_green == 0:
-            # We have won!
-            reward = 500
-            self.games_played += 1
-            terminated = True
+        if self.turn:
+            if new_blue == 0:
+                # We have lost
+                reward = -5
+                self.games_played += 1
+                terminated = True
+            elif new_green == 0:
+                # We have won!
+                reward = 500
+                self.games_played += 1
+                terminated = True
+            else:
+                if new_green < self.green_cells:
+                    reward += self.green_cells - new_green
+                if not terminated:
+                    reward += new_blue - self.blue_cells
         else:
-            if new_green < self.green_cells:
-                reward += self.green_cells - new_green
-            if not terminated:
-                reward += new_blue - self.blue_cells
+            # TODO reduce with above
+            if new_green == 0:
+                # We have lost
+                reward = -5
+                self.games_played += 1
+                terminated = True
+            elif new_blue == 0:
+                # We have won!
+                reward = 500
+                self.games_played += 1
+                terminated = True
+            else:
+                if new_blue < self.blue_cells:
+                    reward += self.blue_cells - new_blue
+                if not terminated:
+                    reward += new_green - self.green_cells
+
+        if new_blue + new_green == 49:
+            terminated = True
+            # board is full, see who won
+            if new_blue > new_green:
+                # Blue win
+                if self.turn:
+                    reward = 20
+                else:
+                    reward = -20
+            else:
+                # Green win
+                if self.turn:
+                    reward = -20
+                else:
+                    reward = 20
 
         if terminated:
             new_blue = 2
@@ -95,21 +167,33 @@ class MicroscopeEnv(Env):
         self.blue_cells = new_blue
         self.green_cells = new_green
 
-        termstr = f"Lost - games played: {self.games_played}" if terminated else ""
-        print(f" {reward:>2} {termstr}")
+        #show_board(observation["board"])
+        self.turn = not self.turn
+        observation["turn"] = self.turn
 
         return observation, reward, terminated, False, {}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.game_grid = numpy.zeros((7,7,3))
+        self.game_grid = numpy.zeros((7,7,3), dtype=numpy.uint8)
+        self.game_grid[0, 0] = BLUE
+        self.game_grid[0, 6] = GREEN
+        self.game_grid[6, 0] = GREEN
+        self.game_grid[6, 6] = BLUE
 
         observation = self._get_obs()
-        self.blue_cells, self.green_cells = count_cells(observation)
+        self.blue_cells, self.green_cells = count_cells(observation["board"])
+        self.turn = True  # Blue to start
+        observation["turn"] = self.turn
 
         return observation, None
 
     def is_action_valid(self, action):
+        if self.turn:
+            player_cell = BLUE
+        else:
+            player_cell = GREEN
+
         piece = action // 25
         move = action % 25
         from_x = piece % 7
@@ -119,8 +203,8 @@ class MicroscopeEnv(Env):
 
         to_x = from_x + mv_x
         to_y = from_y + mv_y
-        if self.game_grid[from_y][from_x][2]:
-            # We are trying to move a Blue piece
+        if numpy.array_equal(self.game_grid[from_y][from_x], player_cell):
+            # We are trying to move our own piece
 
             if 0 <= to_x < 7 and\
                0 <= to_y < 7:
@@ -132,12 +216,17 @@ class MicroscopeEnv(Env):
 
     def action_masks(self):
 
+        if self.turn:
+            player_cell = BLUE
+        else:
+            player_cell = GREEN
+
         actions = numpy.zeros((49, 25), dtype=numpy.int8)
 
         for y in range(len(self.game_grid)):
             for x in range(len(self.game_grid[y])):
-                if self.game_grid[y, x][2]:
-                    # We're moving a blue piece
+                if numpy.array_equal(self.game_grid[y, x], player_cell):
+                    # We're moving our own piece
                     valid_moves = numpy.zeros((25), dtype=numpy.int8)
                     for v in range(5):
                         for u in range(5):
