@@ -66,12 +66,12 @@ def count_cells(observation):
 
 class MicroscopeEnv(Env):
 
-    def __init__(self):
+    def __init__(self, scale=1.0):
         super().__init__()
         self.proc = None
         self.loaded = False
         self.games_played = 0
-        self.scale = 2.0
+        self.scale = scale
         # mouse posttions of each grid cell
         self.grid = numpy.zeros((7, 7, 2), dtype=int)
         self.safe_mouse_pos = (0, 0)
@@ -79,7 +79,10 @@ class MicroscopeEnv(Env):
         self.blue_cells = None
         self.green_cells = None
 
-        self.observation_space = gymnasium.spaces.Box(0, 1, shape=(7, 7, 3), dtype=int)
+        self.observation_space = gymnasium.spaces.Dict({
+            "board": gymnasium.spaces.Box(0, 1, shape=(7, 7, 3), dtype=bool),
+            "turn": gymnasium.spaces.Discrete(2)
+        })
         self.action_space = gymnasium.spaces.Discrete(49 * 25)
 
     def _get_obs(self):
@@ -102,7 +105,8 @@ class MicroscopeEnv(Env):
         img = ImageGrab.grab(bbox)
 
         # Trim the edge of the client due to the stupid rounded borders / cursor
-        img = img.crop((img.width//7, img.height//7, img.width-img.width//7, img.height-img.height//7))
+        # TODO: this factor changes with screen size and scaling, do better
+        img = img.crop((img.width//10, img.height//10, img.width-img.width//10, img.height-img.height//10))
 
         # The inner background isnt actually black - make it
         img_arr = numpy.array(img)
@@ -138,12 +142,15 @@ class MicroscopeEnv(Env):
 
         # At this point we either have 255 in a channel or 0
         # Convert to (0, 1, 0) or (0, 0, 1) (Green / Blue)
-        gamegrid = numpy.array(img)
+        gamegrid = numpy.array(img, dtype=numpy.uint8)
         gamegrid[gamegrid > 20] = 1
 
         self.game_grid = gamegrid
 
-        return gamegrid
+        return {
+            "board": gamegrid,
+            "turn": 1
+        }
 
     def step(self, action):
         reward = 0
@@ -185,7 +192,7 @@ class MicroscopeEnv(Env):
             observation = self._get_obs()
             time.sleep(0.1)
             observation2 = self._get_obs()
-            if numpy.array_equal(observation, observation2):
+            if numpy.array_equal(observation["board"], observation2["board"]):
                 times += 1
             else:
                 times = 0
@@ -194,7 +201,7 @@ class MicroscopeEnv(Env):
                 break
 
         # Round over - how did we do?
-        new_blue, new_green = count_cells(observation)
+        new_blue, new_green = count_cells(observation["board"])
         print(f"(B: {new_blue}, G: {new_green})", end="")
 
         if new_blue == 0:
@@ -326,12 +333,12 @@ class MicroscopeEnv(Env):
 
             # Put cursor back to end of screen
             # TODO calc this properly
-            self.safe_mouse_pos = (pos[0] // 2 + 8, pos[1] //2 +8)
+            self.safe_mouse_pos = (int(pos[0] // self.scale + 8), int(pos[1] // self.scale + 8))
             win32api.SetCursorPos(self.safe_mouse_pos)
             self.loaded = True
 
         observation = self._get_obs()
-        self.blue_cells, self.green_cells = count_cells(observation)
+        self.blue_cells, self.green_cells = count_cells(observation["board"])
 
         return observation, None
 
