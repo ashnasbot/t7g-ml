@@ -28,7 +28,6 @@ def show_board(observation):
     img_arr = numpy.copy(observation)
     img_arr[img_arr == 1] = 255
     img = Image.fromarray(img_arr, 'RGB')
-    #img = img.resize((100, 100), Image.Resampling.BOX)
     AutoImage(img).draw(h_align="left")
     time.sleep(0.1)
 
@@ -79,7 +78,6 @@ class MicroscopeEnv(Env):
         to_x = from_x + mv_x
         to_y = from_y + mv_y
 
-        #print(f"{t} [{from_x}, {from_y}]=> [{to_x}, {to_y}]")
         if self.is_action_valid(action):
             if mv_x == 2 or mv_y == 2:
                 self.game_grid[from_y, from_x] = CLEAR
@@ -167,7 +165,7 @@ class MicroscopeEnv(Env):
         self.blue_cells = new_blue
         self.green_cells = new_green
 
-        #show_board(observation["board"])
+        # show_board(observation["board"])
         self.turn = not self.turn
         observation["turn"] = self.turn
 
@@ -175,7 +173,7 @@ class MicroscopeEnv(Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.game_grid = numpy.zeros((7,7,3), dtype=numpy.uint8)
+        self.game_grid = numpy.zeros((7, 7, 3), dtype=numpy.uint8)
         self.game_grid[0, 0] = BLUE
         self.game_grid[0, 6] = GREEN
         self.game_grid[6, 0] = GREEN
