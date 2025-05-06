@@ -71,6 +71,7 @@ class MicroscopeEnv(Env):
         self.proc = None
         self.loaded = False
         self.games_played = 0
+        self.scale = 2.0
         # mouse posttions of each grid cell
         self.grid = numpy.zeros((7, 7, 2), dtype=int)
         self.safe_mouse_pos = (0, 0)
@@ -90,12 +91,18 @@ class MicroscopeEnv(Env):
         win32api.SetCursorPos(self.safe_mouse_pos)
 
         rect = win32gui.GetClientRect(hwnd)
+        rect = list(rect)
+        rect[0] = int(rect[0] * self.scale)
+        rect[1] = int(rect[1] * self.scale)
+        rect[2] = int(rect[2] * self.scale)
+        rect[3] = int(rect[3] * self.scale)
+        rect = tuple(rect)
         client_pos = win32gui.ClientToScreen(hwnd, rect[:2])
         bbox = (client_pos[0], client_pos[1], client_pos[0] + rect[2], client_pos[1] + rect[3])
         img = ImageGrab.grab(bbox)
 
         # Trim the edge of the client due to the stupid rounded borders / cursor
-        img = img.crop((img.width//10, img.height//10, img.width-img.width//10, img.height-img.height//10))
+        img = img.crop((img.width//7, img.height//7, img.width-img.width//7, img.height-img.height//7))
 
         # The inner background isnt actually black - make it
         img_arr = numpy.array(img)
@@ -111,6 +118,9 @@ class MicroscopeEnv(Env):
         # remove red
         red = Image.new(img.mode, img.size, (255, 0, 0))
         img = ImageChops.subtract(img, red)
+
+        im3 = ImageEnhance.Brightness(img)
+        img = im3.enhance(1.5)
 
         # crush the noise
         img = ImageOps.posterize(img, 3)
@@ -173,6 +183,7 @@ class MicroscopeEnv(Env):
         times = 0
         while True:
             observation = self._get_obs()
+            time.sleep(0.1)
             observation2 = self._get_obs()
             if numpy.array_equal(observation, observation2):
                 times += 1
@@ -270,12 +281,18 @@ class MicroscopeEnv(Env):
             # Calc the game grid
 
             rect = win32gui.GetClientRect(hwnd)
+            rect = list(rect)
+            rect[0] = int(rect[0] * self.scale)
+            rect[1] = int(rect[1] * self.scale)
+            rect[2] = int(rect[2] * self.scale)
+            rect[3] = int(rect[3] * self.scale)
+            rect = tuple(rect)
             pos = win32gui.ClientToScreen(hwnd, rect[:2])
             bbox = (pos[0], pos[1], pos[0] + rect[2], pos[1] + rect[3])
             img = ImageGrab.grab(bbox)
             # Move cursor to center to avoid trimming issues
-            cx = pos[0] + (bbox[2] - bbox[0])//2
-            cy = pos[1] + (bbox[3] - bbox[1])//2
+            cx = int((pos[0] + (bbox[2] - bbox[0])//2) // self.scale)
+            cy = int((pos[1] + (bbox[3] - bbox[1])//2) // self.scale)
             win32api.SetCursorPos((cx, cy))
 
             # Trim the edge of the client due to the stupid rounded borders
@@ -298,18 +315,18 @@ class MicroscopeEnv(Env):
 
             grid_w = grid[2] - grid[0]
             grid_h = grid[3] - grid[1]
-            cell_w = grid_w // 7
-            cell_h = grid_h // 7
+            cell_w = (grid_w // 7)
+            cell_h = (grid_h // 7)
 
             for x in range(7):
                 for y in range(7):
                     cell_x = grid[0] + (x * cell_w) + (cell_w // 2)
                     cell_y = grid[1] + (y * cell_h) + (cell_h // 2)
-                    self.grid[x][y] = (cell_x, cell_y)
+                    self.grid[x][y] = (cell_x // self.scale, cell_y//self.scale)
 
             # Put cursor back to end of screen
             # TODO calc this properly
-            self.safe_mouse_pos = (pos[0] + 8, pos[1]+8)
+            self.safe_mouse_pos = (pos[0] // 2 + 8, pos[1] //2 +8)
             win32api.SetCursorPos(self.safe_mouse_pos)
             self.loaded = True
 
