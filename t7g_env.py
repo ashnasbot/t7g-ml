@@ -9,6 +9,8 @@ import win32gui
 import win32api
 import win32con
 
+from t7g_utils import count_cells, action_to_move
+
 
 def get_game():
     toplist, winlist = [], []
@@ -46,22 +48,6 @@ def click(left_or_right, x, y, delay):
         time.sleep(0.1)
         win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, x, y, 0, 0)
     time.sleep(delay)
-
-
-def count_cells(observation):
-    b = observation.reshape(-1, 3)
-    blue = 0
-    green = 0
-    for triplet in b:
-        if triplet[2] == 1:
-            blue += 1
-        elif triplet[1] == 1:
-            green += 1
-
-    return blue, green
-
-# TODO:
-# Discover valid moves and mask
 
 
 class MicroscopeEnv(Env):
@@ -152,19 +138,8 @@ class MicroscopeEnv(Env):
             "turn": 1
         }
 
-    def step(self, action):
-        reward = 0
-        terminated = False
-
-        piece = action // 25
-        move = action % 25
-        from_x = piece % 7
-        from_y = piece // 7
-        mv_x = (move % 5) - 2
-        mv_y = (move // 5) - 2
-
-        to_x = from_x + mv_x
-        to_y = from_y + mv_y
+    def move(self, action):
+        from_x, from_y, to_x, to_y, _ = action_to_move(action)
 
         print(f"[{from_x}, {from_y}] => [{to_x}, {to_y}]: ", end="")
         if self.is_action_valid(action):
@@ -176,12 +151,18 @@ class MicroscopeEnv(Env):
             click_x, click_y = self.grid[to_x][to_y]
             click("left", click_x, click_y, 0)
             click("right", click_x, click_y, 0.1)
-        else:
-            print("==INVALID ACTION==")
-            print(f"[{from_x}, {from_y}]=> [{to_x}, {to_y}]")
-            print("==================")
-            terminated = True
-            reward = -5
+            return True
+        return False
+
+    def step(self, action):
+        reward = 0
+        terminated = False
+
+        if not self.move(action):
+            # Made an inpossible move
+            observation = self._get_obs()
+
+            return observation, 0, False, False, {}
 
         # end of turn, wait for green
         click("right", *self.grid[0, 0], 0)
@@ -190,7 +171,7 @@ class MicroscopeEnv(Env):
         times = 0
         while True:
             observation = self._get_obs()
-            time.sleep(0.1)
+            time.sleep(0.2)
             observation2 = self._get_obs()
             if numpy.array_equal(observation["board"], observation2["board"]):
                 times += 1
@@ -342,20 +323,13 @@ class MicroscopeEnv(Env):
 
         return observation, None
 
+    # TODO: refactor to utils?
     def is_action_valid(self, action):
-        piece = action // 25
-        move = action % 25
-        from_x = piece % 7
-        from_y = piece // 7
-        mv_x = (move % 5) - 2
-        mv_y = (move // 5) - 2
-
-        to_x = from_x + mv_x
-        to_y = from_y + mv_y
+        from_x, from_y, to_x, to_y, _ = action_to_move(action)
         if self.game_grid[from_y][from_x][2]:
             # We are trying to move a Blue piece
 
-            if 0 <= to_x < 7 and\
+            if 0 <= to_x < 7 and \
                0 <= to_y < 7:
 
                 if not any(self.game_grid[to_y][to_x]):
@@ -363,6 +337,7 @@ class MicroscopeEnv(Env):
                     return True
         return False
 
+    # TODO: refactor to utils?
     def action_masks(self):
 
         actions = numpy.zeros((49, 25), dtype=numpy.int8)
