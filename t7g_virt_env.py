@@ -14,25 +14,31 @@ class MicroscopeEnv(Env):
 
     def __init__(self):
         super().__init__()
-        self.proc = None
-        self.loaded = False
         self.games_played = 0
         self.turn = True  # Blue = True, Green = False - Blue starts
+        self.turns = 0
+        self.turn_limit = 50
+        # Flags
         self.masks = False
+        self.debug = False
+        self.random_start = False
+        self.cum_reward = 0
 
         self.blue_cells = None
         self.green_cells = None
 
         self.observation_space = gymnasium.spaces.Dict({
-            "board": gymnasium.spaces.Box(0, 1, shape=(7, 7, 3), dtype=bool),
-            "turn": gymnasium.spaces.Discrete(2)
+            "board": gymnasium.spaces.Box(0, 1, shape=(7, 7, 2), dtype=bool),
+            "turn": gymnasium.spaces.Discrete(2),
+            "turns": gymnasium.spaces.Discrete(self.turn_limit)
         })
         self.action_space = gymnasium.spaces.Discrete(49 * 25)
 
     def _get_obs(self):
         return {
             "board": self.game_grid,
-            "turn": self.turn
+            "turn": self.turn,
+            "turns": self.turns
         }
 
     def move(self, action):
@@ -44,6 +50,10 @@ class MicroscopeEnv(Env):
             opponent_cell = BLUE
 
         from_x, from_y, to_x, to_y, jump = action_to_move(action)
+
+        if self.debug:
+            t = "B:" if self.turn else "G:"
+            print(f"{t} [{from_x}, {from_y}]=> [{to_x}, {to_y}]")
 
         if self.is_action_valid(action):
             if jump:
@@ -59,10 +69,13 @@ class MicroscopeEnv(Env):
 
                         if numpy.array_equal(self.game_grid[y2, x2], opponent_cell):
                             self.game_grid[y2, x2] = player_cell
+            return True
+        return False
 
     def step(self, action):
         reward = 0
         terminated = False
+        truncated = False
 
         if not self.move(action):
             if self.masks:
@@ -75,11 +88,14 @@ class MicroscopeEnv(Env):
                     show_board(self._get_obs()["board"])
                     print("==================")
                 # else no valid moves remain, end game
+            # we've not made a move, don't count it
+            self.turns -= 1
+            reward = -10
 
         observation = self._get_obs()
 
         # Round over - how did we do?
-        # TODO: Evaluate in another function
+        # TODO: Evaluate in a utils function
         new_blue, new_green = count_cells(observation["board"])
 
         if self.turn:
@@ -95,50 +111,49 @@ class MicroscopeEnv(Env):
 
         if player_cells == 0:
             # We have lost
-            reward = -5
+            reward = -100
             self.games_played += 1
             terminated = True
         elif opponent_cells == 0:
             # We have won!
-            reward = 10
+            reward = 2 * (self.turn_limit - self.turns)
             self.games_played += 1
             terminated = True
         else:
             cell_diff = (
-                opponent_cells - prev_opponent_cells +
-                player_cells - prev_player_cells
+                (player_cells - prev_player_cells) -
+                (opponent_cells - prev_opponent_cells)
             )
 
-            if not terminated:
-                reward += pow(cell_diff, 2)
-
-        if new_blue + new_green == 49:
-            terminated = True
-            # board is full, see who won
-            if player_cells > opponent_cells:
-                # We win
-                reward = 5
+            if terminated:
+                reward = (player_cells - opponent_cells) * 10
             else:
-                reward = -20
+                reward += cell_diff * 2
 
-        if terminated:
-            new_blue = 2
-            new_green = 2
-
-        self.blue_cells = new_blue
-        self.green_cells = new_green
-
-        # show_board(observation["board"])
+        # Switch to the other player
         self.turn = not self.turn
         observation["turn"] = self.turn
+        self.turns += 1
+        observation["turns"] = self.turns
 
-        return observation, reward, terminated, False, {}
+        reward -= (self.turns / 7)
+        if self.debug:
+            print("Reward:", reward)
+
+        self.cum_reward += reward
+        if terminated and self.debug:
+            show_board(observation["board"])
+            print("Total reward:", self.cum_reward)
+        if self.turns >= self.turn_limit - 1:
+            truncated = True
+
+        return observation, reward, terminated, truncated, {}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.game_grid = numpy.zeros((7, 7, 3), dtype=numpy.bool)
+        self.game_grid = numpy.zeros((7, 7, 2), dtype=numpy.bool)
         pieces = [BLUE, GREEN, BLUE, GREEN]
-        if random.randint(0, 10) < 1:
+        if not self.random_start or random.randint(0, 10) < 1:
             self.game_grid[0, 0] = BLUE
             self.game_grid[0, 6] = GREEN
             self.game_grid[6, 0] = GREEN
@@ -154,6 +169,9 @@ class MicroscopeEnv(Env):
         self.blue_cells, self.green_cells = count_cells(observation["board"])
         self.turn = True  # Blue to start
         observation["turn"] = self.turn
+
+        self.cum_reward = 0
+        self.turns = 0
 
         return observation, None
 

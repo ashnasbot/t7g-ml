@@ -1,3 +1,6 @@
 __pycache__/*
 .venv/*
 *.zip
+t7g_env.py
+tblog/
+movecache.pk

@@ -2,29 +2,30 @@ import numpy
 from PIL import Image
 from term_image.image import AutoImage
 
-BLUE = [0, 0, 1]
-GREEN = [0, 1, 0]
-CLEAR = [0, 0, 0]
+BLUE = [0, 1]
+GREEN = [1, 0]
+CLEAR = [0, 0]
 
 
 def count_cells(board):
-    b = board.reshape(-1, 3)
+    b = board.reshape(-1, 2)
     blue = 0
     green = 0
-    for triplet in b:
-        if triplet[2] == 1:
+    for cell in b:
+        if numpy.array_equal(cell, BLUE):
             blue += 1
-        elif triplet[1] == 1:
+        elif numpy.array_equal(cell, GREEN):
             green += 1
 
     return blue, green
 
 
 def show_board(board):
-    img_arr = numpy.copy(board)
+    img_arr = board.astype(dtype=numpy.uint8)
+    img_arr = numpy.dstack((numpy.zeros((7, 7), dtype=numpy.uint8), img_arr))
     img_arr[img_arr == 1] = 255
     img = Image.fromarray(img_arr, 'RGB')
-    AutoImage(img).draw(h_align="left")
+    AutoImage(img).draw(h_align="left", pad_height=-6)
 
 
 def action_to_move(action):

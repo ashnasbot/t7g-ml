@@ -56,8 +56,9 @@ class MicroscopeEnv(Env):
         super().__init__()
         self.proc = None
         self.loaded = False
-        self.games_played = 0
         self.scale = scale
+        self.turns = 0
+        self.turn_limit = 50
         # mouse posttions of each grid cell
         self.grid = numpy.zeros((7, 7, 2), dtype=int)
         self.safe_mouse_pos = (0, 0)
@@ -66,8 +67,9 @@ class MicroscopeEnv(Env):
         self.green_cells = None
 
         self.observation_space = gymnasium.spaces.Dict({
-            "board": gymnasium.spaces.Box(0, 1, shape=(7, 7, 3), dtype=bool),
-            "turn": gymnasium.spaces.Discrete(2)
+            "board": gymnasium.spaces.Box(0, 1, shape=(7, 7, 2), dtype=bool),
+            "turn": gymnasium.spaces.Discrete(2),
+            "turns": gymnasium.spaces.Discrete(self.turn_limit)
         })
         self.action_space = gymnasium.spaces.Discrete(49 * 25)
 
@@ -131,11 +133,15 @@ class MicroscopeEnv(Env):
         gamegrid = numpy.array(img, dtype=numpy.uint8)
         gamegrid[gamegrid > 20] = 1
 
+        # Now slice off the red channel as it is not needed
+        gamegrid = gamegrid[:, :, 1:3]
+
         self.game_grid = gamegrid
 
         return {
             "board": gamegrid,
-            "turn": 1
+            "turn": 1,
+            "turns": self.turns
         }
 
     def move(self, action):
@@ -154,6 +160,35 @@ class MicroscopeEnv(Env):
             return True
         return False
 
+    def get_reward(self, board):
+        new_blue, new_green = count_cells(board)
+        print(f"(B: {new_blue}, G: {new_green})", end="")
+
+        terminated = False
+
+        if new_blue == 0:
+            # We have lost
+            reward = -100
+            terminated = True
+        elif new_green == 0:
+            # We have won!
+            reward = 2 * (self.turn_limit - self.turns)
+            terminated = True
+        else:
+            cell_diff = (
+                (new_blue - self.blue_cells) -
+                (new_green - self.green_cells)
+            )
+
+            reward = cell_diff * 2
+
+        reward -= (self.turns / 10)
+
+        self.blue_cells = new_blue
+        self.green_cells = new_green
+
+        return reward, terminated
+
     def step(self, action):
         reward = 0
         terminated = False
@@ -168,6 +203,7 @@ class MicroscopeEnv(Env):
         click("right", *self.grid[0, 0], 0)
 
         # Detect when it's our go again
+        # We wait for the grid to stop changing
         times = 0
         while True:
             observation = self._get_obs()
@@ -178,46 +214,21 @@ class MicroscopeEnv(Env):
             else:
                 times = 0
 
-            if times == 3:
+            if times == 4:
                 break
 
-        # Round over - how did we do?
-        new_blue, new_green = count_cells(observation["board"])
-        print(f"(B: {new_blue}, G: {new_green})", end="")
+        click("right", *self.grid[0, 0], 0)
 
-        if new_blue == 0:
-            # We have lost
-            reward = -5
-            self.games_played += 1
-            terminated = True
-        elif new_green == 0:
-            # We have won!
-            reward = 500
-            self.games_played += 1
-            terminated = True
-        else:
-            if new_green < self.green_cells:
-                if self.green_cells - new_green > 6 and new_green == 2:
-                    print("Broken, we must have lost")
-                    reward = 0
-                    terminated = True
-                    new_blue = 2
-                else:
-                    reward += self.green_cells - new_green
-            if not terminated:
-                reward += new_blue - self.blue_cells
+        # Round over - how did we do?
+        reward, terminated = self.get_reward(observation["board"])
 
         if terminated:
-            new_blue = 2
-            new_green = 2
+            print("Lost")
             for _ in range(8):
                 click("right", *self.grid[0, 0], 0)
 
-        self.blue_cells = new_blue
-        self.green_cells = new_green
-
-        termstr = f"Lost - games played: {self.games_played}" if terminated else ""
-        print(f" {reward:>2} {termstr}")
+        print(f" {reward:>2}")
+        self.turns += 1
 
         return observation, reward, terminated, False, {}
 
@@ -318,6 +329,7 @@ class MicroscopeEnv(Env):
             win32api.SetCursorPos(self.safe_mouse_pos)
             self.loaded = True
 
+        self.turns = 0
         observation = self._get_obs()
         self.blue_cells, self.green_cells = count_cells(observation["board"])
 
@@ -326,7 +338,7 @@ class MicroscopeEnv(Env):
     # TODO: refactor to utils?
     def is_action_valid(self, action):
         from_x, from_y, to_x, to_y, _ = action_to_move(action)
-        if self.game_grid[from_y][from_x][2]:
+        if self.game_grid[from_y][from_x][1]:
             # We are trying to move a Blue piece
 
             if 0 <= to_x < 7 and \
@@ -344,7 +356,7 @@ class MicroscopeEnv(Env):
 
         for y in range(len(self.game_grid)):
             for x in range(len(self.game_grid[y])):
-                if self.game_grid[y, x][2]:
+                if self.game_grid[y, x][1]:
                     # We're moving a blue piece
                     valid_moves = numpy.zeros((25), dtype=numpy.int8)
                     for v in range(5):
