@@ -195,31 +195,26 @@ class MicroscopeEnv(Env):
 
     def action_masks(self):
 
-        if self.turn:
-            player_cell = BLUE
-        else:
-            player_cell = GREEN
+        player_cell = BLUE if self.turn else GREEN
 
         actions = numpy.zeros((49, 25), dtype=numpy.bool)
 
-        for y in range(len(self.game_grid)):
-            for x in range(len(self.game_grid[y])):
-                if numpy.array_equal(self.game_grid[y, x], player_cell):
-                    # We're moving our own piece
-                    valid_moves = numpy.zeros((25), dtype=numpy.bool)
-                    for v in range(5):
-                        for u in range(5):
-                            to_x = x + u - 2
-                            to_y = y + v - 2
+        # TODO: This could be so much faster if vectorised
+        for y, x in numpy.ndindex((7, 7)):
+            if numpy.array_equal(self.game_grid[y, x], player_cell):
+                # We're moving our own piece
+                valid_moves = numpy.zeros((25), dtype=numpy.bool)
+                for u, v in numpy.ndindex((5, 5)):
+                    to_x = x + u - 2
+                    to_y = y + v - 2
 
-                            if 0 <= to_x < 7 and\
-                               0 <= to_y < 7:
-                                if not any(self.game_grid[to_y][to_x]):
-                                    valid_moves[v * 5 + u] = 1
+                    if 0 <= to_x < 7 and\
+                        0 <= to_y < 7:
+                        if not any(self.game_grid[to_y, to_x]):
+                            valid_moves[v * 5 + u] = 1
 
-                    actions[y * 7 + x] = valid_moves
+                actions[y * 7 + x] = valid_moves
 
-        actions.flags.writeable = False
         return actions.flatten()
 
     def close(self):
