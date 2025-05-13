@@ -2,22 +2,13 @@ import numpy
 from PIL import Image
 from term_image.image import AutoImage
 
-BLUE = [0, 1]
-GREEN = [1, 0]
-CLEAR = [0, 0]
+BLUE = numpy.array([0, 1], dtype=bool)
+GREEN = numpy.array([1, 0], dtype=bool)
+CLEAR = numpy.array([0, 0], dtype=bool)
 
 
 def count_cells(board):
-    b = board.reshape(-1, 2)
-    blue = 0
-    green = 0
-    for cell in b:
-        if numpy.array_equal(cell, BLUE):
-            blue += 1
-        elif numpy.array_equal(cell, GREEN):
-            green += 1
-
-    return blue, green
+    return numpy.sum(numpy.all(board == BLUE, axis=-1)), numpy.sum(numpy.all(board == GREEN, axis=-1))
 
 
 def show_board(board):

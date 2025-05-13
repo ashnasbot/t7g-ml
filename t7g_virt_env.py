@@ -60,15 +60,14 @@ class MicroscopeEnv(Env):
                 self.game_grid[from_y, from_x] = CLEAR
             self.game_grid[to_y, to_x] = player_cell
 
-            for x in range(3):
-                for y in range(3):
-                    x2 = to_x - 1 + x
-                    y2 = to_y - 1 + y
-                    if 0 <= x2 < 7 and\
-                       0 <= y2 < 7:
+            for x, y in numpy.ndindex((3, 3)):
+                x2 = to_x - 1 + x
+                y2 = to_y - 1 + y
+                if 0 <= x2 < 7 and\
+                   0 <= y2 < 7:
 
-                        if numpy.array_equal(self.game_grid[y2, x2], opponent_cell):
-                            self.game_grid[y2, x2] = player_cell
+                    if numpy.array_equal(self.game_grid[y2, x2], opponent_cell):
+                        self.game_grid[y2, x2] = player_cell
             return True
         return False
 
@@ -111,12 +110,12 @@ class MicroscopeEnv(Env):
 
         if player_cells == 0:
             # We have lost
-            reward = -100
+            reward = -abs(self.cum_reward)
             self.games_played += 1
             terminated = True
         elif opponent_cells == 0:
             # We have won!
-            reward = 2 * (self.turn_limit - self.turns)
+            reward = 50 + 8 * (self.turn_limit - self.turns)
             self.games_played += 1
             terminated = True
         else:
@@ -126,7 +125,7 @@ class MicroscopeEnv(Env):
             )
 
             if terminated:
-                reward = (player_cells - opponent_cells) * 10
+                reward = (player_cells - opponent_cells) * 4
             else:
                 reward += cell_diff * 2
 
@@ -136,7 +135,7 @@ class MicroscopeEnv(Env):
         self.turns += 1
         observation["turns"] = self.turns
 
-        reward -= (self.turns / 7)
+        reward -= (self.turns / 8)
         if self.debug:
             print("Reward:", reward)
 
@@ -197,23 +196,20 @@ class MicroscopeEnv(Env):
 
         player_cell = BLUE if self.turn else GREEN
 
-        actions = numpy.zeros((49, 25), dtype=numpy.bool)
+        actions = numpy.zeros((7, 7, 5, 5), dtype=numpy.bool)
 
         # TODO: This could be so much faster if vectorised
         for y, x in numpy.ndindex((7, 7)):
             if numpy.array_equal(self.game_grid[y, x], player_cell):
                 # We're moving our own piece
-                valid_moves = numpy.zeros((25), dtype=numpy.bool)
                 for u, v in numpy.ndindex((5, 5)):
                     to_x = x + u - 2
                     to_y = y + v - 2
 
                     if 0 <= to_x < 7 and\
-                        0 <= to_y < 7:
+                       0 <= to_y < 7:
                         if not any(self.game_grid[to_y, to_x]):
-                            valid_moves[v * 5 + u] = 1
-
-                actions[y * 7 + x] = valid_moves
+                            actions[y, x, v, u] = 1
 
         return actions.flatten()
 
