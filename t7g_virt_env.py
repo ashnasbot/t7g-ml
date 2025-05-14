@@ -92,6 +92,16 @@ class MicroscopeEnv(Env):
             reward = -10
 
         observation = self._get_obs()
+        self.turn = not self.turn
+        actions = self.action_masks()
+        if numpy.any(actions):
+            action2 = numpy.where(actions==True)[0][0]
+            self.move(action2)
+        else:
+            self.terminated = True
+        self.turn = not self.turn
+
+        observation = self._get_obs()
 
         # Round over - how did we do?
         # TODO: Evaluate in a utils function
@@ -110,7 +120,7 @@ class MicroscopeEnv(Env):
 
         if player_cells == 0:
             # We have lost
-            reward = -abs(self.cum_reward)
+            reward = -100
             self.games_played += 1
             terminated = True
         elif opponent_cells == 0:
@@ -128,6 +138,7 @@ class MicroscopeEnv(Env):
                 reward = (player_cells - opponent_cells) * 4
             else:
                 reward += cell_diff * 2
+                reward += abs(cell_diff)
 
         # Switch to the other player
         self.turn = not self.turn
@@ -135,7 +146,7 @@ class MicroscopeEnv(Env):
         self.turns += 1
         observation["turns"] = self.turns
 
-        reward -= (self.turns / 8)
+        reward -= (self.turns / 10)
         if self.debug:
             print("Reward:", reward)
 
