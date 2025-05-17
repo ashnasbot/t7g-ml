@@ -1,0 +1,7 @@
+numpy
+tqdm
+rich
+term-image
+sb3-contrib
+stable-baselines3
+tensorboard
