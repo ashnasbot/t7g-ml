@@ -375,7 +375,6 @@ int find_best_move(bool game_board[7][7][2], int depth, bool turn)
             {
                 continue;
             }
-            printf("Green: I am defeat\n");
             return i;
         }
         // There *are* no moves - usually a terminal state

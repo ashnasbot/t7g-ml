@@ -19,6 +19,19 @@ as possible.
 
 ## Trainers
 
+ TODO
+
+## Utils
 
 - `utils.py` contains any easily extractable code from the other envs, to
     reduce duplication.
+
+## C module
+`micro_3.c` contains a C impl of the alpha-beta pruning minimaxer for getting the next best green cell move.
+
+Windows:
+```
+gcc -Ofast .\micro_3.c -o .\micro3.dll --shared
+```
+This module uses a numpy array converted to bytes directly and doesnt do much in the way of error checking,
+be warned.

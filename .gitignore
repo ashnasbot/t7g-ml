@@ -6,3 +6,4 @@ tblog/
 movecache.pk
 build/*
 *.dll
+.vscode

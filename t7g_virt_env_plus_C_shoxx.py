@@ -9,7 +9,7 @@ import numpy
 
 
 from t7g_utils import (
-    calc_reward, show_board, action_to_move,
+    calc_reward, show_board, action_to_move, action_masks, is_action_valid,
     BLUE, GREEN, CLEAR
 )
 
@@ -58,7 +58,7 @@ class MicroscopeEnv(Env):
             t = "B:" if self.turn else "G:"
             print(f"{t} [{from_x}, {from_y}]=> [{to_x}, {to_y}]")
 
-        if self.is_action_valid(action):
+        if is_action_valid(self.game_grid, action, self.turn):
             if jump:
                 self.game_grid[from_y, from_x] = CLEAR
             self.game_grid[to_y, to_x] = player_cell
@@ -150,46 +150,8 @@ class MicroscopeEnv(Env):
 
         return observation, {}
 
-    def is_action_valid(self, action):
-        if self.turn:
-            player_cell = BLUE
-        else:
-            player_cell = GREEN
-
-        from_x, from_y, to_x, to_y, _ = action_to_move(action)
-        if numpy.array_equal(self.game_grid[from_y, from_x], player_cell):
-            # We are trying to move our own piece
-
-            if 0 <= to_x < 7 and\
-               0 <= to_y < 7:
-
-                if not any(self.game_grid[to_y, to_x]):
-                    # The Dest is free
-                    return True
-        return False
-
     def action_masks(self):
-
-        if self.turn:
-            player_cell = BLUE
-        else:
-            player_cell = GREEN
-
-        actions = numpy.zeros((7, 7, 5, 5), dtype=numpy.bool)
-
-        for y, x in numpy.ndindex((7, 7)):
-            if numpy.array_equal(self.game_grid[y, x], player_cell):
-                # We're moving our own piece
-                for u, v in numpy.ndindex((5, 5)):
-                    to_x = x + u - 2
-                    to_y = y + v - 2
-
-                    if 0 <= to_x < 7 and\
-                       0 <= to_y < 7:
-                        if not any(self.game_grid[to_y][to_x]):
-                            actions[y, x, v, u] = 1
-
-        return actions.flatten()
+        return action_masks(self.game_grid, self.turn)
 
     def close(self):
         pass
