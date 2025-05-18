@@ -1,10 +1,14 @@
+import ctypes
+from functools import cache
+import pathlib
 import random
 
 import gymnasium
 from gymnasium import Env
 import numpy
 
-from t7g_utils import (
+
+from util.t7g import (
     calc_reward, show_board, action_to_move, action_masks, is_action_valid,
     BLUE, GREEN, CLEAR
 )
@@ -12,22 +16,24 @@ from t7g_utils import (
 
 class MicroscopeEnv(Env):
 
-    def __init__(self, random_opponent=False):
+    def __init__(self):
         super().__init__()
-        self.games_played = 0
         self.turn = True  # Blue = True, Green = False - Blue starts
         self.turns = 0
         self.turn_limit = 100
         # Flags
-        self.masks = True
+        self.masks = False
         self.debug = False
         self.random_start = False
-        self.play_opponent = random_opponent
+
+        libname = pathlib.Path().absolute() / "micro3.dll"
+        self.scopelib = ctypes.CDLL(libname)
+        self.scopelib.find_best_move.restype = ctypes.c_int
 
         self.observation_space = gymnasium.spaces.Dict({
-            "board": gymnasium.spaces.Box(0, 1, shape=(7, 7, 2), dtype=bool),
+            "board": gymnasium.spaces.Box(0, 1, shape=(7, 7, 2), dtype=numpy.bool),
             "turn": gymnasium.spaces.Discrete(2),
-            "turns": gymnasium.spaces.Discrete(self.turn_limit)
+            "turns": gymnasium.spaces.Discrete(self.turn_limit),
         })
         self.action_space = gymnasium.spaces.Discrete(49 * 25)
 
@@ -65,8 +71,12 @@ class MicroscopeEnv(Env):
 
                     if numpy.array_equal(self.game_grid[y2, x2], opponent_cell):
                         self.game_grid[y2, x2] = player_cell
-            return True
-        return False
+        elif self.debug:
+            print("Not valid")
+
+    @cache
+    def find_best_move(self, board: bytes, depth: int, turn: bool) -> int:
+        return self.scopelib.find_best_move(board, depth, turn)
 
     def step(self, action):
         reward = 0
@@ -76,7 +86,7 @@ class MicroscopeEnv(Env):
         if not self.move(action):
             if self.masks:
                 terminated = True
-                if numpy.any(action_masks(self._get_obs()["board"], self.turn)):
+                if numpy.any(self.action_masks()):
                     print("==INVALID ACTION==")
                     # t = "B:" if self.turn else "G:"
                     # print(f"{t} [{from_x}, {from_y}]=> [{to_x}, {to_y}]")
@@ -84,34 +94,34 @@ class MicroscopeEnv(Env):
                     show_board(self._get_obs()["board"])
                     print("==================")
                 # else no valid moves remain, end game
-            # we've not made a move, don't count it
-            self.turns -= 1
-            reward = -10
+        self.turns += 1
 
         observation = self._get_obs()
 
-        if self.play_opponent:
-            self.turn = not self.turn
-            actions = action_masks(observation["board"], self.turn)
-            if numpy.any(actions):
-                action2 = numpy.where(actions == True)[0][0]  # noqa: E712
-                self.move(action2)
-                self.turns += 1
-            else:
-                # We cant play a move, the game is over
-                self.terminated = True
-            self.turn = not self.turn
+        self.turn = not self.turn
+        input = observation["board"].tobytes()
+        opponent_move = self.find_best_move(input, 3, True)
 
-            observation = self._get_obs()
+        if opponent_move != 1225:
+            if self.move(opponent_move):
+                self.turns += 1
+        else:
+            show_board(self._get_obs()["board"])
+            print("INVALID GREEEEEN")
+        self.turn = not self.turn
+
+        observation = self._get_obs()
 
         # Round over - how did we do?
         reward, terminated = calc_reward(observation["board"], self.turn)
+
         if self.debug:
             print("Reward:", reward)
+
             if terminated:
                 show_board(observation["board"])
 
-        if self.turns >= self.turn_limit - 1:
+        if self.turns >= self.turn_limit - 2:  # There are 2 turns per step
             truncated = True
 
         return observation, reward, terminated, truncated, {}
@@ -132,11 +142,16 @@ class MicroscopeEnv(Env):
                 x = p % 7
                 self.game_grid[y, x] = pieces.pop()
 
-        self.turn = True  # Blue to start
-        self.turns = 0
         observation = self._get_obs()
+        self.turn = True  # Blue to start
+        observation["turn"] = self.turn
+
+        self.turns = 0
 
         return observation, {}
+
+    def action_masks(self):
+        return action_masks(self.game_grid, self.turn)
 
     def close(self):
         pass

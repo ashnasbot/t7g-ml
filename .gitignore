@@ -7,3 +7,4 @@ movecache.pk
 build/*
 *.dll
 .vscode
+*/__pycache__/

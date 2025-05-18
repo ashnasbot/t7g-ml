@@ -1,6 +1,6 @@
 import os
 
-from t7g_env import MicroscopeEnv
+from env.env_t7g import MicroscopeEnv
 
 from sb3_contrib.ppo_mask import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks

@@ -1,4 +1,4 @@
-from t7g_virt_env_plus_C_shoxx import MicroscopeEnv
+from env.env_virt_minimax import MicroscopeEnv
 
 from sb3_contrib.ppo_mask import MaskablePPO as PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv

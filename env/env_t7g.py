@@ -10,7 +10,7 @@ import win32gui
 import win32api
 import win32con
 
-from t7g_utils import calc_reward, action_to_move, is_action_valid
+from util.t7g import calc_reward, action_to_move, is_action_valid
 
 
 def get_game():

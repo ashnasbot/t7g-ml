@@ -315,6 +315,8 @@ int find_best_move(bool game_board[7][7][2], int depth, bool turn)
 {
     bool valid_moves[7][7][5][5] = {0};
     bool colour[2];
+
+    // Non-standard GNU extension
     float res[1225] = {[0 ... 1224] = -INFINITY};
     float score;
 
