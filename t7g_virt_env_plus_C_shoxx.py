@@ -9,7 +9,7 @@ import numpy
 
 
 from t7g_utils import (
-    count_cells, show_board, action_to_move,
+    calc_reward, show_board, action_to_move,
     BLUE, GREEN, CLEAR
 )
 
@@ -113,37 +113,12 @@ class MicroscopeEnv(Env):
         observation = self._get_obs()
 
         # Round over - how did we do?
-        # TODO: Evaluate in another function
-        new_blue, new_green = count_cells(observation["board"])
-
-        if self.turn:
-            player_cells = new_blue
-            opponent_cells = new_green
-        else:
-            player_cells = new_green
-            opponent_cells = new_blue
-
-        if player_cells == 0:  # We have lost
-            reward = -100
-            terminated = True
-        elif opponent_cells == 0:  # We have won!
-            print("win!")
-            reward = 100 + 5 * (self.turn_limit - self.turns)
-            terminated = True
-        else:
-            cell_diff = player_cells - opponent_cells
-
-            if cell_diff > 0:
-                reward = 1
-            elif cell_diff < 0:
-                reward = -1
-            reward = 0
+        reward, terminated = calc_reward(observation["board"], self.turn)
 
         if self.debug:
             print("Reward:", reward)
 
-        if terminated:
-            if self.debug:
+            if terminated:
                 show_board(observation["board"])
 
         if self.turns >= self.turn_limit - 2:  # There are 2 turns per step

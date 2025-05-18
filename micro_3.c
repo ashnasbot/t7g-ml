@@ -1,3 +1,7 @@
+/*
+* A solver for the T7G 'microscope' puzzle.
+* Inspired by https://github.com/darkshoxx/Trilobyters
+*/
 #include <stdbool.h>
 #include <string.h>
 #include <sys/types.h>
@@ -14,12 +18,12 @@ bool CLEAR[2] = {0, 0};
 /*
 *   TODO:
 *       - Sort moves so that those that take are ranked higher.
+*       - Enable evaluating blue moves as well as green
 */
 
-/* Arrange the N elements of ARRAY in random order.
-   Only effective if N is much smaller than RAND_MAX;
-   if this may not be the case, use a better random
-   number generator. */
+/*
+*   Shuffle the elements of array, badly.
+*/ 
 void shuffle(int *array, size_t n)
 {
     if (n > 1) 

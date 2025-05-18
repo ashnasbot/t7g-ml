@@ -4,12 +4,13 @@ import time
 import gymnasium
 from gymnasium import Env
 import numpy
+# Imports for interacting with the Game
 from PIL import ImageGrab, Image, ImageChops, ImageEnhance, ImageOps
 import win32gui
 import win32api
 import win32con
 
-from t7g_utils import count_cells, action_to_move
+from t7g_utils import calc_reward, action_to_move, is_action_valid
 
 
 def get_game():
@@ -62,9 +63,6 @@ class MicroscopeEnv(Env):
         # mouse posttions of each grid cell
         self.grid = numpy.zeros((7, 7, 2), dtype=int)
         self.safe_mouse_pos = (0, 0)
-
-        self.blue_cells = None
-        self.green_cells = None
 
         self.observation_space = gymnasium.spaces.Dict({
             "board": gymnasium.spaces.Box(0, 1, shape=(7, 7, 2), dtype=bool),
@@ -148,7 +146,7 @@ class MicroscopeEnv(Env):
         from_x, from_y, to_x, to_y, _ = action_to_move(action)
 
         print(f"[{from_x}, {from_y}] => [{to_x}, {to_y}]: ", end="")
-        if self.is_action_valid(action):
+        if is_action_valid(self.game_grid, action, True):
 
             click_x, click_y = self.grid[from_x][from_y]
             click("left", click_x, click_y, 0)
@@ -159,35 +157,6 @@ class MicroscopeEnv(Env):
             click("right", click_x, click_y, 0.1)
             return True
         return False
-
-    def get_reward(self, board):
-        new_blue, new_green = count_cells(board)
-        print(f"(B: {new_blue}, G: {new_green})", end="")
-
-        terminated = False
-
-        if new_blue == 0:
-            # We have lost
-            reward = -100
-            terminated = True
-        elif new_green == 0:
-            # We have won!
-            reward = 2 * (self.turn_limit - self.turns)
-            terminated = True
-        else:
-            cell_diff = (
-                (new_blue - self.blue_cells) -
-                (new_green - self.green_cells)
-            )
-
-            reward = cell_diff * 2
-
-        reward -= (self.turns / 10)
-
-        self.blue_cells = new_blue
-        self.green_cells = new_green
-
-        return reward, terminated
 
     def step(self, action):
         reward = 0
@@ -201,6 +170,7 @@ class MicroscopeEnv(Env):
 
         # end of turn, wait for green
         click("right", *self.grid[0, 0], 0)
+        self.turns += 1
 
         # Detect when it's our go again
         # We wait for the grid to stop changing
@@ -218,17 +188,16 @@ class MicroscopeEnv(Env):
                 break
 
         click("right", *self.grid[0, 0], 0)
+        self.turns += 1
 
         # Round over - how did we do?
-        reward, terminated = self.get_reward(observation["board"])
+        reward, terminated = calc_reward(observation["board"], True)
+        print(f" {reward:>2}", end="")
 
         if terminated:
-            print("Lost")
+            print("- Lost")
             for _ in range(8):
                 click("right", *self.grid[0, 0], 0)
-
-        print(f" {reward:>2}")
-        self.turns += 1
 
         return observation, reward, terminated, False, {}
 
@@ -331,47 +300,8 @@ class MicroscopeEnv(Env):
 
         self.turns = 0
         observation = self._get_obs()
-        self.blue_cells, self.green_cells = count_cells(observation["board"])
 
         return observation, None
-
-    # TODO: refactor to utils?
-    def is_action_valid(self, action):
-        from_x, from_y, to_x, to_y, _ = action_to_move(action)
-        if self.game_grid[from_y][from_x][1]:
-            # We are trying to move a Blue piece
-
-            if 0 <= to_x < 7 and \
-               0 <= to_y < 7:
-
-                if not any(self.game_grid[to_y][to_x]):
-                    # The Dest is free
-                    return True
-        return False
-
-    # TODO: refactor to utils?
-    def action_masks(self):
-
-        actions = numpy.zeros((49, 25), dtype=numpy.int8)
-
-        for y in range(len(self.game_grid)):
-            for x in range(len(self.game_grid[y])):
-                if self.game_grid[y, x][1]:
-                    # We're moving a blue piece
-                    valid_moves = numpy.zeros((25), dtype=numpy.int8)
-                    for v in range(5):
-                        for u in range(5):
-                            to_x = x + u - 2
-                            to_y = y + v - 2
-
-                            if 0 <= to_x < 7 and\
-                               0 <= to_y < 7:
-                                if not any(self.game_grid[to_y][to_x]):
-                                    valid_moves[v * 5 + u] = 1
-
-                    actions[y * 7 + x] = valid_moves
-
-        return actions.flatten()
 
     def close(self):
         if self.proc:
