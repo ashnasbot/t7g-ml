@@ -1,0 +1,1 @@
+gcc -Ofast .\micro_3.c -o .\micro3.dll --shared

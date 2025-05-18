@@ -12,17 +12,18 @@ from t7g_utils import (
 
 class MicroscopeEnv(Env):
 
-    def __init__(self):
+    def __init__(self, random_opponent=False):
         super().__init__()
         self.games_played = 0
         self.turn = True  # Blue = True, Green = False - Blue starts
         self.turns = 0
         self.turn_limit = 50
         # Flags
-        self.masks = False
+        self.masks = True
         self.debug = False
         self.random_start = False
         self.cum_reward = 0
+        self.play_opponent = random_opponent
 
         self.blue_cells = None
         self.green_cells = None
@@ -86,12 +87,32 @@ class MicroscopeEnv(Env):
                     reward = -5
                     show_board(self._get_obs()["board"])
                     print("==================")
+                else:
+                    observation = self._get_obs()
+                    new_blue, new_green = count_cells(observation["board"])
+                    if new_blue > new_green:
+                        reward = 500 + 3 * self.turns
+                    reward = -500 - 3 * self.turns
+                    return observation, reward, True, False, {}
                 # else no valid moves remain, end game
             # we've not made a move, don't count it
             self.turns -= 1
             reward = -10
 
         observation = self._get_obs()
+
+        if self.play_opponent:
+            self.turn = not self.turn
+            actions = self.action_masks()
+            if numpy.any(actions):
+                action2 = numpy.where(actions == True)[0][0]  # noqa: E712
+                self.move(action2)
+                self.turns += 1
+            else:
+                self.terminated = True
+            self.turn = not self.turn
+
+            observation = self._get_obs()
 
         # Round over - how did we do?
         # TODO: Evaluate in a utils function
@@ -110,12 +131,12 @@ class MicroscopeEnv(Env):
 
         if player_cells == 0:
             # We have lost
-            reward = -abs(self.cum_reward)
+            reward = -500
             self.games_played += 1
             terminated = True
         elif opponent_cells == 0:
             # We have won!
-            reward = 50 + 8 * (self.turn_limit - self.turns)
+            reward = 500 + 4 * (self.turn_limit - self.turns)
             self.games_played += 1
             terminated = True
         else:
@@ -125,17 +146,13 @@ class MicroscopeEnv(Env):
             )
 
             if terminated:
+                # Terminated due to no moves
                 reward = (player_cells - opponent_cells) * 4
             else:
-                reward += cell_diff * 2
+                # End of round, std reward
+                reward += (cell_diff * 2) + abs(cell_diff)
 
-        # Switch to the other player
-        self.turn = not self.turn
-        observation["turn"] = self.turn
-        self.turns += 1
-        observation["turns"] = self.turns
-
-        reward -= (self.turns / 8)
+        reward -= (self.turns / 5)
         if self.debug:
             print("Reward:", reward)
 
@@ -172,7 +189,7 @@ class MicroscopeEnv(Env):
         self.cum_reward = 0
         self.turns = 0
 
-        return observation, None
+        return observation, {}
 
     def is_action_valid(self, action):
         if self.turn:
