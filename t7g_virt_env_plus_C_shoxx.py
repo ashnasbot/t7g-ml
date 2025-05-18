@@ -18,18 +18,13 @@ class MicroscopeEnv(Env):
 
     def __init__(self):
         super().__init__()
-        self.games_played = 0
         self.turn = True  # Blue = True, Green = False - Blue starts
         self.turns = 0
-        self.turn_limit = 50
+        self.turn_limit = 100
         # Flags
         self.masks = False
         self.debug = False
         self.random_start = False
-        self.cum_reward = 0
-
-        self.blue_cells = None
-        self.green_cells = None
 
         libname = pathlib.Path().absolute() / "micro3.dll"
         self.scopelib = ctypes.CDLL(libname)
@@ -99,16 +94,20 @@ class MicroscopeEnv(Env):
                     show_board(self._get_obs()["board"])
                     print("==================")
                 # else no valid moves remain, end game
+        self.turns += 1
 
         observation = self._get_obs()
 
         self.turn = not self.turn
         input = observation["board"].tobytes()
+        opponent_move = self.find_best_move(input, 3, True)
 
-        opponent_move = self.find_best_move(input, 5, False)
         if opponent_move != 1225:
-            self.move(opponent_move)
-            self.turns += 1
+            if self.move(opponent_move):
+                self.turns += 1
+        else:
+            show_board(self._get_obs()["board"])
+            print("INVALID GREEEEEN")
         self.turn = not self.turn
 
         observation = self._get_obs()
@@ -120,45 +119,32 @@ class MicroscopeEnv(Env):
         if self.turn:
             player_cells = new_blue
             opponent_cells = new_green
-            prev_player_cells = self.blue_cells
-            prev_opponent_cells = self.green_cells
         else:
             player_cells = new_green
             opponent_cells = new_blue
-            prev_player_cells = self.green_cells
-            prev_opponent_cells = self.blue_cells
 
-        if player_cells == 0:
-            # We have lost
+        if player_cells == 0:  # We have lost
             reward = -100
-            self.games_played += 1
             terminated = True
-        elif opponent_cells == 0:
-            # We have won!
-            reward = 50 + 8 * (self.turn_limit - self.turns)
-            self.games_played += 1
+        elif opponent_cells == 0:  # We have won!
+            print("win!")
+            reward = 100 + 5 * (self.turn_limit - self.turns)
             terminated = True
         else:
-            cell_diff = (
-                (player_cells - prev_player_cells) -
-                (opponent_cells - prev_opponent_cells)
-            )
+            cell_diff = player_cells - opponent_cells
 
-            if terminated:
-                reward = (player_cells - opponent_cells) * 4
-            else:
-                reward += cell_diff * 2
+            if cell_diff > 0:
+                reward = 1
+            elif cell_diff < 0:
+                reward = -1
+            reward = 0
 
         if self.debug:
             print("Reward:", reward)
 
-        reward -= (self.turns / 10)
-
-        self.turns += 1
-        self.cum_reward += reward
-        if terminated and self.debug:
-            show_board(observation["board"])
-            print("Total reward:", self.cum_reward)
+        if terminated:
+            if self.debug:
+                show_board(observation["board"])
 
         if self.turns >= self.turn_limit - 2:  # There are 2 turns per step
             truncated = True
@@ -182,14 +168,12 @@ class MicroscopeEnv(Env):
                 self.game_grid[y, x] = pieces.pop()
 
         observation = self._get_obs()
-        self.blue_cells, self.green_cells = count_cells(observation["board"])
         self.turn = True  # Blue to start
         observation["turn"] = self.turn
 
-        self.cum_reward = 0
         self.turns = 0
 
-        return observation, None
+        return observation, {}
 
     def is_action_valid(self, action):
         if self.turn:

@@ -7,15 +7,38 @@
 
 #define BOARD_SIZE 7
 
-bool valid_moves[7][7][5][5] = {0};
 bool BLUE[2] = {0, 1};
 bool GREEN[2] = {1, 0};
 bool CLEAR[2] = {0, 0};
 
 /*
+*   TODO:
+*       - Sort moves so that those that take are ranked higher.
+*/
+
+/* Arrange the N elements of ARRAY in random order.
+   Only effective if N is much smaller than RAND_MAX;
+   if this may not be the case, use a better random
+   number generator. */
+void shuffle(int *array, size_t n)
+{
+    if (n > 1) 
+    {
+        size_t i;
+        for (i = 0; i < n - 1; i++) 
+        {
+          size_t j = i + rand() / (RAND_MAX / (n - i) + 1);
+          int t = array[j];
+          array[j] = array[i];
+          array[i] = t;
+        }
+    }
+}
+
+/*
 *   Returns true if any valid action currently exists.
 */
-bool any_moves(void)
+bool any_moves(bool valid_moves[7][7][5][5])
 {
     for (int x = 0; x < 7; x++)
     {
@@ -59,7 +82,7 @@ int count_cells(bool board[7][7][2], bool colour[2])
 /*
 *   Get the current score for the given colour.
 */
-int get_score(bool board[7][7][2], bool colour[2])
+float get_score(bool board[7][7][2], bool colour[2])
 {
     bool opponent[2];
 
@@ -76,7 +99,23 @@ int get_score(bool board[7][7][2], bool colour[2])
     int player_cells = count_cells(board, colour);
     int opponent_cells = count_cells(board, opponent);
 
-    return player_cells - opponent_cells;
+    return (player_cells - opponent_cells) * 1.0f;
+}
+
+
+void print_board(bool board[7][7][2])
+{
+    printf("[");
+    for (int y = 0; y < 7; y++)
+    {
+        printf("[");
+        for (int x = 0; x < 7; x++)
+        {
+            printf("[%d,%d],", board[y][x][0], board[y][x][1]);
+        }
+        printf("]\n");
+    }
+    printf("]\n");
 }
 
 
@@ -84,9 +123,10 @@ int get_score(bool board[7][7][2], bool colour[2])
 *   Update the global valid_moves structure with the valid moves for the
 *   given board and player colour.
 */
-void update_valid_moves(bool board[7][7][2], bool colour[2])
+void get_valid_moves(bool board[7][7][2], bool colour[2], bool valid_moves[7][7][5][5])
 {
-    memset(valid_moves, 0, sizeof(valid_moves));
+
+    memset(valid_moves, 0, sizeof(bool[7][7][5][5]));
     bool *moves = (bool *)valid_moves;
 
     for (int x = 0; x < BOARD_SIZE; x++)
@@ -110,7 +150,7 @@ void update_valid_moves(bool board[7][7][2], bool colour[2])
                                 board[to_y][to_x][1] == CLEAR[1])
                             {
                                 int moveid = (25 * ((7 * y) + x)) + (5 *v) + u;
-                                moves[moveid] = 1;
+                                moves[moveid] = true;
                             }
                         }
                     }
@@ -172,29 +212,30 @@ void move(bool board[7][7][2], int action, bool colour[2])
 */
 float minimax(bool board[7][7][2], int depth, float alpha, float beta, bool max_player)
 {
-    float score = 0.0;
+    float score = 0.0f;
     int empty = 0;
     float bias = max_player ? 0.5f : -0.5f;
     bool colour[2];
 
     if (max_player)
     {
-        colour[0] = BLUE[0];
-        colour[1] = BLUE[1];
-    } else {
         colour[0] = GREEN[0];
         colour[1] = GREEN[1];
+    } else {
+        colour[0] = BLUE[0];
+        colour[1] = BLUE[1];
     }
 
     if (depth == 0)
     {
         score = get_score(board, GREEN);
-        score += bias;
-        return score;
+        //printf("score: %f\n", score);
+        return score + bias;
     }
 
-    update_valid_moves(board, colour);
-    if (!any_moves())
+    bool valid_moves[7][7][5][5] = {0};
+    get_valid_moves(board, colour, valid_moves);
+    if (!any_moves(valid_moves))
     {
         score = get_score(board, GREEN);
         empty = count_cells(board, CLEAR);
@@ -211,53 +252,51 @@ float minimax(bool board[7][7][2], int depth, float alpha, float beta, bool max_
         return score;
     }
 
-    // Need to copy here as we'll update actions inside each iteration
-    bool moves_cpy[7][7][5][5] = {0};
-    bool *moves = (bool *)moves_cpy;
-    memcpy(moves, valid_moves, sizeof(valid_moves));
+    // 1D iterable for moves where index = move id
+    bool *moves = (bool *)valid_moves;
 
     float value = 0.0f;
-    if (max_player)
+    if (max_player == true)
     {
-        value = -100.0f;
+        value = -INFINITY;
         for (int i = 0; i < 1225; i++)
         {
-            if (moves[i] == 0)
-            {
-                continue;
-            }
-            bool newboard[7][7][2];
-            memcpy(newboard, board, sizeof(newboard));
-            move(newboard, i, colour);
+            if (moves[i] == false) { continue; }
 
-            value = fmax(value, minimax(newboard, depth-1, alpha, beta, false));
-            if (value >= beta)
+            bool child[7][7][2];
+            memcpy(child, board, sizeof(child));
+            move(child, i, colour);
+
+            float eval = minimax(child, depth-1, alpha, beta, false);
+            value = fmaxf(value, eval);
+            alpha = fmaxf(alpha, eval);
+            if (beta <= alpha)
                 break;
-            alpha = fmax(alpha, value);
         }
-        return value;
     }
     else
     {
-        value = 100.0f;
+        value = INFINITY;
         for (int i = 0; i <  1225; i++)
         {
-            if (moves[i] == 0)
-            {
-                continue;
-            }
-            bool newboard[7][7][2];
-            memcpy(newboard, board, sizeof(newboard));
-            move(newboard, i, colour);
+            if (moves[i] == false) { continue; }
 
-            value = fmin(value, minimax(newboard, depth-1, alpha, beta, true));
-            if (value <= alpha)
+            bool child[7][7][2];
+            memcpy(child, board, sizeof(child));
+            move(child, i, colour);
+
+            float eval = minimax(child, depth-1, alpha, beta, true);
+            value = fminf(value, eval);
+            beta = fminf(beta, eval);
+            if (beta <= alpha)
                 break;
-            beta = fmin(beta, value);
         }
-        return value;
     }
-    return -999.0f;
+    //if (depth < 2)
+    //{
+//        printf("depth: %d, alpha: %f, beta: %f, score: %f\n", depth, alpha, beta, value);
+    //}
+    return value;
 }
 
 /*
@@ -270,38 +309,73 @@ float minimax(bool board[7][7][2], int depth, float alpha, float beta, bool max_
 */
 int find_best_move(bool game_board[7][7][2], int depth, bool turn)
 {
-    update_valid_moves(game_board, GREEN);
+    bool valid_moves[7][7][5][5] = {0};
+    bool colour[2];
+    float res[1225] = {[0 ... 1224] = -INFINITY};
+    float score;
+
+    if (turn)
+    {
+        colour[0] = GREEN[0];
+        colour[1] = GREEN[1];
+    } else {
+        colour[0] = BLUE[0];
+        colour[1] = BLUE[1];
+    }
+    get_valid_moves(game_board, colour, valid_moves);
     bool *moves = (bool *)valid_moves;
 
-    float res[1225] = {[0 ... 1224] = -200.0f};
-
+    int order[1225] = {0};
     for (int i = 0; i <  1225; i++)
+    {  
+        order[i] = i;
+    }
+    shuffle(order, 1225);
+
+    float max = -INFINITY;
+    int residx = 1225;
+    for (int j = 0; j <  1225; j++)
     {
+        int i = order[j];
         if (moves[i] == 0)
         {
             continue;
         }
-        bool newboard[7][7][2] = {0};
-        memcpy(newboard, game_board, 49*sizeof(bool)*2);
+        bool child[7][7][2] = {0};
+        memcpy(child, game_board, sizeof(child));
 
-        move(newboard, i, GREEN);
+        move(child, i, colour);
 
-        float score = minimax(game_board, depth, -100.0f, 100.0f, !turn);
+        score = minimax(child, depth-1, -INFINITY, INFINITY, !turn);
         res[i] = score;
-        if (score == 100.0f)
+
+        // Early break for winning move
+        if (score >= 50.0f)
         {
             return i;
         }
-    }
-    float max = -100.0f;
-    int residx = 1225;
-    for (int i = 0; i <  1225; i++)
-    {
-        if (res[i] > max)
+        if (score > max)
         {
-            max = res[i];
+            max = score;
             residx = i;
         }
+    }
+
+    // Every move we have probably loses, just pick something at random.
+    if (residx == 1225)
+    {
+        for (int j = 0; j <  1225; j++)
+        {
+            int i = order[j];
+            if (moves[i] == 0)
+            {
+                continue;
+            }
+            printf("Green: I am defeat\n");
+            return i;
+        }
+        // There *are* no moves - usually a terminal state
+        return -1;
     }
 
     return residx;
