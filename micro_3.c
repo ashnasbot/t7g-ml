@@ -48,11 +48,11 @@ bool any_moves(bool valid_moves[7][7][5][5])
     {
         for (int y = 0; y < 7; y++)
         {
-            for (int u = 0; u < 7; u++)
+            for (int u = 0; u < 5; u++)
             {
-                for (int v = 0; v < 7; v++)
+                for (int v = 0; v < 5; v++)
                 {
-                    if(valid_moves[y][y][v][u] != 0) {
+                    if(valid_moves[y][x][v][u] != 0) {
                         return true;
                     }
                 }
@@ -181,9 +181,11 @@ void move(bool board[7][7][2], int action, bool colour[2])
     int to_y = from_y + mv_y;
 
     if (abs(mv_x) == 2 || abs(mv_y) == 2)
+    {
         // Jump
         board[from_y][from_x][0] = CLEAR[0];
         board[from_y][from_x][1] = CLEAR[1];
+    }
     board[to_y][to_x][0] = colour[0];
     board[to_y][to_x][1] = colour[1];
 
@@ -221,39 +223,34 @@ float minimax(bool board[7][7][2], int depth, float alpha, float beta, bool max_
     float bias = max_player ? 0.5f : -0.5f;
     bool colour[2];
 
+    bool opponent_colour[2];
+    opponent_colour[0] = !score_colour[0];
+    opponent_colour[1] = !score_colour[1];
+
     if (max_player)
     {
-        colour[0] = GREEN[0];
-        colour[1] = GREEN[1];
+        colour[0] = score_colour[0];
+        colour[1] = score_colour[1];
     } else {
-        colour[0] = BLUE[0];
-        colour[1] = BLUE[1];
+        colour[0] = opponent_colour[0];
+        colour[1] = opponent_colour[1];
     }
 
+    score = get_score(board, score_colour);
     if (depth == 0)
     {
-        score = get_score(board, GREEN);
-        //printf("score: %f\n", score);
-        return score + bias;
+        score += bias;
+        return score;
     }
 
+    // Does anyone have a turn?
     bool valid_moves[7][7][5][5] = {0};
     get_valid_moves(board, colour, valid_moves);
     if (!any_moves(valid_moves))
     {
-        score = get_score(board, GREEN);
+        // Opponent may still be able to move
         empty = count_cells(board, CLEAR);
-        if (empty == 0)
-        {
-            if (score > 0)
-                score = 100.0f;
-            score = -100.0f;
-        }
-        else
-        {
-            score = score + (bias * 2 * empty);
-        }
-        return score;
+        return score - empty;
     }
 
     // 1D iterable for moves where index = move id
@@ -271,15 +268,13 @@ float minimax(bool board[7][7][2], int depth, float alpha, float beta, bool max_
             memcpy(child, board, sizeof(child));
             move(child, i, colour);
 
-            float eval = minimax(child, depth-1, alpha, beta, false);
+            float eval = minimax(child, depth-1, alpha, beta, false, score_colour);
             value = fmaxf(value, eval);
             alpha = fmaxf(alpha, eval);
             if (beta <= alpha)
                 break;
         }
-    }
-    else
-    {
+    } else {
         value = INFINITY;
         for (int i = 0; i <  1225; i++)
         {
@@ -289,18 +284,14 @@ float minimax(bool board[7][7][2], int depth, float alpha, float beta, bool max_
             memcpy(child, board, sizeof(child));
             move(child, i, colour);
 
-            float eval = minimax(child, depth-1, alpha, beta, true);
+            float eval = minimax(child, depth-1, alpha, beta, true, score_colour);
             value = fminf(value, eval);
             beta = fminf(beta, eval);
             if (beta <= alpha)
                 break;
         }
     }
-    //if (depth < 2)
-    //{
-//        printf("depth: %d, alpha: %f, beta: %f, score: %f\n", depth, alpha, beta, value);
-    //}
-    return value;
+        return value;
 }
 
 /*
@@ -311,23 +302,20 @@ float minimax(bool board[7][7][2], int depth, float alpha, float beta, bool max_
 *   may take a looong time to compute for complex boards with lots of available moves.
 *   Keep depth < 8.
 */
-int find_best_move(bool game_board[7][7][2], int depth, bool turn)
+int find_best_move(bool game_board[7][7][2], int depth, bool isPlayerTurn)
 {
     bool valid_moves[7][7][5][5] = {0};
     bool colour[2];
-
-    // Non-standard GNU extension
-    float res[1225] = {[0 ... 1224] = -INFINITY};
     float score;
 
-    if (turn)
+    if (isPlayerTurn == true)
     {
-        colour[0] = GREEN[0];
-        colour[1] = GREEN[1];
-    } else {
         colour[0] = BLUE[0];
         colour[1] = BLUE[1];
-    }
+    } else {
+        colour[0] = GREEN[0];
+        colour[1] = GREEN[1];
+        }
     get_valid_moves(game_board, colour, valid_moves);
     bool *moves = (bool *)valid_moves;
 
@@ -352,11 +340,10 @@ int find_best_move(bool game_board[7][7][2], int depth, bool turn)
 
         move(child, i, colour);
 
-        score = minimax(child, depth-1, -INFINITY, INFINITY, !turn);
-        res[i] = score;
+        score = minimax(child, depth-1, -INFINITY, INFINITY, true, colour);
 
         // Early break for winning move
-        if (score >= 50.0f)
+        if (score >= 120.0f)
         {
             return i;
         }
