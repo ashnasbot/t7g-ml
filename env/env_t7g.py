@@ -10,7 +10,7 @@ import win32gui
 import win32api
 import win32con
 
-from util.t7g import calc_reward, action_to_move, is_action_valid
+from util.t7g import calc_reward, action_to_move, is_action_valid, action_masks
 
 
 def get_game():
@@ -59,7 +59,7 @@ class MicroscopeEnv(Env):
         self.loaded = False
         self.scale = scale
         self.turns = 0
-        self.turn_limit = 50
+        self.turn_limit = 100
         # mouse posttions of each grid cell
         self.grid = numpy.zeros((7, 7, 2), dtype=int)
         self.safe_mouse_pos = (0, 0)
@@ -187,11 +187,12 @@ class MicroscopeEnv(Env):
             if times == 4:
                 break
 
+        # Round over - how did we do?
+        reward, terminated = calc_reward(observation["board"], True)
+
         click("right", *self.grid[0, 0], 0)
         self.turns += 1
 
-        # Round over - how did we do?
-        reward, terminated = calc_reward(observation["board"], True)
         print(f" {reward:>2}", end="")
 
         if terminated:
@@ -302,6 +303,9 @@ class MicroscopeEnv(Env):
         observation = self._get_obs()
 
         return observation, None
+
+    def action_masks(self):
+        return action_masks(self.game_grid, True)
 
     def close(self):
         if self.proc:

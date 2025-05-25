@@ -1,11 +1,20 @@
+import ctypes
 import numpy
+import pathlib
 from PIL import Image
 from term_image.image import AutoImage
 import numpy.typing as npt
 
+
 BLUE = numpy.array([0, 1], dtype=bool)
 GREEN = numpy.array([1, 0], dtype=bool)
 CLEAR = numpy.array([0, 0], dtype=bool)
+
+libname = pathlib.Path().absolute() / "micro3.dll"
+scopelib = ctypes.CDLL(libname)
+scopelib.find_best_move.restype = ctypes.c_int
+scopelib.minimax.restype = ctypes.c_float
+scopelib.minimax.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_bool]
 
 
 def count_cells(board):
@@ -55,20 +64,28 @@ def calc_reward(board, as_blue=True):
         player_cells = new_green
         opponent_cells = new_blue
 
+    if not numpy.any(action_masks(board, as_blue)) and \
+           numpy.any(action_masks(board, not as_blue)):
+        # The game is over neither player can move
+        score = player_cells - opponent_cells
+        if score > 0:
+            print("win, moves")
+            reward = 50
+        elif score < 0:
+            reward = -10
+        else:
+            reward = 0
+        return reward, True
+
     if player_cells == 0:  # We have lost
-        reward = -100
         terminated = True
+        reward = -10
     elif opponent_cells == 0:  # We have won!
-        print("win!")
+        print("win, cells")
+        show_board(board)
         reward = 100
         terminated = True
     else:
-        cell_diff = player_cells - opponent_cells
-
-        if cell_diff > 0:
-            reward = 1
-        elif cell_diff < 0:
-            reward = -1
         reward = 0
     return reward, terminated
 
@@ -106,9 +123,15 @@ def is_action_valid(board, action, as_blue):
         # We are trying to move our own piece
 
         if 0 <= to_x < 7 and\
-            0 <= to_y < 7:
+           0 <= to_y < 7:
 
             if not any(board[to_y, to_x]):
                 # The Dest is free
                 return True
     return False
+
+
+def debug_move(action, is_player):
+    from_x, from_y, to_x, to_y, _ = action_to_move(action)
+    t = "B:" if is_player else "G:"
+    print(f"{t} [{from_x}, {from_y}]=> [{to_x}, {to_y}]")

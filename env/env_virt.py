@@ -25,7 +25,7 @@ class MicroscopeEnv(Env):
         self.play_opponent = random_opponent
 
         self.observation_space = gymnasium.spaces.Dict({
-            "board": gymnasium.spaces.Box(0, 1, shape=(7, 7, 2), dtype=bool),
+            "board": gymnasium.spaces.Box(0, 1, shape=(7, 7, 2), dtype=numpy.bool),
             "turn": gymnasium.spaces.Discrete(2),
             "turns": gymnasium.spaces.Discrete(self.turn_limit)
         })
@@ -72,21 +72,19 @@ class MicroscopeEnv(Env):
         reward = 0
         terminated = False
         truncated = False
+        self.turns += 1
+        player_had_no_move = False
 
         if not self.move(action):
             if self.masks:
-                terminated = True
                 if numpy.any(action_masks(self._get_obs()["board"], self.turn)):
-                    print("==INVALID ACTION==")
-                    # t = "B:" if self.turn else "G:"
-                    # print(f"{t} [{from_x}, {from_y}]=> [{to_x}, {to_y}]")
+                    terminated = True
                     reward = -5
-                    show_board(self._get_obs()["board"])
-                    print("==================")
-                # else no valid moves remain, end game
-            # we've not made a move, don't count it
-            self.turns -= 1
-            reward = -10
+                    # we've not made a move, don't count it
+                    self.turns -= 1
+            # We don't have a valid move, but opponent might, continue
+            reward = -1
+            player_had_no_move = True
 
         observation = self._get_obs()
 
@@ -99,19 +97,25 @@ class MicroscopeEnv(Env):
                 self.turns += 1
             else:
                 # We cant play a move, the game is over
-                self.terminated = True
+                if player_had_no_move:
+                    self.terminated = True
+                
             self.turn = not self.turn
 
             observation = self._get_obs()
 
         # Round over - how did we do?
         reward, terminated = calc_reward(observation["board"], self.turn)
+
+        reward -= self.turns / 100
+
         if self.debug:
             print("Reward:", reward)
             if terminated:
                 show_board(observation["board"])
 
-        if self.turns >= self.turn_limit - 1:
+        if self.turns >= self.turn_limit - 2:
+            reward = -1
             truncated = True
 
         return observation, reward, terminated, truncated, {}
@@ -137,6 +141,9 @@ class MicroscopeEnv(Env):
         observation = self._get_obs()
 
         return observation, {}
+
+    def action_masks(self):
+        return action_masks(self.game_grid, self.turn)
 
     def close(self):
         pass
