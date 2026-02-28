@@ -1,37 +1,71 @@
-# T7G-ml
+# T7G Microscope — ML Gym
 
-Some experiements in training a model to play the The 7th Guest minigame,
-'Microscope'. This game plays a little like orthello on a 7x7 Zero sum grid.
+Train RL agents to play the Microscope minigame from *The 7th Guest* — an Ataxx-like board game on a 7×7 grid.
 
-The goal is to develop an agent that wins against the game AI in as few moves
-as possible.
+## Quick Start
 
-## Environments
+```bash
+# Train
+python train.py
 
-- `t7g_env.py` provides an environment for a model to play against Stauf himself.
-    very slow, good for confirming performance (or not).
-- `t7g_virt_env.py` Provides a virtual environment for faster training.
-    This env can also move the opponent randomly for a basic training env.
-    Otherwise this env can be used for playing.
-- `t7g_virt_env_plus_C_shoxx.py` This mouthful works as `t7g_virt_env` except
-    it implements a alhpa-beta pruning minimaxer to provide an opponent.
-    The minimaxer was delveoped by [Darkshoxx](https://github.com/darkshoxx) and adapted to C for greater performance.
+# Monitor
+tensorboard --logdir=./tblog/
 
-## Trainers
+# Play against MCTS
+python scripts/play_mcts.py
 
- TODO
-
-## Utils
-
-- `utils.py` contains any easily extractable code from the other envs, to
-    reduce duplication.
-
-## C module
-`micro_3.c` contains a C impl of the alpha-beta pruning minimaxer for getting the next best green cell move.
-
-Windows:
+# Play with GUI
+python scripts/play_gui.py
 ```
-gcc -Ofast .\micro_3.c -o .\micro3.dll --shared
+
+## Installation
+
+```bash
+git clone <repository-url>
+cd t7g-ml-gym
+pip install -r requirements.txt
+
+# Compile the C minimax opponent (Windows)
+gcc -O3 -march=native -ffast-math micro_3.c -o micro3.dll --shared
 ```
-This module uses a numpy array converted to bytes directly and doesnt do much in the way of error checking,
-be warned.
+
+See [requirements.txt](requirements.txt) for GPU (ROCm/CUDA) torch install instructions.
+
+## Project Structure
+
+```
+├── train.py                  # Main PPO training entry point
+├── train_curriculum.py       # Curriculum learning variant
+├── micro_3.c                 # C minimax implementation (compile → micro3.dll)
+│
+├── lib/
+│   ├── t7g.py                # Game logic, board helpers
+│   ├── networks.py           # CNN policy architectures
+│   ├── dual_network.py       # Dual-head network (policy + value)
+│   ├── reward_functions.py   # Reward shaping functions
+│   └── mcts.py               # Monte Carlo Tree Search
+│
+├── env/
+│   ├── env_virt.py           # Fast virtual self-play environment
+│   ├── env_t7g.py            # Real game environment (screen capture)
+│   ├── minimax_wrapper.py    # Minimax opponent wrapper
+│   ├── random_opponent_wrapper.py
+│   ├── action_mask_wrapper.py
+│   ├── position_curriculum_wrapper.py
+│   └── symmetry_wrapper.py
+│
+├── scripts/
+│   ├── train_stauf.py        # Train against Stauf (game AI)
+│   ├── train_mcts.py         # Train against MCTS opponent
+│   ├── self_play.py          # Self-play training
+│   ├── play_gui.py           # GUI play (requires pyglet)
+│   ├── play_mcts.py          # Play against MCTS
+│   └── generate_position_bank.py
+│
+└── tests/
+```
+
+## Acknowledgements
+
+- Minimax implementation adapted from [Darkshoxx](https://github.com/darkshoxx)
+- Built with [Stable-Baselines3](https://github.com/DLR-RM/stable-baselines3) and PyTorch

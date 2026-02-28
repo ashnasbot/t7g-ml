@@ -1,8 +1,40 @@
+# Core
 numpy
+gymnasium
 tqdm
-rich
-term-image
-sb3-contrib
-stable-baselines3
 tensorboard
-pywin32
+
+# RL
+stable-baselines3
+sb3-contrib
+
+# Rendering / UI
+Pillow
+term-image
+
+# Windows only — needed by Pillow ImageGrab (real hardware env)
+pywin32; sys_platform == "win32"
+
+# Optional — GUI play script (scripts/play_gui.py)
+# pyglet
+
+# --- PyTorch ---
+# PyPI only ships the CPU build. Install the GPU variant manually after the above.
+#
+#   AMD ROCm (Windows, ROCm 7.2) — pip can't auto-resolve rocm deps from PyPI,
+#   so install the SDK wheels first, then torch:
+#
+#     BASE=https://repo.radeon.com/rocm/windows/rocm-rel-7.2
+#     pip install "$BASE/rocm_sdk_core-7.2.0.dev0-py3-none-win_amd64.whl"
+#     pip install "$BASE/rocm_sdk_libraries_custom-7.2.0.dev0-py3-none-win_amd64.whl"
+#     pip install "$BASE/rocm-7.2.0.dev0.tar.gz"
+#     pip install --no-deps \
+#       "$BASE/torch-2.9.1+rocmsdk20260116-cp312-cp312-win_amd64.whl" \
+#       "$BASE/torchaudio-2.9.1+rocmsdk20260116-cp312-cp312-win_amd64.whl" \
+#       "$BASE/torchvision-0.24.1+rocmsdk20260116-cp312-cp312-win_amd64.whl"
+#
+#   NVIDIA (CUDA 12.4):
+#     pip install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+#   CPU fallback (slow):
+#     pip install torch
