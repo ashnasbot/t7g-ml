@@ -49,19 +49,27 @@ def test_debug_true_shows_move_output(capsys):
     env = MicroscopeEnvSimple(render_mode='human', debug=True)
     obs, _ = env.reset()
 
-    # Get valid action
+    # Stage 0: select piece (debug output not printed yet)
     masks = env.action_masks()
     valid_actions = [i for i, m in enumerate(masks) if m]
     assert len(valid_actions) > 0
 
-    # Take one step
-    action = valid_actions[0]
-    obs, reward, terminated, truncated, info = env.step(action)
+    piece_action = valid_actions[0]
+    obs, _, terminated, truncated, info = env.step(piece_action)
+
+    if not terminated and not truncated:
+        # Stage 1: select move (debug output printed here)
+        masks = env.action_masks()
+        valid_moves = [i for i, m in enumerate(masks) if m]
+        assert len(valid_moves) > 0
+
+        move_action = valid_moves[0]
+        obs, reward, terminated, truncated, info = env.step(move_action)
 
     # Capture output
     captured = capsys.readouterr()
 
-    # Should contain move details
+    # Should contain move details (printed during stage 1 execution)
     assert "B:" in captured.out and "=>" in captured.out, \
         "Should print move details when debug=True"
 

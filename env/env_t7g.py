@@ -9,7 +9,7 @@ import win32gui
 import win32api
 import win32con
 
-from lib.t7g import calc_reward, action_to_move, is_action_valid, BLUE
+from lib.t7g import calc_reward, action_to_move, is_action_valid, encode_action, BLUE
 from lib.reward_functions import get_reward_function
 
 # Max seconds to wait for the board to stabilise after a move
@@ -162,11 +162,6 @@ class MicroscopeEnv(Env):
             obs[y, x, 3] = 1.0
         return obs
 
-    def _encode_action(self, x, y, dx, dy):
-        """Convert position + delta to 1225-action encoding used by game logic."""
-        move_idx = (dy + 2) * 5 + (dx + 2)
-        return y * 7 * 25 + x * 25 + move_idx
-
     def move(self, action):
         """Execute a move in the real game via mouse clicks."""
         from_x, from_y, to_x, to_y, _ = action_to_move(action)
@@ -208,7 +203,7 @@ class MicroscopeEnv(Env):
         dx = (move_action % 5) - 2
         dy = (move_action // 5) - 2
         x, y = self.selected_piece_pos
-        full_action = self._encode_action(x, y, dx, dy)
+        full_action = encode_action(x, y, dx, dy)
 
         if not self.move(full_action):
             # Invalid move — refresh board and return penalty
@@ -367,7 +362,7 @@ class MicroscopeEnv(Env):
                     for move_idx in range(25):
                         dx = (move_idx % 5) - 2
                         dy = (move_idx // 5) - 2
-                        if is_action_valid(self.game_grid, self._encode_action(x, y, dx, dy), True):
+                        if is_action_valid(self.game_grid, encode_action(x, y, dx, dy), True):
                             mask[y * 7 + x] = True
                             break
         return mask
@@ -381,7 +376,7 @@ class MicroscopeEnv(Env):
         for move_idx in range(25):
             dx = (move_idx % 5) - 2
             dy = (move_idx // 5) - 2
-            if is_action_valid(self.game_grid, self._encode_action(x, y, dx, dy), True):
+            if is_action_valid(self.game_grid, encode_action(x, y, dx, dy), True):
                 mask[move_idx] = True
         return mask
 

@@ -113,6 +113,112 @@ class PositionBank:
 
 
 # ============================================================
+# Position Generator - phase-based and tactical position generation
+# ============================================================
+
+class PositionGenerator:
+    """
+    Generates diverse board positions for curriculum training.
+
+    Provides positions at specific game phases and with specific tactical
+    characteristics via random playouts.
+    """
+
+    phases = {
+        'opening':   (4, 10),   # Just started, few pieces
+        'early_mid': (8, 18),   # Early development
+        'mid_game':  (14, 28),  # Mid-game complexity
+        'late_game': (24, 38),  # Board filling up
+        'endgame':   (32, 49),  # Nearly full board
+    }
+
+    def generate_standard_start(self):
+        """Generate canonical 4-corner starting position."""
+        board = np.zeros((7, 7, 2), dtype=np.bool_)
+        board[0, 0] = BLUE
+        board[0, 6] = GREEN
+        board[6, 0] = GREEN
+        board[6, 6] = BLUE
+        return board, True  # Blue starts
+
+    def generate_random_start(self):
+        """Generate random 2v2 starting position."""
+        board = np.zeros((7, 7, 2), dtype=np.bool_)
+        positions = random.sample(range(49), 4)
+        colors = [BLUE, BLUE, GREEN, GREEN]
+        random.shuffle(colors)
+        for pos, color in zip(positions, colors):
+            y, x = pos // 7, pos % 7
+            board[y, x] = color
+        return board, random.choice([True, False])
+
+    def generate_phase_position(self, phase, balance=None):
+        """
+        Generate a position at a specific game phase.
+
+        Args:
+            phase: One of 'opening', 'early_mid', 'mid_game', 'late_game', 'endgame'
+            balance: None for any balance, 'balanced', 'blue_ahead', or 'green_ahead'
+
+        Returns:
+            (board, turn) tuple
+        """
+        min_p, max_p = self.phases[phase]
+        fallback = FallbackGenerator()
+
+        for _ in range(500):
+            num_moves = random.randint(2, 100)
+            board, turn = fallback.generate_by_playout(num_moves)
+            total = int(np.sum(board))
+
+            if not (min_p <= total <= max_p):
+                continue
+
+            if balance is None:
+                return board, turn
+
+            blue = int(np.sum(board[:, :, 1]))
+            green = int(np.sum(board[:, :, 0]))
+
+            if balance == 'balanced' and abs(blue - green) <= 1:
+                return board, turn
+            elif balance == 'blue_ahead' and blue > green:
+                return board, turn
+            elif balance == 'green_ahead' and green > blue:
+                return board, turn
+
+        # Fallback: return any valid position in range (ignore balance constraint)
+        for _ in range(200):
+            board, turn = fallback.generate_by_playout(random.randint(2, 100))
+            if min_p <= int(np.sum(board)) <= max_p:
+                return board, turn
+
+        return self.generate_standard_start()
+
+    def generate_tactical_position(self, tactic):
+        """
+        Generate a position with specific tactical characteristics.
+
+        Args:
+            tactic: One of 'conversion_battle', 'piece_advantage',
+                    'mobility_crisis', 'endgame_race'
+
+        Returns:
+            (board, turn) tuple
+        """
+        if tactic == 'conversion_battle':
+            return self.generate_phase_position('mid_game')
+        elif tactic == 'piece_advantage':
+            return self.generate_phase_position('mid_game', balance='blue_ahead')
+        elif tactic == 'mobility_crisis':
+            return self.generate_phase_position('late_game')
+        elif tactic == 'endgame_race':
+            return self.generate_phase_position('endgame')
+        else:
+            return self.generate_standard_start()
+
+
+# ============================================================
 # Fallback generator (when bank not available)
 # ============================================================
 
@@ -186,20 +292,23 @@ class FallbackGenerator:
 
 class PositionCurriculum:
     """
-    Samples training positions from minimax position bank.
+    Samples training positions across curriculum stages.
 
-    If bank exists: samples swing positions, midgame positions, etc.
-    If no bank: falls back to random playout generation.
+    If bank exists: uses minimax game positions for realistic training data.
+    If no bank: falls back to PositionGenerator for phase-based positions.
 
     Curriculum stages:
-    - Early (0-500k): mostly standard starts + general bank positions
-    - Mid (500k-1.5M): swing positions + midgame positions
-    - Late (1.5M+): heavy on big swings and endgame positions
+    - Stage 0 (0-300k):   random starts, build basic intuition
+    - Stage 1 (300k-1M):  opening + early game positions
+    - Stage 2 (1M-2M):    midgame complexity
+    - Stage 3 (2M-4M):    late game and endgame
+    - Stage 4 (4M+):      endgame mastery and tactical positions
     """
 
     def __init__(self, bank_path="positions/position_bank.npz"):
         self.bank = PositionBank(bank_path)
         self.fallback = FallbackGenerator()
+        self.generator = PositionGenerator()
 
         if self.bank.loaded:
             print(f"[Curriculum] Loaded {len(self.bank.boards)} positions from bank")
@@ -208,40 +317,57 @@ class PositionCurriculum:
             if len(self.bank._big_swing_indices) > 0:
                 print(f"  Big swing positions (>=5): {len(self.bank._big_swing_indices)}")
         else:
-            print("[Curriculum] No position bank found, using random playouts")
-            print("  Generate with: python scripts/generate_position_bank.py")
+            print("[Curriculum] No position bank found, using position generator")
+            print("  Generate bank with: python scripts/generate_position_bank.py")
 
         self.stages = [
-            # Stage 0: Standard starts + general positions (0-500k)
+            # Stage 0: Random starts - build basic intuition (0-300k)
             {
-                'max_timestep': 500_000,
+                'max_timestep': 300_000,
+                'distribution': {
+                    'standard_start': 0.2,
+                    'random_start': 0.8,
+                }
+            },
+            # Stage 1: Opening + early game (300k-1M)
+            {
+                'max_timestep': 1_000_000,
                 'distribution': {
                     'standard_start': 0.3,
-                    'bank_any': 0.4,
-                    'bank_midgame': 0.3,
+                    'random_start': 0.2,
+                    'opening': 0.3,
+                    'early_mid': 0.2,
                 }
             },
-            # Stage 1: Swing positions + contested midgame (500k-1.5M)
+            # Stage 2: Midgame complexity (1M-2M)
             {
-                'max_timestep': 1_500_000,
+                'max_timestep': 2_000_000,
                 'distribution': {
-                    'standard_start': 0.10,
-                    'bank_any': 0.20,
-                    'bank_midgame': 0.25,
-                    'bank_swing': 0.30,
-                    'bank_big_swing': 0.15,
+                    'standard_start': 0.1,
+                    'opening': 0.1,
+                    'early_mid': 0.2,
+                    'mid_game': 0.4,
+                    'late_game': 0.2,
                 }
             },
-            # Stage 2: Heavy on swings and endgame (1.5M+)
+            # Stage 3: Late game and endgame (2M-4M)
+            {
+                'max_timestep': 4_000_000,
+                'distribution': {
+                    'mid_game': 0.2,
+                    'late_game': 0.3,
+                    'endgame': 0.3,
+                    'tactical': 0.2,
+                }
+            },
+            # Stage 4: Endgame mastery (4M+)
             {
                 'max_timestep': float('inf'),
                 'distribution': {
-                    'standard_start': 0.10,
-                    'bank_any': 0.10,
-                    'bank_midgame': 0.20,
-                    'bank_swing': 0.25,
-                    'bank_big_swing': 0.20,
-                    'bank_endgame': 0.15,
+                    'mid_game': 0.1,
+                    'late_game': 0.2,
+                    'endgame': 0.4,
+                    'tactical': 0.3,
                 }
             },
         ]
@@ -263,9 +389,20 @@ class PositionCurriculum:
 
     def _generate_position(self, position_type):
         if position_type == 'standard_start':
-            return self.fallback.generate_standard_start()
+            return self.generator.generate_standard_start()
 
-        # Try bank first
+        if position_type == 'random_start':
+            return self.generator.generate_random_start()
+
+        if position_type == 'tactical':
+            tactic = random.choice(['conversion_battle', 'piece_advantage',
+                                    'mobility_crisis', 'endgame_race'])
+            return self.generator.generate_tactical_position(tactic)
+
+        if position_type in ('opening', 'early_mid', 'mid_game', 'late_game', 'endgame'):
+            return self.generator.generate_phase_position(position_type)
+
+        # Legacy bank-based keys (kept for compatibility)
         if self.bank.loaded:
             result = None
             if position_type == 'bank_any':
@@ -282,13 +419,7 @@ class PositionCurriculum:
             if result is not None:
                 return result
 
-        # Fallback to random playouts
-        if position_type in ('bank_swing', 'bank_big_swing'):
-            return self.fallback.generate_by_playout(num_moves=random.randint(10, 30))
-        elif position_type == 'bank_endgame':
-            return self.fallback.generate_by_playout(num_moves=random.randint(25, 45))
-        else:
-            return self.fallback.generate_by_playout(num_moves=random.randint(4, 25))
+        return self.fallback.generate_by_playout(num_moves=random.randint(4, 30))
 
 
 def sample_curriculum_position(timestep=0):

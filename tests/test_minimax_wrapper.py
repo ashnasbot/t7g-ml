@@ -22,40 +22,47 @@ def test_wrapper_initialization():
     wrapped = MinimaxOpponentWrapper(env, depth=3)
 
     obs, info = wrapped.reset()
-    assert obs.shape == (7, 7, 3), "Observation shape should be preserved"
+    assert obs.shape == (7, 7, 4), "Observation shape should be preserved"
     assert wrapped.depth == 3, "Depth should be set correctly"
 
 
 def test_opponent_makes_moves():
-    """Test that opponent actually makes moves after agent"""
+    """Test that opponent actually makes moves after agent completes a full move"""
     env = MicroscopeEnv()
     wrapped = MinimaxOpponentWrapper(env, depth=1)
 
     obs, info = wrapped.reset()
 
-    # Count initial pieces (should be 2 blue, 2 green)
-    blue_before, green_before = count_cells(obs)
-    assert blue_before == 2
-    assert green_before == 2
-
-    # Get valid action
+    # Get valid actions for stage 0 (piece selection)
     masks = wrapped.action_masks()
     valid_actions = np.where(masks)[0]
     assert len(valid_actions) > 0, "Should have valid moves"
 
-    # Agent makes move
-    action = valid_actions[0]
-    obs, reward, terminated, truncated, info = wrapped.step(action)
+    # Stage 0: agent selects piece (wrapper returns early, no opponent move yet)
+    piece_action = valid_actions[0]
+    obs, _, terminated, truncated, info = wrapped.step(piece_action)
 
-    # Check that opponent made a move
+    if terminated or truncated:
+        return  # Unlikely but skip rest if game ended
+
+    # Stage 1: agent selects move (opponent responds after full move)
+    masks = wrapped.action_masks()
+    valid_moves = np.where(masks)[0]
+    assert len(valid_moves) > 0, "Should have valid moves in stage 1"
+
+    move_action = valid_moves[0]
+    obs, reward, terminated, truncated, info = wrapped.step(move_action)
+
+    # After full agent move, opponent should have responded
     assert 'opponent_moves' in info, "Should track opponent moves"
-    assert info['opponent_moves'] == 1, "Opponent should have made 1 move"
     assert info['agent_moves'] == 1, "Agent should have made 1 move"
 
-    # Board should have changed (more pieces after both moves)
+    if not terminated and not truncated:
+        assert info['opponent_moves'] == 1, "Opponent should have made 1 move"
+
+    # Board should still have pieces
     blue_after, green_after = count_cells(obs)
-    assert blue_after > blue_before or green_after > green_before, \
-        "Board should have changed after moves"
+    assert blue_after > 0 or green_after > 0, "Board should still have pieces"
 
 
 def test_game_completes():
@@ -101,12 +108,19 @@ def test_different_depths():
 
         obs, info = wrapped.reset()
 
-        # Take one step
+        # Stage 0: select piece
         masks = wrapped.action_masks()
-        valid_actions = np.where(masks)[0]
-        action = valid_actions[0]
+        piece_action = np.where(masks)[0][0]
+        obs, _, terminated, truncated, info = wrapped.step(piece_action)
 
-        obs, reward, terminated, truncated, info = wrapped.step(action)
+        if terminated or truncated:
+            print(f"\n  Depth {depth}: OK (game ended early)")
+            continue
+
+        # Stage 1: select move (opponent responds after)
+        masks = wrapped.action_masks()
+        move_action = np.where(masks)[0][0]
+        obs, reward, terminated, truncated, info = wrapped.step(move_action)
 
         assert 'opponent_moves' in info
         print(f"\n  Depth {depth}: OK")

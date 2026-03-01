@@ -24,11 +24,13 @@ def simulate_game_with_reward(reward_func, num_moves=10, render=False):
         print(f"\n{'='*60}")
         print(f"Testing: {reward_func.__name__}")
         print(f"{'='*60}")
-        show_board(obs)
+        show_board(env.game_grid)
 
     rewards = []
-    for move_num in range(num_moves):
-        # Get valid actions
+    moves_completed = 0
+
+    while moves_completed < num_moves:
+        # Get valid actions for current stage
         valid_actions = env.action_masks()
         valid_indices = np.where(valid_actions)[0]
 
@@ -41,17 +43,19 @@ def simulate_game_with_reward(reward_func, num_moves=10, render=False):
         # Get environment's step
         obs, env_reward, terminated, truncated, _ = env.step(action)
 
-        # Get our custom reward
-        custom_reward, custom_term = reward_func(obs, env.turn)
+        # Only compute custom reward after a full move (action_stage resets to 0)
+        if env.action_stage == 0:
+            # Pass game_grid (bool 7x7x2) and the player who just moved
+            custom_reward, custom_term = reward_func(env.game_grid, not env.turn)
 
-        if render:
-            from_x, from_y, to_x, to_y, jump = action_to_move(action)
-            print(f"\nMove {move_num + 1}: [{from_x},{from_y}] -> [{to_x},{to_y}]")
-            print(f"  Env reward: {env_reward:.3f}")
-            print(f"  Custom reward: {custom_reward:.3f}")
-            show_board(obs)
+            if render:
+                print(f"\nMove {moves_completed + 1}:")
+                print(f"  Env reward: {env_reward:.3f}")
+                print(f"  Custom reward: {custom_reward:.3f}")
+                show_board(env.game_grid)
 
-        rewards.append(custom_reward)
+            rewards.append(custom_reward)
+            moves_completed += 1
 
         if terminated or truncated:
             break

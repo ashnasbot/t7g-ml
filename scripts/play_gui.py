@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from lib.dual_network import DualHeadNetwork
-from lib.mcts import MCTS, new_board, apply_move, check_terminal
+from lib.mcts import MCTS
+from lib.t7g import new_board, apply_move, check_terminal
 from lib.t7g import find_best_move, count_cells, action_masks, action_to_move
 from lib.t7g import BLUE, GREEN
 

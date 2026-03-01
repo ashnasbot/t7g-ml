@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from lib.t7g import (
     find_best_move, action_to_move, action_masks, is_action_valid,
-    count_cells, BLUE, GREEN, CLEAR
+    apply_move, count_cells, BLUE, GREEN, CLEAR
 )
 
 
@@ -38,30 +38,6 @@ def setup_board(blue_positions, green_positions):
         board[y, x] = BLUE
     for x, y in green_positions:
         board[y, x] = GREEN
-    return board
-
-
-def apply_move(board, action, as_blue=True):
-    """Apply a move to the board and return new board state"""
-    board = board.copy()
-    from_x, from_y, to_x, to_y, jump = action_to_move(action)
-
-    player_cell = BLUE if as_blue else GREEN
-    opponent_cell = GREEN if as_blue else BLUE
-
-    if jump:
-        board[from_y, from_x] = CLEAR
-    board[to_y, to_x] = player_cell
-
-    # Convert adjacent opponent pieces
-    for dx in range(-1, 2):
-        for dy in range(-1, 2):
-            x2 = to_x + dx
-            y2 = to_y + dy
-            if 0 <= x2 < 7 and 0 <= y2 < 7:
-                if np.array_equal(board[y2, x2], opponent_cell):
-                    board[y2, x2] = player_cell
-
     return board
 
 
@@ -89,10 +65,13 @@ def test_minimax_returns_valid_move_opening():
 
 def test_minimax_returns_no_move_when_stuck():
     """Minimax should return -1 when no moves available"""
-    # Board where blue is completely surrounded by green (no moves)
+    # Blue at (3,3) with ALL 24 squares in its 5x5 range filled by green.
+    # Blue can clone/jump to any (x+dx, y+dy) where dx,dy in [-2,2],
+    # so we must fill every square in [1..5] x [1..5] except (3,3) itself.
+    green_positions = [(x, y) for x in range(1, 6) for y in range(1, 6) if (x, y) != (3, 3)]
     board = setup_board(
         blue_positions=[(3, 3)],
-        green_positions=[(2, 2), (3, 2), (4, 2), (2, 3), (4, 3), (2, 4), (3, 4), (4, 4)]
+        green_positions=green_positions  # 24 surrounding squares
     )
 
     move = find_best_move(board.tobytes(), depth=1, as_blue=True)

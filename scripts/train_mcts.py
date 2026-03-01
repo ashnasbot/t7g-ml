@@ -29,7 +29,8 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lib.dual_network import DualHeadNetwork
-from lib.mcts import MCTS, new_board, apply_move, check_terminal, board_to_obs
+from lib.mcts import MCTS
+from lib.t7g import new_board, apply_move, check_terminal, board_to_obs
 from lib.t7g import find_best_move, count_cells, show_board, action_masks
 
 

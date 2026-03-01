@@ -22,12 +22,21 @@ import random
 import gymnasium
 from gymnasium import Env
 import numpy
+import numpy.typing as npt
+from typing import Any, Optional
 
 from lib.t7g import (
     calc_reward, show_board, action_to_move, action_masks, is_action_valid,
-    BLUE, GREEN, CLEAR
+    apply_move, encode_action, new_board,
+    BLUE, GREEN
 )
 from lib.reward_functions import get_reward_function
+
+
+Board = npt.NDArray[numpy.bool_]    # shape (7, 7, 2)
+Obs = npt.NDArray[numpy.float32]   # shape (7, 7, 4)
+ActionMask = npt.NDArray[numpy.bool_]
+StepResult = tuple[Obs, float, bool, bool, dict[str, Any]]
 
 
 class MicroscopeEnv(Env):
@@ -49,7 +58,7 @@ class MicroscopeEnv(Env):
 
     metadata = {"name": "Microscope Virt", "render_modes": [None, "human"]}
 
-    def __init__(self, reward_fn='original', render_mode=None, debug=False):
+    def __init__(self, reward_fn: str = 'original', render_mode: Optional[str] = None, debug: bool = False) -> None:
         super().__init__()
         self.games_played = 0
         self.turn = True
@@ -68,20 +77,19 @@ class MicroscopeEnv(Env):
 
         # Flags
         self.masks = True
-        self.random_start = True  # Enable random starts for diverse self-play
+        self.random_start = True
 
         # Two-stage action tracking
         self.action_stage = 0  # 0 = select piece, 1 = select move
-        self.selected_piece_pos = None  # (x, y) of selected piece
+        self.selected_piece_pos: Optional[tuple[int, int]] = None  # (x, y) of selected piece
 
         # Observation: 7x7x4 (green pieces, blue pieces, turn indicator, selected piece)
         self.observation_space = gymnasium.spaces.Box(0, 1, shape=(7, 7, 4), dtype=numpy.float32)
         # Action space: max(49 positions, 25 moves) = 49
         self.action_space = gymnasium.spaces.Discrete(49)
 
-    def _get_obs(self):
+    def _get_obs(self) -> Obs:
         # Return board with turn indicator and selected piece as 3rd and 4th channels
-        # No perspective flipping - agent sees absolute board positions
         obs = numpy.zeros((7, 7, 4), dtype=numpy.float32)
         obs[:, :, 0:2] = self.game_grid  # Green and blue pieces
         obs[:, :, 2] = 1.0 if self.turn else 0.0  # Turn indicator (1=blue, 0=green)
@@ -93,39 +101,23 @@ class MicroscopeEnv(Env):
 
         return obs
 
-    def get_observation(self):
+    def get_observation(self) -> bytes:
         # Return serialized observation with turn indicator
         return self._get_obs().tobytes()
 
-    def move(self, action):
-        if self.turn:
-            player_cell = BLUE
-            opponent_cell = GREEN
-        else:
-            player_cell = GREEN
-            opponent_cell = BLUE
-
-        from_x, from_y, to_x, to_y, jump = action_to_move(action)
+    def move(self, action: int) -> bool:
+        from_x, from_y, to_x, to_y, _ = action_to_move(action)
 
         if self.render_mode == "human" and self.debug:
             t = "B:" if self.turn else "G:"
             print(f"{t} [{from_x}, {from_y}] => [{to_x}, {to_y}]")
 
         if is_action_valid(self.game_grid, action, self.turn):
-            if jump:
-                self.game_grid[from_y, from_x] = CLEAR
-            self.game_grid[to_y, to_x] = player_cell
-
-            for x, y in numpy.ndindex((3, 3)):
-                x2 = to_x - 1 + x
-                y2 = to_y - 1 + y
-                if 0 <= x2 < 7 and 0 <= y2 < 7:
-                    if numpy.array_equal(self.game_grid[y2, x2], opponent_cell):
-                        self.game_grid[y2, x2] = player_cell
+            self.game_grid = apply_move(self.game_grid, action, self.turn)
             return True
         return False
 
-    def step(self, action):
+    def step(self, action: int) -> StepResult:
         """
         Two-stage action processing:
         - Stage 0: action is position index (0-48) selecting piece to move
@@ -138,16 +130,10 @@ class MicroscopeEnv(Env):
             # STAGE 1: SELECT MOVE
             return self._step_select_move(action)
 
-    def _step_select_piece(self, position_action):
+    def _step_select_piece(self, position_action: int) -> StepResult:
         """Stage 0: Select which piece to move"""
         # VALIDATION: position_action must be in range [0, 48]
         if position_action >= 49:
-            print(f"\n[ERROR] Invalid position_action received: {position_action}")
-            print(f"  Current turn: {'Blue' if self.turn else 'Green'}")
-            print(f"  Valid actions at this stage:")
-            masks = self._action_masks_select_piece()
-            print(f"  Mask shape: {masks.shape}")
-            print(f"  Valid indices: {numpy.where(masks)[0]}")
             raise ValueError(f"position_action {position_action} >= 49 (valid range: 0-48)")
 
         # Decode position (0-48 -> x, y)
@@ -162,18 +148,10 @@ class MicroscopeEnv(Env):
         # No reward yet, not terminal, stage 1 pending
         return obs, 0.0, False, False, {'stage': 1, 'selected_pos': self.selected_piece_pos}
 
-    def _step_select_move(self, move_action):
+    def _step_select_move(self, move_action: int) -> StepResult:
         """Stage 1: Execute the move"""
         # VALIDATION: move_action must be in range [0, 24]
         if move_action >= 25:
-            print(f"\n[ERROR] Invalid move_action received: {move_action}")
-            print(f"  Selected piece: {self.selected_piece_pos}")
-            print(f"  Current turn: {'Blue' if self.turn else 'Green'}")
-            print(f"  Valid actions at this stage:")
-            masks = self._action_masks_select_move()
-            print(f"  Mask shape: {masks.shape}")
-            print(f"  Valid indices: {numpy.where(masks)[0]}")
-            print(f"  move_action {move_action} is INVALID (must be 0-24)")
             raise ValueError(f"move_action {move_action} >= 25 (valid range: 0-24)")
 
         # Decode move (0-24 -> dx, dy)
@@ -182,7 +160,7 @@ class MicroscopeEnv(Env):
 
         # Combine with selected position to get full action
         x, y = self.selected_piece_pos
-        full_action = self._encode_action(x, y, dx, dy)
+        full_action = encode_action(x, y, dx, dy)
 
         # Execute the move using original logic
         reward = 0
@@ -211,11 +189,10 @@ class MicroscopeEnv(Env):
             reward = -1
             truncated = True
 
-        # Render final board when episode ends
         if self.render_mode == 'human':
+            # Render final board when episode ends
             if self.debug:
                 print(f"Reward: {reward}")
-            # Always show final board when episode ends
             if terminated or truncated:
                 show_board(self.game_grid)
 
@@ -225,21 +202,13 @@ class MicroscopeEnv(Env):
 
         return observation, reward, terminated, truncated, {}
 
-    def _encode_action(self, x, y, dx, dy):
-        """Convert position + move to original 1225-action encoding"""
-        move_idx = (dy + 2) * 5 + (dx + 2)
-        return y * 7 * 25 + x * 25 + move_idx
-
-    def reset(self, seed=None, options=None):
+    def reset(self, seed: Optional[int] = None, options: Optional[dict[str, Any]] = None) -> tuple[Obs, dict[str, Any]]:
         super().reset(seed=seed)
-        self.game_grid = numpy.zeros((7, 7, 2), dtype=numpy.bool)
 
         if not self.random_start or random.randint(0, 10) < 1:
-            self.game_grid[0, 0] = BLUE
-            self.game_grid[0, 6] = GREEN
-            self.game_grid[6, 0] = GREEN
-            self.game_grid[6, 6] = BLUE
+            self.game_grid = new_board()
         else:
+            self.game_grid = numpy.zeros((7, 7, 2), dtype=numpy.bool_)
             pieces = [BLUE, GREEN, BLUE, GREEN]
             for p in random.sample(range(49), 4):
                 y = p // 7
@@ -257,14 +226,14 @@ class MicroscopeEnv(Env):
 
         return observation, {}
 
-    def action_masks(self):
+    def action_masks(self) -> ActionMask:
         """Return valid actions for current stage"""
         if self.action_stage == 0:
             return self._action_masks_select_piece()
         else:
             return self._action_masks_select_move()
 
-    def _action_masks_select_piece(self):
+    def _action_masks_select_piece(self) -> ActionMask:
         """Stage 0: Mask positions with pieces of current color that have valid moves"""
         mask = numpy.zeros(49, dtype=bool)
 
@@ -290,7 +259,7 @@ class MicroscopeEnv(Env):
 
         return mask
 
-    def _action_masks_select_move(self):
+    def _action_masks_select_move(self) -> ActionMask:
         """Stage 1: Mask valid moves from selected position (padded to 49 for consistency)"""
         mask = numpy.zeros(49, dtype=bool)  # Always 49 to match action space
 
@@ -305,7 +274,7 @@ class MicroscopeEnv(Env):
             dy = (move_idx // 5) - 2
 
             # Check if this move is valid
-            full_action = self._encode_action(x, y, dx, dy)
+            full_action = encode_action(x, y, dx, dy)
             if is_action_valid(self.game_grid, full_action, self.turn):
                 mask[move_idx] = True
 
@@ -313,7 +282,7 @@ class MicroscopeEnv(Env):
 
         return mask
 
-    def close(self):
+    def close(self) -> None:
         pass
 
 
@@ -323,7 +292,7 @@ class MicroscopeEnvDense(MicroscopeEnv):
     """Environment with dense rewards - best for initial training"""
     metadata = {"name": "Microscope Virt (Dense)", "render_modes": [None, "human"]}
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(reward_fn='dense', **kwargs)
 
 
@@ -331,7 +300,7 @@ class MicroscopeEnvSimple(MicroscopeEnv):
     """Environment with simple linear rewards - good baseline"""
     metadata = {"name": "Microscope Virt (Simple)", "render_modes": [None, "human"]}
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(reward_fn='simple', **kwargs)
 
 
@@ -339,7 +308,7 @@ class MicroscopeEnvStrategic(MicroscopeEnv):
     """Environment with strategic rewards - for advanced training"""
     metadata = {"name": "Microscope Virt (Strategic)", "render_modes": [None, "human"]}
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(reward_fn='strategic', **kwargs)
 
 
@@ -347,5 +316,5 @@ class MicroscopeEnvAggressive(MicroscopeEnv):
     """Environment with aggressive rewards - material + frontier, matches minimax objective"""
     metadata = {"name": "Microscope Virt (Aggressive)", "render_modes": [None, "human"]}
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(reward_fn='aggressive', **kwargs)

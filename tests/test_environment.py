@@ -24,12 +24,12 @@ class TestEnvironmentBasics:
         """Environment initializes with correct spaces"""
         env = MicroscopeEnv()
 
-        # Check observation space: 7x7x3 (board + turn indicator)
-        assert env.observation_space.shape == (7, 7, 3)
+        # Check observation space: 7x7x4 (green, blue, turn indicator, selected piece)
+        assert env.observation_space.shape == (7, 7, 4)
         assert env.observation_space.dtype == np.float32
 
-        # Check action space: 49 cells * 25 moves = 1225
-        assert env.action_space.n == 1225
+        # Check action space: two-stage (49 positions or 25 moves, padded to 49)
+        assert env.action_space.n == 49
 
     def test_reset_returns_valid_observation(self):
         """Reset returns correctly shaped observation"""
@@ -37,7 +37,7 @@ class TestEnvironmentBasics:
         obs, info = env.reset()
 
         # Check shape
-        assert obs.shape == (7, 7, 3)
+        assert obs.shape == (7, 7, 4)
         assert obs.dtype == np.float32
 
         # Check values are in [0, 1]
@@ -54,9 +54,10 @@ class TestEnvironmentBasics:
     def test_initial_board_setup(self):
         """Initial board has pieces in correct corners"""
         env = MicroscopeEnv()
+        env.random_start = False
         obs, _ = env.reset()
 
-        # Extract board (without turn channel)
+        # Extract board (without turn/selected channels)
         board = obs[:, :, 0:2]
 
         # Check corners have pieces
@@ -72,19 +73,22 @@ class TestTurnHandling:
     """Test turn alternation and perspective"""
 
     def test_turn_alternates_after_step(self):
-        """Turn indicator flips after each step"""
+        """Turn indicator flips after each full move (two stages)"""
         env = MicroscopeEnv()
         obs, _ = env.reset()
 
         # Initial turn should be blue (1.0)
         assert obs[0, 0, 2] == 1.0
 
-        # Get a valid move
+        # Stage 0: select piece
         masks = env.action_masks()
-        valid_action = np.where(masks)[0][0]
+        piece_action = np.where(masks)[0][0]
+        env.step(piece_action)
 
-        # Take step
-        obs, _, _, _, _ = env.step(valid_action)
+        # Stage 1: select move
+        masks = env.action_masks()
+        move_action = np.where(masks)[0][0]
+        obs, _, _, _, _ = env.step(move_action)
 
         # Turn should now be green (0.0)
         assert obs[0, 0, 2] == 0.0
@@ -128,7 +132,7 @@ class TestActionMasking:
 
         # Should have some valid moves
         assert np.any(masks)
-        assert masks.shape == (1225,)
+        assert masks.shape == (49,)
         assert masks.dtype == bool
 
     def test_only_masked_actions_are_valid(self):
@@ -143,10 +147,10 @@ class TestActionMasking:
         if len(invalid_actions) > 0:
             invalid_action = invalid_actions[0]
 
-            # Taking invalid action should give negative reward
+            # Taking invalid action in stage 0 returns 0 reward (no validation at piece select)
             _, reward, terminated, _, _ = env.step(invalid_action)
 
-            # Should get penalty for invalid move
+            # Should get 0 or negative reward for invalid move
             assert reward <= 0
 
 
@@ -196,7 +200,7 @@ class TestEpisodeLifecycle:
         obs, _ = env.reset()
 
         # Should be back to initial state
-        assert obs.shape == (7, 7, 3)
+        assert obs.shape == (7, 7, 4)
         total_pieces = np.sum(obs[:, :, 0]) + np.sum(obs[:, :, 1])
         assert total_pieces == 4.0
 
@@ -209,7 +213,7 @@ class TestEpisodeLifecycle:
         truncated = False
         steps = 0
 
-        while not truncated and steps < 20:
+        while not truncated and steps < 30:
             masks = env.action_masks()
             if not np.any(masks):
                 break
@@ -218,8 +222,8 @@ class TestEpisodeLifecycle:
             _, _, _, truncated, _ = env.step(valid_action)
             steps += 1
 
-        # Should truncate around turn limit
-        assert steps <= env.turn_limit + 1
+        # With two-stage actions, each full turn takes 2 steps
+        assert steps <= (env.turn_limit + 1) * 2
 
 
 class TestRewardFunctions:
@@ -271,19 +275,24 @@ class TestObservationConsistency:
         assert overlap == 0.0
 
     def test_observation_after_move(self):
-        """Observation updates after move"""
+        """Observation updates after full move (two stages)"""
         env = MicroscopeEnv()
         obs_before, _ = env.reset()
 
-        # Take a move
+        # Stage 0: select piece
         masks = env.action_masks()
-        valid_action = np.where(masks)[0][0]
-        obs_after, _, _, _, _ = env.step(valid_action)
+        piece_action = np.where(masks)[0][0]
+        env.step(piece_action)
+
+        # Stage 1: select move
+        masks = env.action_masks()
+        move_action = np.where(masks)[0][0]
+        obs_after, _, _, _, _ = env.step(move_action)
 
         # Observations should be different
         assert not np.array_equal(obs_before, obs_after)
 
-        # Turn indicator should flip
+        # Turn indicator should flip after full move
         assert obs_before[0, 0, 2] != obs_after[0, 0, 2]
 
 

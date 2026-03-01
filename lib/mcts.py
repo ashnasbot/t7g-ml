@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from lib.t7g import (
     action_masks, action_to_move, count_cells,
+    apply_move, board_to_obs, check_terminal, new_board,
     BLUE, GREEN, CLEAR
 )
 
@@ -42,110 +43,6 @@ def get_legal_moves(board, turn):
     """Get list of valid action indices in 1225-action space."""
     masks = action_masks(board, turn)
     return list(np.where(masks)[0])
-
-
-def apply_move(board, action, turn):
-    """
-    Apply a move and return the new board state.
-    Replicates env_virt.py move() logic without side effects.
-
-    Args:
-        board: 7x7x2 numpy bool array
-        action: action index in 1225-space
-        turn: True=Blue, False=Green
-
-    Returns:
-        new_board: 7x7x2 numpy bool array (copy)
-    """
-    new_board = board.copy()
-    player_cell = BLUE if turn else GREEN
-    opponent_cell = GREEN if turn else BLUE
-
-    from_x, from_y, to_x, to_y, jump = action_to_move(action)
-
-    # Move piece
-    if jump:
-        new_board[from_y, from_x] = CLEAR
-    new_board[to_y, to_x] = player_cell
-
-    # Convert adjacent opponent pieces
-    for dx in range(-1, 2):
-        for dy in range(-1, 2):
-            nx, ny = to_x + dx, to_y + dy
-            if 0 <= nx < 7 and 0 <= ny < 7:
-                if np.array_equal(new_board[ny, nx], opponent_cell):
-                    new_board[ny, nx] = player_cell
-
-    return new_board
-
-
-def check_terminal(board, turn):
-    """
-    Check if game is over from perspective of player whose turn it is.
-
-    Returns:
-        (is_terminal, value_for_current_player)
-        value is +1.0 for win, -1.0 for loss, 0.0 for draw, None if not terminal
-    """
-    blue_count, green_count = count_cells(board)
-
-    # One side wiped out
-    if blue_count == 0:
-        return True, (-1.0 if turn else 1.0)
-    if green_count == 0:
-        return True, (1.0 if turn else -1.0)
-
-    # Check mobility - compute current player first; only check opponent when needed
-    current_can_move = np.any(action_masks(board, turn))
-    if current_can_move:
-        opponent_can_move = np.any(action_masks(board, not turn))
-        if opponent_can_move:
-            return False, None   # normal non-terminal state (common path)
-
-    if not current_can_move:
-        opponent_can_move = np.any(action_masks(board, not turn))
-
-    # At least one player is stuck - game over
-    if not current_can_move:
-        empty = 49 - blue_count - green_count
-        if turn:       # current = Blue is stuck → empty go to Green
-            green_count += empty
-        else:          # current = Green is stuck → empty go to Blue
-            blue_count += empty
-
-    if not opponent_can_move:
-        empty = 49 - blue_count - green_count
-        if turn:       # opponent = Green is stuck → empty go to Blue
-            blue_count += empty
-        else:          # opponent = Blue is stuck → empty go to Green
-            green_count += empty
-
-    score = (blue_count - green_count) if turn else (green_count - blue_count)
-    if score > 0:
-        return True, 1.0
-    elif score < 0:
-        return True, -1.0
-    else:
-        return True, 0.0
-
-
-def board_to_obs(board, turn):
-    """Convert 7x7x2 board + turn to 7x7x4 observation for network input."""
-    obs = np.zeros((7, 7, 4), dtype=np.float32)
-    obs[:, :, 0:2] = board.astype(np.float32)
-    obs[:, :, 2] = 1.0 if turn else 0.0
-    # Channel 3 (selected piece) is always 0 for MCTS
-    return obs
-
-
-def new_board():
-    """Create standard starting position."""
-    board = np.zeros((7, 7, 2), dtype=np.bool_)
-    board[0, 0] = BLUE
-    board[0, 6] = GREEN
-    board[6, 0] = GREEN
-    board[6, 6] = BLUE
-    return board
 
 
 # ============================================================
