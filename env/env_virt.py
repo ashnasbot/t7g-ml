@@ -162,35 +162,23 @@ class MicroscopeEnv(Env):
         x, y = self.selected_piece_pos
         full_action = encode_action(x, y, dx, dy)
 
-        # Execute the move using original logic
-        reward = 0
-        terminated = False
-        truncated = False
-        self.turns += 1
-
         if not self.move(full_action):
-            if self.masks:
-                if numpy.any(action_masks(self.game_grid, self.turn)):
-                    terminated = True
-                    reward = -5
-                    self.turns -= 1
-            reward = -1
+            # Invalid move — return penalty immediately without consuming a turn or flipping sides
+            self.action_stage = 0
+            self.selected_piece_pos = None
+            return self._get_obs(), -1.0, False, False, {}
 
-        # Flip turn for self-play (agent plays both colors)
+        # Valid move: advance turn counter and flip sides for self-play
+        self.turns += 1
         self.turn = not self.turn
 
-        # Use configured reward function (expects 7x7x2 board)
         reward, terminated = self.reward_fn(self.game_grid, not self.turn)
 
-        # Get observation with turn indicator
+        truncated = self.turns >= self.turn_limit
+
         observation = self._get_obs()
 
-        if self.turns >= self.turn_limit - 1:
-            reward = -1
-            truncated = True
-
         if self.render_mode == 'human':
-            # Render final board when episode ends
             if self.debug:
                 print(f"Reward: {reward}")
             if terminated or truncated:
@@ -247,8 +235,6 @@ class MicroscopeEnv(Env):
                     # Check if this piece has any valid moves
                     has_valid_move = False
                     for move_idx in range(25):
-                        dx = (move_idx % 5) - 2
-                        dy = (move_idx // 5) - 2
                         full_action = y * 7 * 25 + x * 25 + move_idx
                         if is_action_valid(self.game_grid, full_action, self.turn):
                             has_valid_move = True
@@ -261,10 +247,7 @@ class MicroscopeEnv(Env):
 
     def _action_masks_select_move(self) -> ActionMask:
         """Stage 1: Mask valid moves from selected position (padded to 49 for consistency)"""
-        mask = numpy.zeros(49, dtype=bool)  # Always 49 to match action space
-
-        if self.selected_piece_pos is None:
-            return mask  # Shouldn't happen
+        mask = numpy.zeros(49, dtype=bool)
 
         x, y = self.selected_piece_pos
 

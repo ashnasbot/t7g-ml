@@ -177,8 +177,8 @@ class TestEpisodeLifecycle:
             _, _, terminated, truncated, _ = env.step(valid_action)
             steps += 1
 
-        # Should terminate within max steps
-        assert steps < max_steps
+        # Should terminate within max steps (exactly at limit is fine)
+        assert steps <= max_steps
         assert terminated or truncated
 
     def test_reset_clears_state(self):

@@ -268,13 +268,10 @@ def check_terminal(board: Board, turn: bool) -> tuple[bool, Optional[float]]:
         return True, (1.0 if turn else -1.0)
 
     current_can_move = numpy.any(action_masks(board, turn))
-    if current_can_move:
-        opponent_can_move = numpy.any(action_masks(board, not turn))
-        if opponent_can_move:
-            return False, None
+    opponent_can_move = numpy.any(action_masks(board, not turn))
 
-    if not current_can_move:
-        opponent_can_move = numpy.any(action_masks(board, not turn))
+    if current_can_move and opponent_can_move:
+        return False, None
 
     if not current_can_move:
         empty = 49 - blue_count - green_count
