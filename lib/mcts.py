@@ -6,6 +6,11 @@ using game logic from util/t7g.py. Each tree edge is a complete move
 (piece + direction) encoded in 1225-action space.
 
 Performance features:
+  - Transposition table: duplicate board positions share statistics and network
+    evaluations, so the same position discovered via different paths is only
+    evaluated by the network once
+  - Cycle detection: if a board position appears twice in the current selection
+    path, the simulation terminates with value=0 (draw by repetition)
   - Lazy child expansion: child MCTSNodes created only when first visited
   - Batched network inference: multiple leaf nodes evaluated in one forward pass
   - Virtual loss: discourages re-selecting the same path within a batch
@@ -18,17 +23,22 @@ Usage:
     network = DualHeadNetwork()
     mcts = MCTS(network, num_simulations=100)
     action_probs = mcts.search(board, turn=True)
-    mcts.advance_tree(selected_action)   # reuse tree next move
+    mcts.advance_tree(selected_action)   # reuse graph next move
 """
+from __future__ import annotations
+
 import math
 import numpy as np
+import numpy.typing as npt
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from lib.t7g import (
     action_masks, action_to_move, count_cells,
     apply_move, board_to_obs, check_terminal, new_board,
-    BLUE, GREEN, CLEAR
+    BLUE, GREEN, CLEAR,
+    Board,  # npt.NDArray[np.bool_], shape (7, 7, 2)
 )
 
 # Virtual loss added to discourage parallel paths from converging on the same leaf
@@ -39,7 +49,7 @@ VIRTUAL_LOSS = 3
 # Game simulation
 # ============================================================
 
-def get_legal_moves(board, turn):
+def get_legal_moves(board: Board, turn: bool) -> list[int]:
     """Get list of valid action indices in 1225-action space."""
     masks = action_masks(board, turn)
     return list(np.where(masks)[0])
@@ -50,29 +60,53 @@ def get_legal_moves(board, turn):
 # ============================================================
 
 class MCTSNode:
-    """Single node in the MCTS tree."""
+    """
+    Single node in the MCTS search graph (transposition table entry).
+
+    A node represents a unique (board, turn) position. The same node may be
+    reachable via multiple paths from the root — this is the transposition case.
+    Visit statistics are shared across all paths that reach this position.
+    """
 
     __slots__ = [
-        'board', 'turn', 'parent', 'action', 'children',
+        'board', 'turn', 'action', 'children',
         'visit_count', 'value_sum', 'prior',
-        'is_terminal', 'terminal_value', 'is_expanded',
-        # Lazy expansion: priors stored here; children created on first visit
-        'move_priors',    # dict[action -> prior prob] for all legal moves
-        'network_value',  # cached network value estimate (for backprop)
+        'edge_visits', 'is_terminal', 'terminal_value', 'is_expanded',
+        'move_priors', 'network_value',
     ]
 
-    def __init__(self, board, turn, parent=None, action=None, prior=0.0):
+    board: Board
+    turn: bool
+    action: int | None              # action that first created this node (informational)
+    children: dict[int, MCTSNode]   # action_1225 -> MCTSNode (lazily populated)
+    visit_count: int
+    value_sum: float
+    prior: float
+    edge_visits: dict[int, int]     # action -> simulation count through this edge
+    is_terminal: bool
+    terminal_value: float | None
+    is_expanded: bool
+    move_priors: dict[int, float] | None  # set during _expand_batch
+    network_value: float                  # set during _expand_batch
+
+    def __init__(
+        self,
+        board: Board,
+        turn: bool,
+        action: int | None = None,
+        prior: float = 0.0,
+    ) -> None:
         self.board = board
         self.turn = turn
-        self.parent = parent
-        self.action = action        # action that led to this node
-        self.children = {}          # action_1225 -> MCTSNode (lazily populated)
+        self.action = action
+        self.children = {}
         self.visit_count = 0
         self.value_sum = 0.0
         self.prior = prior
+        self.edge_visits = {}
         self.is_expanded = False
-        self.move_priors = None     # set during _expand_batch
-        self.network_value = 0.0   # set during _expand_batch
+        self.move_priors = None
+        self.network_value = 0.0
 
         # Check terminal state
         self.is_terminal, self.terminal_value = check_terminal(board, turn)
@@ -93,34 +127,53 @@ class MCTS:
     """
     AlphaZero-style Monte Carlo Tree Search with neural network guidance.
 
+    The search graph uses a transposition table so that identical board
+    positions discovered via different move sequences share the same node and
+    its visit statistics. Cycles are detected per-simulation and treated as
+    draws (value = 0).
+
     Optimizations vs naive implementation:
+      - Transposition table: O(1) lookup prevents duplicate network evaluations
+        and merges visit counts across transposed paths
+      - Cycle detection: repeated positions in one selection path → value=0
       - Lazy child expansion: nodes created only when first selected
       - Batched inference: `inference_batch_size` leaves evaluated per forward pass
-      - Virtual loss: steers batch selections to different tree branches
-      - Tree reuse: call advance_tree(action) to carry the tree across moves
+      - Virtual loss: steers batch selections to different branches
+      - Graph reuse: call advance_tree(action) to carry the graph across moves
     """
 
-    def __init__(self, network, num_simulations=100, c_puct=2.0,
-                 dirichlet_alpha=0.1, dirichlet_epsilon=0.25,
-                 inference_batch_size=8):
+    def __init__(
+        self,
+        network: nn.Module,
+        num_simulations: int = 100,
+        c_puct: float = 2.0,
+        dirichlet_alpha: float = 0.1,
+        dirichlet_epsilon: float = 0.25,
+        inference_batch_size: int = 8,
+    ) -> None:
         """
         Args:
-            network: DualHeadNetwork
+            network: DualHeadNetwork (or any nn.Module with the same interface)
             num_simulations: MCTS rollouts per search call
             c_puct: exploration constant for PUCT formula
             dirichlet_alpha: Dirichlet noise concentration at root
             dirichlet_epsilon: weight of Dirichlet noise at root
             inference_batch_size: leaves per network forward pass
         """
-        self.network = network
-        self.num_simulations = num_simulations
-        self.c_puct = c_puct
-        self.dirichlet_alpha = dirichlet_alpha
-        self.dirichlet_epsilon = dirichlet_epsilon
-        self.inference_batch_size = inference_batch_size
-        self.root = None  # persistent root for tree reuse
+        self.network: nn.Module = network
+        self.num_simulations: int = num_simulations
+        self.c_puct: float = c_puct
+        self.dirichlet_alpha: float = dirichlet_alpha
+        self.dirichlet_epsilon: float = dirichlet_epsilon
+        self.inference_batch_size: int = inference_batch_size
+        self.root: MCTSNode | None = None
+        self.transposition_table: dict[bytes, MCTSNode] = {}
 
-    def search(self, board, turn):
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def search(self, board: Board, turn: bool) -> npt.NDArray[np.float32]:
         """
         Run MCTS from position, return action probability distribution.
 
@@ -131,9 +184,12 @@ class MCTS:
         Returns:
             action_probs: 1225-element numpy array of visit-count probabilities
         """
-        # --- Tree reuse: reuse existing subtree if board matches ---
+        # --- Graph reuse: reset only when the board position changes ---
+        root_key = self._board_key(board, turn)
         if self.root is None or not np.array_equal(self.root.board, board):
+            self.transposition_table = {}
             self.root = MCTSNode(board, turn)
+            self.transposition_table[root_key] = self.root
         root = self.root
 
         # Expand root if not already done
@@ -156,38 +212,46 @@ class MCTS:
         sims_done = 0
         while sims_done < self.num_simulations:
             batch_leaves = []
+            batch_nodes = []    # path node lists for each batch leaf
+            batch_edges = []    # path edge lists for each batch leaf
+
             batch_target = min(
                 self.inference_batch_size,
                 self.num_simulations - sims_done
             )
 
             for _ in range(batch_target):
-                node = root
+                nodes, edges, is_cycle = self._select_path(root)
+                leaf = nodes[-1]
 
-                # SELECT: traverse tree using PUCT until a leaf
-                while node.is_expanded and not node.is_terminal:
-                    node = self._select_child(node)
-
-                if node.is_terminal:
-                    self._backpropagate(node, node.terminal_value)
+                if is_cycle:
+                    # Repeated position in this path → draw by repetition
+                    self._backpropagate(nodes, edges, 0.0)
+                    sims_done += 1
+                elif leaf.is_terminal:
+                    self._backpropagate(nodes, edges, leaf.terminal_value)
                     sims_done += 1
                 else:
-                    # Apply virtual loss so parallel selections avoid this path
-                    self._apply_virtual_loss(node)
-                    batch_leaves.append(node)
+                    # Apply virtual loss so other batch sims avoid this path
+                    self._apply_virtual_loss(nodes)
+                    batch_leaves.append(leaf)
+                    batch_nodes.append(nodes)
+                    batch_edges.append(edges)
 
             # EXPAND batch + BACKPROPAGATE
             if batch_leaves:
                 self._expand_batch(batch_leaves)
-                for node in batch_leaves:
-                    self._remove_virtual_loss(node)
-                    self._backpropagate(node, node.network_value)
+                for leaf, nodes, edges in zip(batch_leaves, batch_nodes, batch_edges):
+                    self._remove_virtual_loss(nodes)
+                    self._backpropagate(nodes, edges, leaf.network_value)
                     sims_done += 1
 
-        # Build action probability distribution from visit counts
+        # Build action probability distribution from per-edge visit counts.
+        # Using edge_visits (not child.visit_count) correctly handles the rare
+        # case where two different root moves lead to the same transposed position.
         action_probs = np.zeros(1225, dtype=np.float32)
-        for action, child in root.children.items():
-            action_probs[action] = child.visit_count
+        for action, count in root.edge_visits.items():
+            action_probs[action] = count
 
         total = action_probs.sum()
         if total > 0:
@@ -195,63 +259,112 @@ class MCTS:
 
         return action_probs
 
-    def advance_tree(self, action):
+    def advance_tree(self, action: int) -> None:
         """
-        Reuse the subtree rooted at the child for `action`.
+        Reuse the subgraph rooted at the child for `action`.
 
-        Call this after selecting and applying a move so the next search
-        builds on existing visit counts instead of starting from scratch.
+        The transposition table is preserved across the advance so previously
+        explored positions retain their statistics. Call this after selecting
+        and applying a move.
         """
         if self.root is not None and action in self.root.children:
             self.root = self.root.children[action]
-            self.root.parent = None   # detach → allows GC of old branches
         else:
-            self.root = None          # child not visited yet; start fresh
+            self.root = None
+            self.transposition_table = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _select_child(self, node):
-        """Select child with highest PUCT score, creating it lazily if needed."""
+    def _board_key(self, board: Board, turn: bool) -> bytes:
+        """Compact hashable key for the transposition table."""
+        return board.tobytes() + bytes([turn])
+
+    def _select_path(
+        self, root: MCTSNode
+    ) -> tuple[list[MCTSNode], list[int], bool]:
+        """
+        Traverse from root to a leaf using PUCT selection.
+
+        Returns:
+            nodes: list[MCTSNode] from root to leaf (inclusive)
+            edges: list[int] of actions taken; edges[i] goes from nodes[i] to nodes[i+1]
+            is_cycle: True if the leaf position already appeared earlier in the path
+        """
+        nodes = [root]
+        edges = []
+        visited_keys = {self._board_key(root.board, root.turn)}
+        node = root
+
+        while node.is_expanded and not node.is_terminal:
+            action = self._best_action(node)
+            child = self._get_or_create_child(node, action)
+            edges.append(action)
+            nodes.append(child)
+
+            key = self._board_key(child.board, child.turn)
+            if key in visited_keys:
+                return nodes, edges, True   # cycle detected
+            visited_keys.add(key)
+            node = child
+
+        return nodes, edges, False
+
+    def _best_action(self, node: MCTSNode) -> int:
+        """Return the action with the highest PUCT score from this node."""
         best_score = -float('inf')
         best_action = None
         sqrt_parent = math.sqrt(node.visit_count)
 
         for action, prior in node.move_priors.items():
             child = node.children.get(action)
-            if child is None:
-                q = 0.0
-                visits = 0
-            else:
-                q = -child.q_value   # negate: child value is opponent's perspective
-                visits = child.visit_count
+            q = 0.0 if child is None else -child.q_value   # negate: child is opponent
+            visits = 0 if child is None else child.visit_count
 
             score = q + self.c_puct * prior * sqrt_parent / (1 + visits)
             if score > best_score:
                 best_score = score
                 best_action = action
 
-        # Lazily create the child node only now (on first selection)
-        if best_action not in node.children:
-            child_board = apply_move(node.board, best_action, node.turn)
-            child = MCTSNode(
-                child_board,
-                turn=not node.turn,
-                parent=node,
-                action=best_action,
-                prior=node.move_priors[best_action],
-            )
-            node.children[best_action] = child
+        return best_action
 
-        return node.children[best_action]
+    def _get_or_create_child(self, node: MCTSNode, action: int) -> MCTSNode:
+        """
+        Return the child for `action`, creating it lazily if needed.
 
-    def _expand_batch(self, nodes):
+        Checks the transposition table before allocating a new node — if this
+        board position was already reached via a different path, the existing
+        node (with its accumulated statistics) is reused.
+        """
+        if action not in node.children:
+            child_board = apply_move(node.board, action, node.turn)
+            child_turn = not node.turn
+            key = self._board_key(child_board, child_turn)
+
+            if key in self.transposition_table:
+                child = self.transposition_table[key]
+            else:
+                child = MCTSNode(
+                    child_board,
+                    turn=child_turn,
+                    action=action,
+                    prior=node.move_priors[action],
+                )
+                self.transposition_table[key] = child
+
+            node.children[action] = child
+
+        return node.children[action]
+
+    def _expand_batch(self, nodes: list[MCTSNode]) -> None:
         """
         Evaluate a batch of leaf nodes in a single network forward pass.
 
         Sets node.move_priors, node.network_value, node.is_expanded.
         Handles terminal / no-legal-moves cases without a network call.
+        Skips nodes that are already expanded (can happen with transpositions
+        when two batch simulations reach the same unexpanded position).
         """
         to_evaluate = []
         legal_moves_list = []
@@ -305,31 +418,39 @@ class MCTS:
             node.network_value = float(value)
             node.is_expanded = True
 
-    def _apply_virtual_loss(self, node):
-        """Add pessimistic counts up the tree to discourage re-selection."""
-        n = node
-        while n is not None:
-            n.visit_count += VIRTUAL_LOSS
-            n.value_sum -= VIRTUAL_LOSS   # value = -1 per virtual visit
-            n = n.parent
+    def _apply_virtual_loss(self, nodes: list[MCTSNode]) -> None:
+        """Add pessimistic counts to all nodes on the selection path."""
+        for node in nodes:
+            node.visit_count += VIRTUAL_LOSS
+            node.value_sum -= VIRTUAL_LOSS
 
-    def _remove_virtual_loss(self, node):
+    def _remove_virtual_loss(self, nodes: list[MCTSNode]) -> None:
         """Undo virtual loss before applying real backpropagation."""
-        n = node
-        while n is not None:
-            n.visit_count -= VIRTUAL_LOSS
-            n.value_sum += VIRTUAL_LOSS
-            n = n.parent
+        for node in nodes:
+            node.visit_count -= VIRTUAL_LOSS
+            node.value_sum += VIRTUAL_LOSS
 
-    def _backpropagate(self, node, value):
-        """Update visit counts and values from leaf to root."""
-        while node is not None:
+    def _backpropagate(
+        self, nodes: list[MCTSNode], edges: list[int], value: float
+    ) -> None:
+        """
+        Update visit counts, values, and edge visit counts from leaf to root.
+
+        nodes[i] --edges[i]--> nodes[i+1], with value from nodes[-1]'s perspective.
+        Sign flips at each step to account for alternating player perspectives.
+        """
+        for i in range(len(nodes) - 1, -1, -1):
+            node = nodes[i]
             node.visit_count += 1
             node.value_sum += value
-            value = -value   # flip perspective at each level
-            node = node.parent
+            if i < len(edges):
+                action = edges[i]
+                node.edge_visits[action] = node.edge_visits.get(action, 0) + 1
+            value = -value  # flip perspective at each level
 
-    def select_action(self, action_probs, temperature=1.0):
+    def select_action(
+        self, action_probs: npt.NDArray[np.float32], temperature: float = 1.0
+    ) -> int:
         """
         Select action from MCTS probability distribution.
 

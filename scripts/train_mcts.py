@@ -23,6 +23,7 @@ from collections import deque
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 # Add project root to path
@@ -281,22 +282,27 @@ def train_network(network, replay_buffer, optimizer, batch_size=256,
 # Evaluation
 # ============================================================
 
-def evaluate_vs_minimax(network, minimax_depth=2, num_games=20,
-                        num_simulations=100):
+def evaluate_vs_noisy_minimax(network, minimax_depth=2, noise=0.3,
+                               num_games=20, num_simulations=100):
     """
-    Evaluate MCTS agent (as Blue) against minimax opponent (as Green).
+    Evaluate MCTS agent (Blue) against an epsilon-greedy minimax opponent (Green).
+
+    With probability `noise` the opponent picks a random legal move; otherwise
+    it plays the minimax best move at `minimax_depth`. This gives a smooth
+    difficulty knob: noise=1.0 is purely random, noise=0.0 is pure minimax.
 
     Returns:
         win_rate: fraction of games won by MCTS agent
         results: dict with wins/losses/draws
     """
     mcts = MCTS(network, num_simulations=num_simulations,
-                dirichlet_epsilon=0.0)  # No exploration noise for eval
+                dirichlet_epsilon=0.0)  # no exploration noise during eval
     wins = 0
     losses = 0
     draws = 0
 
-    pbar = tqdm(range(num_games), desc=f"Eval vs MM-{minimax_depth}", unit="game", leave=False)
+    label = f"Eval vs MM-{minimax_depth} (noise={noise:.0%})"
+    pbar = tqdm(range(num_games), desc=label, unit="game", leave=False)
     for _ in pbar:
         board = new_board()
         turn = True  # Blue = MCTS agent
@@ -313,7 +319,6 @@ def evaluate_vs_minimax(network, minimax_depth=2, num_games=20,
 
             is_terminal, terminal_value = check_terminal(board, turn)
             if is_terminal:
-                # terminal_value from current player perspective
                 blue_result = terminal_value if turn else -terminal_value
                 break
 
@@ -322,13 +327,18 @@ def evaluate_vs_minimax(network, minimax_depth=2, num_games=20,
                 action_probs = mcts.search(board, turn)
                 action = mcts.select_action(action_probs, temperature=0)
             else:
-                # Minimax opponent (Green)
-                board_bytes = board.tobytes()
-                action = find_best_move(board_bytes, minimax_depth, False)
-                if action in [-1, 1225]:
-                    # Minimax has no moves - MCTS wins
-                    blue_result = 1.0
-                    break
+                # Noisy minimax opponent (Green)
+                if np.random.random() < noise:
+                    legal = np.where(action_masks(board, False))[0]
+                    if len(legal) == 0:
+                        blue_result = 1.0
+                        break
+                    action = int(np.random.choice(legal))
+                else:
+                    action = find_best_move(board.tobytes(), minimax_depth, False)
+                    if action in (-1, 1225):
+                        blue_result = 1.0
+                        break
 
             board = apply_move(board, action, turn)
             turn = not turn
@@ -352,61 +362,6 @@ def evaluate_vs_minimax(network, minimax_depth=2, num_games=20,
     return win_rate, {"wins": wins, "losses": losses, "draws": draws}
 
 
-def evaluate_vs_random(network, num_games=20, num_simulations=50):
-    """Quick evaluation against random opponent."""
-    mcts = MCTS(network, num_simulations=num_simulations,
-                dirichlet_epsilon=0.0)
-    wins = 0
-
-    pbar = tqdm(range(num_games), desc="Eval vs Random", unit="game", leave=False)
-    for i in pbar:
-        board = new_board()
-        turn = True
-        move_count = 0
-        board_history = {}
-
-        while True:
-            state_key = board.tobytes() + bytes([turn])
-            board_history[state_key] = board_history.get(state_key, 0) + 1
-            if board_history[state_key] >= 3:
-                blue, green = count_cells(board)
-                blue_result = 1.0 if blue > green else (-1.0 if green > blue else 0.0)
-                break
-
-            is_terminal, terminal_value = check_terminal(board, turn)
-            if is_terminal:
-                blue_result = terminal_value if turn else -terminal_value
-                break
-
-            if turn:
-                # MCTS agent
-                action_probs = mcts.search(board, turn)
-                action = mcts.select_action(action_probs, temperature=0)
-            else:
-                # Random opponent
-                masks = action_masks(board, turn)
-                legal = np.where(masks)[0]
-                if len(legal) == 0:
-                    blue_result = 1.0
-                    break
-                action = int(np.random.choice(legal))
-
-            board = apply_move(board, action, turn)
-            turn = not turn
-            move_count += 1
-
-            if move_count > 200:
-                blue, green = count_cells(board)
-                blue_result = 1.0 if blue > green else (-1.0 if green > blue else 0.0)
-                break
-
-        if blue_result > 0:
-            wins += 1
-        pbar.set_postfix(win_rate=f"{wins / (i + 1):.0%}")
-
-    return wins / num_games
-
-
 # ============================================================
 # Main training loop
 # ============================================================
@@ -421,6 +376,8 @@ def main():
                         help="Self-play games per iteration")
     parser.add_argument("--iterations", type=int, default=NUM_ITERATIONS,
                         help="Total training iterations")
+    parser.add_argument("--logdir", type=str, default="tblog/mcts",
+                        help="TensorBoard log directory")
     args = parser.parse_args()
 
     # Device
@@ -446,8 +403,10 @@ def main():
         start_iteration = checkpoint.get('iteration', 0) + 1
         print(f"Resuming from iteration {start_iteration}")
 
-    # Create checkpoint directory
+    # Create checkpoint directory and TensorBoard writer
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    writer = SummaryWriter(log_dir=args.logdir)
+    print(f"TensorBoard logs: {args.logdir}")
 
     print("=" * 60)
     print("AlphaZero MCTS Training for Microscope")
@@ -460,10 +419,13 @@ def main():
     print(f"Epochs/iteration: {EPOCHS_PER_ITERATION}")
     print("=" * 60)
 
-    # Quick baseline: random network vs random opponent
-    print("\nBaseline: untrained network vs random...")
-    baseline_wr = evaluate_vs_random(network, num_games=10, num_simulations=20)
-    print(f"  Win rate vs random: {baseline_wr:.0%}")
+    # Quick baseline: untrained network vs mostly-random opponent
+    print("\nBaseline: untrained network vs noisy minimax (noise=100%)...")
+    baseline_wr, _ = evaluate_vs_noisy_minimax(
+        network, minimax_depth=1, noise=1.0, num_games=10, num_simulations=20
+    )
+    print(f"  Win rate: {baseline_wr:.0%}")
+    writer.add_scalar("eval/win_rate_vs_random", baseline_wr, global_step=0)
 
     iter_pbar = tqdm(range(start_iteration, args.iterations),
                      desc="Training", unit="iter",
@@ -484,9 +446,18 @@ def main():
         print(f"  Generated {len(examples)} examples in {gen_time:.1f}s")
         print(f"  Results: Blue {bw} / Green {gw} / Draw {dr}")
 
+        step = iteration + 1
+        total_games = bw + gw + dr
+        writer.add_scalar("self_play/blue_win_rate",  bw / total_games, step)
+        writer.add_scalar("self_play/green_win_rate", gw / total_games, step)
+        writer.add_scalar("self_play/draw_rate",      dr / total_games, step)
+        writer.add_scalar("self_play/examples_generated", len(examples), step)
+        writer.add_scalar("timing/gen_seconds", gen_time, step)
+
         # 2. Add to replay buffer
         replay_buffer.extend(examples)
         print(f"  Replay buffer: {len(replay_buffer)} examples")
+        writer.add_scalar("self_play/buffer_size", len(replay_buffer), step)
 
         # 3. Train network
         print(f"\nTraining ({EPOCHS_PER_ITERATION} epochs, "
@@ -503,34 +474,35 @@ def main():
         print(f"  Total loss:  {losses['total_loss']:.4f}")
         print(f"  Train time:  {train_time:.1f}s")
 
+        writer.add_scalar("train/policy_loss", losses['policy_loss'], step)
+        writer.add_scalar("train/value_loss",  losses['value_loss'],  step)
+        writer.add_scalar("train/total_loss",  losses['total_loss'],  step)
+        writer.add_scalar("timing/train_seconds", train_time, step)
+
         # 4. Evaluate
         if (iteration + 1) % EVAL_INTERVAL == 0:
             print("\nEvaluating...")
 
-            # vs random
-            wr_random = evaluate_vs_random(
-                network, num_games=EVAL_GAMES, num_simulations=args.simulations
-            )
-            print(f"  vs Random: {wr_random:.0%}")
-
-            # vs minimax depth-1
-            wr_mm1, results_mm1 = evaluate_vs_minimax(
-                network, minimax_depth=1, num_games=EVAL_GAMES,
+            # vs noisy minimax depth-1 (30% blunder rate)
+            wr_mm1, results_mm1 = evaluate_vs_noisy_minimax(
+                network, minimax_depth=1, noise=0.3, num_games=EVAL_GAMES,
                 num_simulations=args.simulations
             )
-            print(f"  vs Minimax-1: {wr_mm1:.0%} "
+            print(f"  vs MM-1 (30% noise): {wr_mm1:.0%} "
                   f"(W:{results_mm1['wins']} L:{results_mm1['losses']} "
                   f"D:{results_mm1['draws']})")
+            writer.add_scalar("eval/win_rate_mm1_noise30", wr_mm1, step)
 
-            # vs minimax depth-2 (less frequent, slower)
+            # vs noisy minimax depth-2 (30% blunder rate, less frequent)
             if (iteration + 1) % (EVAL_INTERVAL * 2) == 0:
-                wr_mm2, results_mm2 = evaluate_vs_minimax(
-                    network, minimax_depth=2, num_games=10,
+                wr_mm2, results_mm2 = evaluate_vs_noisy_minimax(
+                    network, minimax_depth=2, noise=0.3, num_games=10,
                     num_simulations=args.simulations
                 )
-                print(f"  vs Minimax-2: {wr_mm2:.0%} "
+                print(f"  vs MM-2 (30% noise): {wr_mm2:.0%} "
                       f"(W:{results_mm2['wins']} L:{results_mm2['losses']} "
                       f"D:{results_mm2['draws']})")
+                writer.add_scalar("eval/win_rate_mm2_noise30", wr_mm2, step)
 
         # 5. Checkpoint
         if (iteration + 1) % CHECKPOINT_INTERVAL == 0:
@@ -550,6 +522,8 @@ def main():
             buf=len(replay_buffer),
             time=f"{iter_time:.0f}s"
         )
+
+    writer.close()
 
     # Save final model
     final_path = os.path.join(CHECKPOINT_DIR, "final.pt")
