@@ -44,12 +44,12 @@ GAMES_PER_ITERATION = 50
 MCTS_SIMULATIONS = 100
 BATCH_SIZE = 256
 EPOCHS_PER_ITERATION = 5
-REPLAY_BUFFER_SIZE = 100_000
+REPLAY_BUFFER_SIZE = 25_000
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 TEMPERATURE_THRESHOLD = 15   # moves before switching to greedy
-C_PUCT = 2.0                 # PUCT exploration constant (lower = more exploitation)
-DIRICHLET_ALPHA = 0.1        # root noise concentration (~10/avg_legal_moves)
+C_PUCT = 1.5                 # PUCT exploration constant (lower = more exploitation)
+DIRICHLET_ALPHA = 0.5        # root noise concentration (~10/avg_legal_moves, ~16-24 legal moves here)
 EVAL_INTERVAL = 5            # evaluate every N iterations
 EVAL_GAMES = 20
 CHECKPOINT_INTERVAL = 10
@@ -171,9 +171,9 @@ def generate_self_play_data(network, num_games, num_simulations=100,
                             num_workers=None):
     """Generate training data from multiple self-play games in parallel."""
     if num_workers is None:
-        # Cap at 3 workers — each torch worker commits ~6 GB of virtual address
-        # space on Windows. we're bottlenecked by inference anyway. 
-        num_workers = min(3, num_games)
+        # Cap at 4 workers — each torch worker commits ~6 GB of virtual address
+        # space on Windows. Inference quickly becomes the bottleneck anyway.
+        num_workers = min(4, num_games)
 
     # CPU state dict is picklable; CUDA tensors are not
     state_dict = {k: v.cpu() for k, v in network.state_dict().items()}
@@ -483,6 +483,16 @@ def main():
         if (iteration + 1) % EVAL_INTERVAL == 0:
             print("\nEvaluating...")
 
+            # vs pure random (noise=1.0)
+            wr_rand, results_rand = evaluate_vs_noisy_minimax(
+                network, minimax_depth=1, noise=1.0, num_games=EVAL_GAMES,
+                num_simulations=args.simulations
+            )
+            print(f"  vs Random:           {wr_rand:.0%} "
+                  f"(W:{results_rand['wins']} L:{results_rand['losses']} "
+                  f"D:{results_rand['draws']})")
+            writer.add_scalar("eval/win_rate_vs_random", wr_rand, step)
+
             # vs noisy minimax depth-1 (30% blunder rate)
             wr_mm1, results_mm1 = evaluate_vs_noisy_minimax(
                 network, minimax_depth=1, noise=0.3, num_games=EVAL_GAMES,
@@ -493,16 +503,26 @@ def main():
                   f"D:{results_mm1['draws']})")
             writer.add_scalar("eval/win_rate_mm1_noise30", wr_mm1, step)
 
-            # vs noisy minimax depth-2 (30% blunder rate, less frequent)
+            # vs noisy minimax depth-2 (30% blunder rate)
+            wr_mm2, results_mm2 = evaluate_vs_noisy_minimax(
+                network, minimax_depth=2, noise=0.3, num_games=EVAL_GAMES,
+                num_simulations=args.simulations
+            )
+            print(f"  vs MM-2 (30% noise): {wr_mm2:.0%} "
+                  f"(W:{results_mm2['wins']} L:{results_mm2['losses']} "
+                  f"D:{results_mm2['draws']})")
+            writer.add_scalar("eval/win_rate_mm2_noise30", wr_mm2, step)
+
+            # vs pure minimax depth-3 (no noise, less frequent — harder)
             if (iteration + 1) % (EVAL_INTERVAL * 2) == 0:
-                wr_mm2, results_mm2 = evaluate_vs_noisy_minimax(
-                    network, minimax_depth=2, noise=0.3, num_games=10,
+                wr_mm3, results_mm3 = evaluate_vs_noisy_minimax(
+                    network, minimax_depth=3, noise=0.0, num_games=EVAL_GAMES,
                     num_simulations=args.simulations
                 )
-                print(f"  vs MM-2 (30% noise): {wr_mm2:.0%} "
-                      f"(W:{results_mm2['wins']} L:{results_mm2['losses']} "
-                      f"D:{results_mm2['draws']})")
-                writer.add_scalar("eval/win_rate_mm2_noise30", wr_mm2, step)
+                print(f"  vs MM-3 (pure):      {wr_mm3:.0%} "
+                      f"(W:{results_mm3['wins']} L:{results_mm3['losses']} "
+                      f"D:{results_mm3['draws']})")
+                writer.add_scalar("eval/win_rate_mm3_pure", wr_mm3, step)
 
         # 5. Checkpoint
         if (iteration + 1) % CHECKPOINT_INTERVAL == 0:
