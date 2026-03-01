@@ -17,6 +17,7 @@ Usage:
 """
 from env.env_virt import MicroscopeEnvAggressive
 from env.minimax_wrapper import MinimaxOpponentWrapper
+from env.noisy_minimax_wrapper import NoisyMinimaxOpponentWrapper
 from env.random_opponent_wrapper import RandomOpponentWrapper
 from env.action_mask_wrapper import ActionMaskWrapper
 from env.symmetry_wrapper import SymmetryAugmentationWrapper
@@ -54,24 +55,42 @@ STAGE_PROGRESSION = [
         "eval_opponent": "random",
         "eval_depth": None
     },
-    # Stage 2: Jump straight to depth-3
-    # Depth-1 is pure greedy (same signal as reward function - skip it).
-    # Depth-3 actually plans: sets traps, sacrifices for position, creates
-    # multi-move conversion chains the agent must learn to anticipate.
+    # Stage 2: Bridge — noisy minimax (30% random blunders)
+    # Pure minimax-3 is too dominant for an agent coming out of random training.
+    # Noise=0.3 means the opponent occasionally hangs pieces, giving the agent
+    # something to exploit while still needing to handle real tactical threats.
     {
-        "name": "stage2_vs_minimax3",
+        "name": "stage2_vs_noisy_minimax",
+        "env_class": MicroscopeEnvAggressive,
+        "timesteps": 2_000_000,
+        "learning_rate": 3e-4,
+        "description": "Bridge: noisy minimax-3 (30% random blunders)",
+        "train_opponent": "noisy_minimax",
+        "train_depth": 3,
+        "train_noise": 0.3,
+        "eval_opponent": "noisy_minimax",
+        "eval_depth": 3,
+        "eval_noise": 0.3,
+    },
+    # Stage 3: Depth-3 with 10% blunder rate
+    # Near-perfect play is too hard to learn against; a small noise floor keeps
+    # the agent receiving enough positive feedback to stay on track.
+    {
+        "name": "stage3_vs_minimax3",
         "env_class": MicroscopeEnvAggressive,
         "timesteps": 3_000_000,
         "learning_rate": 3e-4,
-        "description": "Tactical: learn to handle multi-move planning vs minimax-3",
-        "train_opponent": "minimax",
+        "description": "Tactical: minimax-3 with 10% blunders",
+        "train_opponent": "noisy_minimax",
         "train_depth": 3,
-        "eval_opponent": "minimax",
-        "eval_depth": 3
+        "train_noise": 0.1,
+        "eval_opponent": "noisy_minimax",
+        "eval_depth": 3,
+        "eval_noise": 0.1,
     },
-    # Stage 3: Train vs depth-5
+    # Stage 4: Train vs depth-5
     {
-        "name": "stage3_vs_minimax5",
+        "name": "stage4_vs_minimax5",
         "env_class": MicroscopeEnvAggressive,
         "timesteps": 3_000_000,
         "learning_rate": 1e-4,
@@ -84,7 +103,7 @@ STAGE_PROGRESSION = [
 ]
 
 
-def make_env_with_timeout(env_class, render_mode=None, opponent_type=None, minimax_depth=3):
+def make_env_with_timeout(env_class, render_mode=None, opponent_type=None, minimax_depth=3, minimax_noise=0.3):
     """
     Create environment with safety timeout.
 
@@ -94,8 +113,9 @@ def make_env_with_timeout(env_class, render_mode=None, opponent_type=None, minim
     Args:
         env_class: Environment class to instantiate
         render_mode: 'human' for visualization, None for training
-        opponent_type: 'random', 'minimax', or None for self-play
-        minimax_depth: Minimax search depth if opponent_type='minimax' (1-5, default 3)
+        opponent_type: 'random', 'minimax', 'noisy_minimax', or None for self-play
+        minimax_depth: Minimax search depth (1-5, default 3)
+        minimax_noise: Blunder probability for noisy_minimax (0.0-1.0, default 0.3)
     """
     def _init():
         env = env_class(render_mode=render_mode)
@@ -106,6 +126,8 @@ def make_env_with_timeout(env_class, render_mode=None, opponent_type=None, minim
             env = RandomOpponentWrapper(env, render_mode=render_mode)
         elif opponent_type == 'minimax':
             env = MinimaxOpponentWrapper(env, depth=minimax_depth)
+        elif opponent_type == 'noisy_minimax':
+            env = NoisyMinimaxOpponentWrapper(env, depth=minimax_depth, noise=minimax_noise)
         # else: self-play (no opponent wrapper)
 
         # Apply symmetry augmentation for 8x data efficiency
@@ -181,7 +203,8 @@ if __name__ == "__main__":
             make_env_with_timeout(
                 stage_config['env_class'],
                 opponent_type=stage_config['train_opponent'],
-                minimax_depth=stage_config.get('train_depth', 3)
+                minimax_depth=stage_config.get('train_depth', 3),
+                minimax_noise=stage_config.get('train_noise', 0.3),
             ) for _ in range(8)
         ])
 
@@ -197,7 +220,8 @@ if __name__ == "__main__":
                 stage_config['env_class'],
                 render_mode='human',
                 opponent_type=opponent_type,
-                minimax_depth=stage_config.get('eval_depth', 3)
+                minimax_depth=stage_config.get('eval_depth', 3),
+                minimax_noise=stage_config.get('eval_noise', 0.3),
             ) for _ in range(4)
         ])
 

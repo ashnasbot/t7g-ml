@@ -1,5 +1,4 @@
 import ctypes
-from functools import cache
 import numpy
 import pathlib
 from PIL import Image
@@ -179,7 +178,6 @@ def debug_move(action: int, is_player: bool) -> None:
     print(f"{t} [{from_x}, {from_y}]=> [{to_x}, {to_y}]")
 
 
-@cache
 def find_best_move(board: Any, depth: int, as_blue: bool) -> int:
     return scopelib.find_best_move(board, depth, as_blue)
 

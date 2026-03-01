@@ -9,7 +9,7 @@ import win32gui
 import win32api
 import win32con
 
-from lib.t7g import calc_reward, action_to_move, is_action_valid, encode_action, BLUE
+from lib.t7g import calc_reward, action_to_move, is_action_valid, encode_action, action_masks, BLUE
 from lib.reward_functions import get_reward_function
 
 # Max seconds to wait for the board to stabilise after a move
@@ -355,29 +355,16 @@ class MicroscopeEnv(Env):
 
     def _action_masks_select_piece(self):
         """Stage 0: Positions with blue pieces that have at least one valid move."""
-        mask = numpy.zeros(49, dtype=bool)
-        for y in range(7):
-            for x in range(7):
-                if numpy.array_equal(self.game_grid[y, x], BLUE):
-                    for move_idx in range(25):
-                        dx = (move_idx % 5) - 2
-                        dy = (move_idx // 5) - 2
-                        if is_action_valid(self.game_grid, encode_action(x, y, dx, dy), True):
-                            mask[y * 7 + x] = True
-                            break
-        return mask
+        return action_masks(self.game_grid, True).reshape(49, 25).any(axis=1)
 
     def _action_masks_select_move(self):
         """Stage 1: Valid moves from selected position (first 25 entries, padded to 49)."""
-        mask = numpy.zeros(49, dtype=bool)
         if self.selected_piece_pos is None:
-            return mask
+            return numpy.zeros(49, dtype=bool)
         x, y = self.selected_piece_pos
-        for move_idx in range(25):
-            dx = (move_idx % 5) - 2
-            dy = (move_idx // 5) - 2
-            if is_action_valid(self.game_grid, encode_action(x, y, dx, dy), True):
-                mask[move_idx] = True
+        piece_idx = y * 7 + x
+        mask = numpy.zeros(49, dtype=bool)
+        mask[:25] = action_masks(self.game_grid, True).reshape(49, 25)[piece_idx]
         return mask
 
     def close(self):

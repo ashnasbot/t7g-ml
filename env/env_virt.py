@@ -223,46 +223,14 @@ class MicroscopeEnv(Env):
 
     def _action_masks_select_piece(self) -> ActionMask:
         """Stage 0: Mask positions with pieces of current color that have valid moves"""
-        mask = numpy.zeros(49, dtype=bool)
-
-        color = BLUE if self.turn else GREEN
-
-        for y in range(7):
-            for x in range(7):
-                pos_idx = y * 7 + x
-                # Position is valid if it has a piece of our color AND that piece has valid moves
-                if numpy.array_equal(self.game_grid[y, x], color):
-                    # Check if this piece has any valid moves
-                    has_valid_move = False
-                    for move_idx in range(25):
-                        full_action = y * 7 * 25 + x * 25 + move_idx
-                        if is_action_valid(self.game_grid, full_action, self.turn):
-                            has_valid_move = True
-                            break
-
-                    if has_valid_move:
-                        mask[pos_idx] = True
-
-        return mask
+        return action_masks(self.game_grid, self.turn).reshape(49, 25).any(axis=1)
 
     def _action_masks_select_move(self) -> ActionMask:
         """Stage 1: Mask valid moves from selected position (padded to 49 for consistency)"""
-        mask = numpy.zeros(49, dtype=bool)
-
         x, y = self.selected_piece_pos
-
-        # Put move masks in first 25 positions
-        for move_idx in range(25):
-            dx = (move_idx % 5) - 2
-            dy = (move_idx // 5) - 2
-
-            # Check if this move is valid
-            full_action = encode_action(x, y, dx, dy)
-            if is_action_valid(self.game_grid, full_action, self.turn):
-                mask[move_idx] = True
-
-        # Positions 25-48 are always False (padding)
-
+        piece_idx = y * 7 + x
+        mask = numpy.zeros(49, dtype=bool)
+        mask[:25] = action_masks(self.game_grid, self.turn).reshape(49, 25)[piece_idx]
         return mask
 
     def close(self) -> None:
