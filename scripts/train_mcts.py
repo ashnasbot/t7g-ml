@@ -447,10 +447,6 @@ def main():
         print(f"  Results: Blue {bw} / Green {gw} / Draw {dr}")
 
         step = iteration + 1
-        total_games = bw + gw + dr
-        writer.add_scalar("self_play/blue_win_rate",  bw / total_games, step)
-        writer.add_scalar("self_play/green_win_rate", gw / total_games, step)
-        writer.add_scalar("self_play/draw_rate",      dr / total_games, step)
         writer.add_scalar("self_play/examples_generated", len(examples), step)
         writer.add_scalar("timing/gen_seconds", gen_time, step)
 
