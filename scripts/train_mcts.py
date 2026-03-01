@@ -18,6 +18,7 @@ import multiprocessing
 import os
 import sys
 import time
+from datetime import datetime
 from collections import deque
 
 import numpy as np
@@ -199,10 +200,7 @@ def generate_self_play_data(network, num_games, num_simulations=100,
             else:
                 draws += 1
             pbar.update(1)
-            pbar.set_postfix(
-                examples=len(all_examples),
-                W=blue_wins, L=green_wins, D=draws,
-            )
+            pbar.set_postfix(examples=len(all_examples))
     pbar.close()
 
     return all_examples, (blue_wins, green_wins, draws)
@@ -356,7 +354,7 @@ def evaluate_vs_noisy_minimax(network, minimax_depth=2, noise=0.3,
         else:
             draws += 1
 
-        pbar.set_postfix(W=wins, L=losses, D=draws)
+        pbar.set_postfix(win_rate=f"{wins / (wins + losses + draws):.0%}")
 
     win_rate = wins / num_games
     return win_rate, {"wins": wins, "losses": losses, "draws": draws}
@@ -377,7 +375,9 @@ def main():
     parser.add_argument("--iterations", type=int, default=NUM_ITERATIONS,
                         help="Total training iterations")
     parser.add_argument("--logdir", type=str, default="tblog/mcts",
-                        help="TensorBoard log directory")
+                        help="TensorBoard log root directory")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="Name for this run (default: timestamp). Logs go to logdir/run-name")
     args = parser.parse_args()
 
     # Device
@@ -405,8 +405,10 @@ def main():
 
     # Create checkpoint directory and TensorBoard writer
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    writer = SummaryWriter(log_dir=args.logdir)
-    print(f"TensorBoard logs: {args.logdir}")
+    run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join(args.logdir, run_name)
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"TensorBoard logs: {log_dir}")
 
     print("=" * 60)
     print("AlphaZero MCTS Training for Microscope")
