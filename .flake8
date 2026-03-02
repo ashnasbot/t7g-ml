@@ -1,0 +1,6 @@
+[flake8]
+max-line-length = 99
+extend-ignore =
+    # Alignment spaces (we use these intentionally in some places)
+    E221,
+    E241,

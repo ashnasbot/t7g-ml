@@ -24,16 +24,16 @@ from collections import deque
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import tqdm
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lib.dual_network import DualHeadNetwork
-from lib.mcts import MCTS
-from lib.t7g import new_board, apply_move, check_terminal, board_to_obs
-from lib.t7g import find_best_move, count_cells, show_board, action_masks
+from lib.dual_network import DualHeadNetwork  # noqa: E402
+from lib.mcts import MCTS  # noqa: E402
+from lib.t7g import new_board, apply_move, check_terminal, board_to_obs  # noqa: E402
+from lib.t7g import find_best_move, count_cells, action_masks  # noqa: E402
 
 
 # ============================================================
@@ -42,17 +42,17 @@ from lib.t7g import find_best_move, count_cells, show_board, action_masks
 
 NUM_ITERATIONS = 200
 GAMES_PER_ITERATION = 50
-MCTS_SIMULATIONS = 100
+MCTS_SIMULATIONS = 250
 BATCH_SIZE = 256
 EPOCHS_PER_ITERATION = 5
 REPLAY_BUFFER_SIZE = 25_000
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
-TEMPERATURE_THRESHOLD = 15   # moves before switching to greedy
+TEMPERATURE_THRESHOLD = 8    # moves before switching to greedy
 C_PUCT = 1.5                 # PUCT exploration constant (lower = more exploitation)
-DIRICHLET_ALPHA = 0.5        # root noise concentration (~10/avg_legal_moves, ~16-24 legal moves here)
+DIRICHLET_ALPHA = 0.5        # root noise alpha (~10/avg_legal_moves, avg ~20 legal moves)
 EVAL_INTERVAL = 5            # evaluate every N iterations
-EVAL_GAMES = 20
+EVAL_GAMES = 100
 CHECKPOINT_INTERVAL = 10
 CHECKPOINT_DIR = "models/mcts"
 
@@ -92,6 +92,7 @@ def self_play_game(network, num_simulations=100, temperature_threshold=15,
         if is_terminal:
             # terminal_value is from current player's perspective
             # Convert to Blue's perspective for consistent value targets
+            assert terminal_value is not None
             winner = terminal_value if turn else -terminal_value
             break
 
@@ -146,7 +147,7 @@ def _worker_init(state_dict):
         device = torch.device("cuda")
     else:
         try:
-            import torch_directml
+            import torch_directml  # type: ignore[import-untyped]
             device = torch_directml.device()
         except ImportError:
             device = torch.device("cpu")
@@ -172,9 +173,10 @@ def generate_self_play_data(network, num_games, num_simulations=100,
                             num_workers=None):
     """Generate training data from multiple self-play games in parallel."""
     if num_workers is None:
-        # Cap at 4 workers — each torch worker commits ~6 GB of virtual address
-        # space on Windows. Inference quickly becomes the bottleneck anyway.
-        num_workers = min(4, num_games)
+        # Cap at 6 workers — each torch worker commits ~6 GB of virtual address
+        # space on Windows; 6 workers keeps peak virtual memory reasonable
+        # while giving the GPU enough concurrent inference streams to stay full.
+        num_workers = min(6, num_games)
 
     # CPU state dict is picklable; CUDA tensors are not
     state_dict = {k: v.cpu() for k, v in network.state_dict().items()}
@@ -211,7 +213,7 @@ def generate_self_play_data(network, num_games, num_simulations=100,
 # ============================================================
 
 def train_network(network, replay_buffer, optimizer, batch_size=256,
-                  epochs=5, device='cpu'):
+                  epochs=5, device: str | torch.device = 'cpu'):
     """
     Train network on replay buffer data.
 
@@ -222,8 +224,8 @@ def train_network(network, replay_buffer, optimizer, batch_size=256,
         return {"policy_loss": 0, "value_loss": 0, "total_loss": 0}
 
     network.train()
-    total_policy_loss = 0
-    total_value_loss = 0
+    total_policy_loss = 0.0
+    total_value_loss = 0.0
     num_batches = 0
 
     # Pre-convert to numpy in RAM (fast), then move only one batch at a time to
@@ -281,7 +283,7 @@ def train_network(network, replay_buffer, optimizer, batch_size=256,
 # ============================================================
 
 def evaluate_vs_noisy_minimax(network, minimax_depth=2, noise=0.3,
-                               num_games=20, num_simulations=100):
+                              num_games=20, num_simulations=100):
     """
     Evaluate MCTS agent (Blue) against an epsilon-greedy minimax opponent (Green).
 
@@ -317,6 +319,7 @@ def evaluate_vs_noisy_minimax(network, minimax_depth=2, noise=0.3,
 
             is_terminal, terminal_value = check_terminal(board, turn)
             if is_terminal:
+                assert terminal_value is not None
                 blue_result = terminal_value if turn else -terminal_value
                 break
 
@@ -393,15 +396,13 @@ def main():
     # Replay buffer
     replay_buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
 
-    # Resume from checkpoint
-    start_iteration = 0
+    # Resume from checkpoint (weights only — fresh optimizer, full iteration budget)
     if args.checkpoint:
         print(f"Loading checkpoint: {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, weights_only=False)
         network.load_state_dict(checkpoint['network'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        start_iteration = checkpoint.get('iteration', 0) + 1
-        print(f"Resuming from iteration {start_iteration}")
+        saved_iter = checkpoint.get('iteration', 0) + 1
+        print(f"Loaded weights from iteration {saved_iter}; training for {args.iterations} fresh iterations")
 
     # Create checkpoint directory and TensorBoard writer
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -429,9 +430,9 @@ def main():
     print(f"  Win rate: {baseline_wr:.0%}")
     writer.add_scalar("eval/win_rate_vs_random", baseline_wr, global_step=0)
 
-    iter_pbar = tqdm(range(start_iteration, args.iterations),
+    iter_pbar = tqdm(range(args.iterations),
                      desc="Training", unit="iter",
-                     initial=start_iteration, total=args.iterations)
+                     total=args.iterations)
     for iteration in iter_pbar:
         iter_start = time.time()
 

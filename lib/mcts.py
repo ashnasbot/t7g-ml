@@ -35,9 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lib.t7g import (
-    action_masks, action_to_move, count_cells,
-    apply_move, board_to_obs, check_terminal, new_board,
-    BLUE, GREEN, CLEAR,
+    action_masks, apply_move, board_to_obs, check_terminal,
     Board,  # npt.NDArray[np.bool_], shape (7, 7, 2)
 )
 
@@ -149,7 +147,7 @@ class MCTS:
         c_puct: float = 2.0,
         dirichlet_alpha: float = 0.1,
         dirichlet_epsilon: float = 0.25,
-        inference_batch_size: int = 8,
+        inference_batch_size: int = 16,
     ) -> None:
         """
         Args:
@@ -229,6 +227,7 @@ class MCTS:
                     self._backpropagate(nodes, edges, 0.0)
                     sims_done += 1
                 elif leaf.is_terminal:
+                    assert leaf.terminal_value is not None
                     self._backpropagate(nodes, edges, leaf.terminal_value)
                     sims_done += 1
                 else:
@@ -313,6 +312,7 @@ class MCTS:
 
     def _best_action(self, node: MCTSNode) -> int:
         """Return the action with the highest PUCT score from this node."""
+        assert node.move_priors is not None
         best_score = -float('inf')
         best_action = None
         sqrt_parent = math.sqrt(node.visit_count)
@@ -327,6 +327,7 @@ class MCTS:
                 best_score = score
                 best_action = action
 
+        assert best_action is not None
         return best_action
 
     def _get_or_create_child(self, node: MCTSNode, action: int) -> MCTSNode:
@@ -337,6 +338,7 @@ class MCTS:
         board position was already reached via a different path, the existing
         node (with its accumulated statistics) is reused.
         """
+        assert node.move_priors is not None
         if action not in node.children:
             child_board = apply_move(node.board, action, node.turn)
             child_turn = not node.turn
