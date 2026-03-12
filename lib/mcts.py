@@ -42,6 +42,11 @@ from lib.t7g import (
 # Virtual loss added to discourage parallel paths from converging on the same leaf
 VIRTUAL_LOSS = 3
 
+# Sentinel action used internally when the current player has no legal moves but
+# the game is not terminal (opponent can still move).  Never appears in the
+# action_probs returned by search() — it is pruned before the output is built.
+PASS_ACTION = 1225
+
 
 # ============================================================
 # Game simulation
@@ -250,7 +255,8 @@ class MCTS:
         # case where two different root moves lead to the same transposed position.
         action_probs = np.zeros(1225, dtype=np.float32)
         for action, count in root.edge_visits.items():
-            action_probs[action] = count
+            if action != PASS_ACTION:   # pass is internal only, never a training target
+                action_probs[action] = count
 
         total = action_probs.sum()
         if total > 0:
@@ -340,8 +346,13 @@ class MCTS:
         """
         assert node.move_priors is not None
         if action not in node.children:
-            child_board = apply_move(node.board, action, node.turn)
-            child_turn = not node.turn
+            if action == PASS_ACTION:
+                # Forced pass: board is unchanged, turn flips
+                child_board = node.board
+                child_turn = not node.turn
+            else:
+                child_board = apply_move(node.board, action, node.turn)
+                child_turn = not node.turn
             key = self._board_key(child_board, child_turn)
 
             if key in self.transposition_table:
@@ -377,10 +388,12 @@ class MCTS:
 
             legal_moves = get_legal_moves(node.board, node.turn)
             if not legal_moves:
-                # No moves = loss for current player
-                node.is_terminal = True
-                node.terminal_value = -1.0
-                node.network_value = -1.0
+                # Current player has no moves but check_terminal returned False,
+                # so the opponent can still move.  Expose a single PASS_ACTION
+                # child (same board, flipped turn) so the tree can search through
+                # this forced-pass position rather than treating it as a loss.
+                node.move_priors = {PASS_ACTION: 1.0}
+                node.network_value = 0.0
                 node.is_expanded = True
             else:
                 to_evaluate.append(node)
