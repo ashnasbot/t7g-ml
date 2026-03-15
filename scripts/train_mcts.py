@@ -16,249 +16,152 @@ Usage:
 import argparse
 import multiprocessing
 import os
+import sys
 import time
-from datetime import datetime
 from collections import deque
+from datetime import datetime
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import tqdm
 
-from lib.dual_network import DualHeadNetwork
-from lib.mcts import MCTS
-from lib.t7g import new_board, apply_move, check_terminal, board_to_obs
-from lib.t7g import find_best_move, count_cells, action_masks
-from lib.t7g import apply_obs_symmetry, SYMMETRY_INV_PERMS, SYMMETRY_PERMS
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lib.bc import generate_bc_data, pretrain_bc          # noqa: E402
+from lib.curriculum import generate_curriculum_data       # noqa: E402
+from lib.device_utils import load_compiled_network  # noqa: E402
+from lib.dual_network import DualHeadNetwork               # noqa: E402
+from lib.mcgs import MCGS                                  # noqa: E402
+from lib.train_workers import self_play_game, play_eval_game  # noqa: E402
+from lib.training import train_network                     # noqa: E402
 
 
 # ============================================================
 # Configuration
 # ============================================================
 
-NUM_ITERATIONS = 200
-GAMES_PER_ITERATION = 50
-MCTS_SIMULATIONS = 750
-EVAL_SIMULATIONS = 750
-BATCH_SIZE = 256
+NUM_ITERATIONS       = 200
+# Iteration time budget: GAMES_PER_ITERATION × avg_moves(≈100) × MCTS_SIMULATIONS
+# ÷ effective_sims_per_sec(≈8600 at 100 sims / 3 workers) ≈ target gen time.
+# 250 × 100 × 100 / 8600 ≈ 290s — matches previous 50 × 100 × 750 / 12500 ≈ 300s.
+GAMES_PER_ITERATION  = 250
+MCTS_SIMULATIONS     = 100   # prior-dominated regime: fewer sims = more concentrated targets
+EVAL_SIMULATIONS     = 100
+BATCH_SIZE           = 256
 EPOCHS_PER_ITERATION = 5
-REPLAY_BUFFER_SIZE = 25_000
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-4
-TEMPERATURE_FRACTION = 0.35  # fraction of avg game length to use temperature>0
-TEMPERATURE_MIN      = 10    # floor: always at least this many stochastic moves
-C_PUCT = 1.5                 # PUCT exploration constant (lower = more exploitation)
-DIRICHLET_ALPHA = 0.2        # root noise alpha (~10/branching_factor; avg ~55 legal moves)
-EVAL_INTERVAL = 5            # evaluate every N iterations
-EVAL_GAMES = 50
-CHECKPOINT_INTERVAL = 10
-CHECKPOINT_DIR = "models/mcts"
-BC_GAMES = 500               # minimax self-play games for behavioral cloning pre-train
-BC_DEPTH = 4                 # minimax depth used as the "expert" for BC labels
-BC_EPOCHS = 10               # training epochs over the BC dataset
-GATE_GAMES = 100             # games per gate evaluation (new vs best network)
-GATE_THRESHOLD = 0.45        # reject if new network wins < this fraction
-GATE_SIMULATIONS = 250       # sims/move for gate games (fast — just needs to be discriminating)
+REPLAY_BUFFER_SIZE   = 100_000  # ≈ 4 iterations at 250 games × 100 moves
+LEARNING_RATE        = 3e-4
+WEIGHT_DECAY         = 1e-4
+C_PUCT               = 0.75  # reduced from 1.5: Q-dominated at this sim count
+GUMBEL_K             = 8      # root candidates for Gumbel top-K sampling
+EVAL_INTERVAL        = 10
+EVAL_GAMES           = 50
+CHECKPOINT_INTERVAL  = 10
+CHECKPOINT_DIR       = "models/mcts"
+BC_GAMES             = 500
+BC_DEPTH             = 1     # teach legal moves only — avoids overpowering MCTS prior
+BC_EPOCHS            = 5     # light fitting: policy must stay plastic; value bootstraps via curriculum
+BC_NOISE             = 0.10  # total non-expert rate (blunders + random)
+BC_BLUNDER_DEPTH     = 1     # blunder depth matches BC depth
+BC_RANDOM_RATE       = 0.02  # true-random floor for positional coverage
+# Value curriculum ladder: (mm_depth, npz_cache_path)
+# Network advances to the next level once it beats the current level's pure
+# win rate >= CURRICULUM_ADVANCE_THRESHOLD for CURRICULUM_ADVANCE_CONSECUTIVE
+# consecutive gate evals.  .npz files are generated lazily and cached on disk;
+# MM-3 takes ~5 min, MM-5 ~50 min to generate.
+# Ladder starts at MM-3: MM-1/MM-2 games are too shallow to provide meaningful
+# value signal (position quality barely correlates with outcome at depth 1-2).
+CURRICULUM_LADDER = [
+    (3, "models/mcts/curriculum_mm3.npz"),
+    (5, "models/mcts/curriculum_mm5.npz"),
+]
+CURRICULUM_GAMES               = 500   # games generated per level
+CURRICULUM_RATIO               = 0.50  # enough to hold value signal against noisy early self-play;
+                                        # curriculum policy is masked so this doesn't affect policy learning
+CURRICULUM_ADVANCE_THRESHOLD   = 0.65  # combined win rate vs current level to advance
+                                        # (50% reachable via first-mover advantage alone)
+CURRICULUM_ADVANCE_CONSECUTIVE = 2     # consecutive gate evals required
 
 
 # ============================================================
-# Self-play game generation
+# Per-process globals (multiprocessing spawn requires module-level state)
 # ============================================================
 
-def self_play_game(mcts: MCTS, temperature_threshold: int = 15):
-    """
-    Play one game via MCTS self-play, collecting training examples.
-
-    Returns:
-        examples: list of (obs, policy_target, turn) tuples
-        winner: +1.0 if Blue wins, -1.0 if Green wins, 0.0 for draw
-        move_count: number of moves played
-        elapsed: wall time in seconds
-        truncated: True if game ended via the hard move-count cap
-    """
-    board = new_board()
-    # Randomise who moves first so the training data is not systematically
-    # biased toward whichever colour has the first-mover advantage.
-    turn = bool(np.random.randint(2))
-    examples = []
-    move_count = 0
-    truncated = False
-    board_history = {}  # state_key -> visit count for repetition detection
-    legal_move_counts = []  # branching factor sample per position
-    game_start = time.time()
-
-    while True:
-        # 3-fold repetition: same board + same player to move = looping
-        state_key = board.tobytes() + bytes([turn])
-        board_history[state_key] = board_history.get(state_key, 0) + 1
-        if board_history[state_key] >= 3:
-            blue, green = count_cells(board)
-            winner = 1.0 if blue > green else (-1.0 if green > blue else 0.0)
-            break
-
-        # Check terminal
-        is_terminal, terminal_value = check_terminal(board, turn)
-        if is_terminal:
-            # terminal_value is from current player's perspective
-            # Convert to Blue's perspective for consistent value targets
-            assert terminal_value is not None
-            winner = terminal_value if turn else -terminal_value
-            break
-
-        # If current player has no moves, pass turn (no training example generated)
-        masks = action_masks(board, turn)
-        legal_count = int(masks.sum())
-        if legal_count == 0:
-            mcts.advance_tree(1225)   # resets tree if pass not pre-searched (rare)
-            turn = not turn
-            continue
-        legal_move_counts.append(legal_count)
-
-        # Run MCTS search
-        action_probs = mcts.search(board, turn)
-
-        # Store training example (value target assigned after game ends)
-        obs = board_to_obs(board, turn)
-        examples.append((obs, action_probs, turn))
-
-        # Select action with temperature
-        temperature = 1.0 if move_count < temperature_threshold else 0.1
-        action = mcts.select_action(action_probs, temperature=temperature)
-
-        # Apply move and advance tree (reuse existing subtree)
-        board = apply_move(board, action, turn)
-        mcts.advance_tree(action)
-        turn = not turn
-        move_count += 1
-
-        # Hard safety limit (should rarely trigger after repetition detection)
-        if move_count > 200:
-            blue, green = count_cells(board)
-            winner = 1.0 if blue > green else (-1.0 if green > blue else 0.0)
-            truncated = True
-            break
-
-    # Assign value targets: +1 if current player wins, -1 if loses
-    training_examples = []
-    for obs, policy_target, example_turn in examples:
-        # winner is from Blue's perspective
-        # Convert to this example's player's perspective
-        value_target = winner if example_turn else -winner
-        training_examples.append((obs, policy_target, value_target))
-
-    elapsed = time.time() - game_start
-    return training_examples, winner, move_count, elapsed, truncated, legal_move_counts
-
-
-# ============================================================
-# Worker functions for parallel self-play (must be module-level
-# so they are picklable under Windows' 'spawn' start method)
-# ============================================================
-
-# Per-process state: each worker holds its own local network copy
-_local_network = None
-_base_network = None        # uncompiled — in-place updates preserve CUDA graph validity
-_gate_opponent_network = None
-_weight_queue = None        # receives weight broadcasts from the main process
+_local_network        = None   # compiled model used for inference in workers
+_base_network         = None   # uncompiled reference for in-place weight updates
+_weight_queue         = None   # receives weight broadcasts from the main process
 
 
 def _worker_init(state_dict, weight_queue=None):
-    """Load a local network copy (optionally compiled) in each worker process."""
+    """Initialise a self-play or evaluation worker process."""
     global _local_network, _base_network, _weight_queue
-    torch.set_num_threads(1)  # prevent thread over-subscription across workers
-    torch.set_float32_matmul_precision('high')
-    torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        try:
-            import torch_directml  # type: ignore[import-untyped]
-            device = torch_directml.device()
-        except ImportError:
-            device = torch.device("cpu")
-    net = DualHeadNetwork(num_actions=1225)
-    net.load_state_dict(state_dict)
-    net.to(device)
-    net.eval()
-    _base_network = net  # keep uncompiled reference for in-place weight updates
-    try:
-        net = torch.compile(net, mode="reduce-overhead")  # type: ignore[assignment]
-    except Exception:
-        pass
-    _local_network = net
+    torch.set_num_threads(1)
+    # Workers use CPU for inference: 3 independent CPU processes outrun
+    # 3 processes sharing one GPU at small MCTS batch sizes (bs~K=8).
+    # GPU is reserved exclusively for the training step in the main process.
+    device = torch.device("cpu")
+    _local_network, _base_network = load_compiled_network(state_dict, device, compile_net=False)
     _weight_queue = weight_queue
 
 
-def _gate_worker_init(state_dict_new, state_dict_best):
-    """Load candidate and champion networks for gate evaluation."""
-    global _local_network, _gate_opponent_network
-    torch.set_num_threads(1)
-    torch.set_float32_matmul_precision('high')
-    torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        try:
-            import torch_directml  # type: ignore[import-untyped]
-            device = torch_directml.device()
-        except ImportError:
-            device = torch.device("cpu")
-
-    def _load(sd):
-        net = DualHeadNetwork(num_actions=1225)
-        net.load_state_dict(sd)
-        net.to(device)
-        net.eval()
-        try:
-            net = torch.compile(net, mode="reduce-overhead")  # type: ignore[assignment]
-        except Exception:
-            pass
-        return net
-
-    _local_network = _load(state_dict_new)
-    _gate_opponent_network = _load(state_dict_best)
-
+# ============================================================
+# Worker entry points (must be module-level for spawn pickling)
+# ============================================================
 
 def _worker_play_game(args):
-    """Entry point for each worker task."""
-    # Apply any pending weight update before starting the game.  load_state_dict
-    # with assign=False (default) copies values in-place, so the compiled model's
-    # CUDA graph tensor addresses remain valid.
+    """Self-play worker: apply pending weight update, then play one game."""
     try:
-        new_sd = _weight_queue.get(block=False)  # type: ignore[union-attr]
-        _base_network.load_state_dict(new_sd)    # type: ignore[union-attr]
+        new_sd = _weight_queue.get(block=False)   # type: ignore[union-attr]
+        _base_network.load_state_dict(new_sd)     # type: ignore[union-attr]
     except Exception:
         pass
-
-    num_simulations, temperature_threshold, c_puct, dirichlet_alpha = args
-    mcts = MCTS(
+    num_simulations, c_puct, gumbel_k = args
+    mcts = MCGS(
         _local_network,  # type: ignore[arg-type]
         num_simulations=num_simulations,
         c_puct=c_puct,
-        dirichlet_alpha=dirichlet_alpha,
+        gumbel_k=gumbel_k,
     )
-    return self_play_game(mcts, temperature_threshold=temperature_threshold)
+    return self_play_game(mcts)
 
 
-def generate_self_play_data(pool: multiprocessing.Pool,
-                            min_non_truncated: int = 50,
-                            num_simulations: int = 100,
-                            temperature_threshold: int = TEMPERATURE_MIN,
-                            num_workers: int = 2):
-    """Generate training data from self-play games using a persistent worker pool.
+def _worker_eval_game(args):
+    """Evaluation worker: play one game vs minimax/stauf."""
+    num_simulations, minimax_depth, noise, engine, vary_depth, mcts_is_blue = args
+    mcts = MCGS(
+        _local_network,  # type: ignore[arg-type]
+        num_simulations=num_simulations,
+    )
+    result = play_eval_game(mcts, minimax_depth, noise, engine, vary_depth, mcts_is_blue)
+    return result, mcts_is_blue
+
+
+# ============================================================
+# Self-play data generation
+# ============================================================
+
+def generate_self_play_data(
+    pool,
+    min_non_truncated: int = 50,
+    num_simulations: int = 100,
+    num_workers: int = 2,
+) -> tuple:
+    """
+    Generate training examples from a persistent worker pool.
 
     Workers already hold up-to-date weights (broadcast by main after each
-    training step). Truncated games are played but their examples are discarded.
-    """
-    task_args_single = (num_simulations, temperature_threshold, C_PUCT, DIRICHLET_ALPHA)
+    training step).  Truncated games are played but their examples are discarded.
 
-    all_examples = []
-    blue_wins = 0
-    green_wins = 0
-    draws = 0
-    truncations = 0
-    non_truncated_count = 0
+    Returns
+    -------
+    (examples, (blue_wins, green_wins, draws), game_moves, game_times,
+     truncations, avg_branching)
+    """
+    task_args = (num_simulations, C_PUCT, GUMBEL_K)
+
+    all_examples: list = []
+    blue_wins = green_wins = draws = truncations = non_truncated_count = 0
     game_moves: list = []
     game_times: list = []
     all_legal_counts: list = []
@@ -266,9 +169,8 @@ def generate_self_play_data(pool: multiprocessing.Pool,
     pbar = tqdm(desc="Self-play", unit="game", total=min_non_truncated)
     try:
         pending = deque()
-        # Seed the pipeline: keep num_workers games in flight at all times
         for _ in range(num_workers):
-            pending.append(pool.apply_async(_worker_play_game, (task_args_single,)))
+            pending.append(pool.apply_async(_worker_play_game, (task_args,)))
 
         while non_truncated_count < min_non_truncated:
             examples, winner, moves, gtime, trunc, legal_counts = pending.popleft().get()
@@ -287,15 +189,12 @@ def generate_self_play_data(pool: multiprocessing.Pool,
                 green_wins += 1
             else:
                 draws += 1
-            pbar.set_postfix(
-                examples=len(all_examples),
-            )
-            # Keep the pipeline full until we have enough
+            pbar.set_postfix(examples=len(all_examples))
             if non_truncated_count < min_non_truncated:
-                pending.append(pool.apply_async(_worker_play_game, (task_args_single,)))
-        # Cancel any remaining in-flight tasks by discarding their futures
+                pending.append(pool.apply_async(_worker_play_game, (task_args,)))
+
         for fut in pending:
-            fut.cancel() if hasattr(fut, 'cancel') else None
+            fut.cancel() if hasattr(fut, 'cancel') else None  # type: ignore[attr-defined]
     finally:
         pbar.close()
 
@@ -305,440 +204,27 @@ def generate_self_play_data(pool: multiprocessing.Pool,
 
 
 # ============================================================
-# Network training
+# Evaluation
 # ============================================================
 
-def train_network(network, replay_buffer, optimizer, batch_size=256,
-                  epochs=5, device: str | torch.device = 'cpu'):
+def _run_pool_wld(
+    worker_fn,
+    task_args: list,
+    initializer,
+    initargs: tuple,
+    desc: str,
+    num_workers: int,
+) -> tuple[int, int, int]:
     """
-    Train network on replay buffer data.
-
-    Returns:
-        dict with average losses
+    Run a multiprocessing pool collecting +1/−1/0 results into W/L/D counts.
     """
-    if len(replay_buffer) < batch_size:
-        return {"policy_loss": 0, "value_loss": 0, "total_loss": 0}
-
-    network.train()
-    total_policy_loss = 0.0
-    total_value_loss = 0.0
-    num_batches = 0
-
-    # Pre-convert to numpy in RAM (fast), then move only one batch at a time to
-    # the device to avoid OOMing GPU VRAM with the full 500+ MB policy tensor.
-    buffer_list = list(replay_buffer)
-    obs_np     = np.array([ex[0] for ex in buffer_list])
-    policy_np  = np.array([ex[1] for ex in buffer_list])
-    value_np   = np.array([ex[2] for ex in buffer_list], dtype=np.float32)
-    n = len(buffer_list)
-
-    for _ in range(epochs):
-        indices = np.random.permutation(n)
-        for start in range(0, n - batch_size + 1, batch_size):
-            idx = indices[start:start + batch_size]
-            k = int(np.random.randint(0, 8))
-            batch_obs    = torch.from_numpy(
-                np.ascontiguousarray(apply_obs_symmetry(obs_np[idx], k))
-            ).to(device)
-            batch_policy = torch.from_numpy(policy_np[idx][:, SYMMETRY_INV_PERMS[k]]).to(device)
-            batch_value  = torch.from_numpy(value_np[idx]).to(device).unsqueeze(-1)
-
-            optimizer.zero_grad()
-
-            # Forward pass
-            pred_logits, pred_value = network(batch_obs)
-
-            # Policy loss: cross-entropy with MCTS policy targets
-            # MCTS targets are probability distributions, use KL divergence
-            log_probs = F.log_softmax(pred_logits, dim=-1)
-            policy_loss = -torch.sum(batch_policy * log_probs, dim=-1).mean()
-
-            # Value loss: MSE between predicted and actual game outcome
-            value_loss = F.mse_loss(pred_value, batch_value)
-
-            # Total loss
-            loss = policy_loss + value_loss
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            total_policy_loss += policy_loss.item()
-            total_value_loss += value_loss.item()
-            num_batches += 1
-
-    if num_batches == 0:
-        return {"policy_loss": 0, "value_loss": 0, "total_loss": 0}
-
-    return {
-        "policy_loss": total_policy_loss / num_batches,
-        "value_loss": total_value_loss / num_batches,
-        "total_loss": (total_policy_loss + total_value_loss) / num_batches,
-    }
-
-
-# ============================================================
-# Behavioral cloning pre-training
-# ============================================================
-
-def _worker_bc_game(args: tuple) -> list:
-    """
-    Play one BC game in a worker process and return its augmented examples.
-    Pure CPU — no network, no InferenceServer needed.
-    """
-    minimax_depth, noise = args
-    board = new_board()
-    turn = True
-    game_examples = []
-    move_count = 0
-
-    # Play 2-3 random opening moves to diversify starting positions
-    num_random = np.random.randint(2, 4)
-    for _ in range(num_random):
-        is_terminal, _ = check_terminal(board, turn)
-        if is_terminal:
-            break
-        legal = np.where(action_masks(board, turn))[0]
-        if len(legal) == 0:
-            turn = not turn
-            continue
-        board = apply_move(board, int(np.random.choice(legal)), turn)
-        turn = not turn
-
-    while True:
-        is_terminal, terminal_value = check_terminal(board, turn)
-        if is_terminal:
-            assert terminal_value is not None
-            winner = terminal_value if turn else -terminal_value
-            break
-
-        legal = np.where(action_masks(board, turn))[0]
-        if len(legal) == 0:
-            turn = not turn
-            continue
-
-        expert_action = find_best_move(board.tobytes(), minimax_depth, turn)
-        if expert_action in (-1, 1225):
-            expert_action = int(np.random.choice(legal))
-
-        obs = board_to_obs(board, turn)
-        game_examples.append((obs, expert_action, turn))
-
-        played = int(np.random.choice(legal)) if np.random.random() < noise else expert_action
-        board = apply_move(board, played, turn)
-        turn = not turn
-        move_count += 1
-
-        if move_count > 200:
-            blue, green = count_cells(board)
-            winner = 1.0 if blue > green else (-1.0 if green > blue else 0.0)
-            break
-
-    # Apply all 8 D4 symmetries (8x augmentation per position)
-    examples = []
-    for obs, action, ex_turn in game_examples:
-        value_target = float(winner if ex_turn else -winner)
-        obs_batch = obs[np.newaxis]
-        for k in range(8):
-            aug_obs = np.ascontiguousarray(apply_obs_symmetry(obs_batch, k)[0])
-            aug_action = int(SYMMETRY_PERMS[k][action])
-            policy_target = np.zeros(1225, dtype=np.float32)
-            policy_target[aug_action] = 1.0
-            examples.append((aug_obs, policy_target, value_target))
-    return examples
-
-
-def generate_bc_data(num_games: int = BC_GAMES, minimax_depth: int = BC_DEPTH,
-                     noise: float = 0.15) -> list:
-    """
-    Generate supervised examples by playing minimax against itself (parallel).
-
-    Games are distributed across a process pool (pure CPU — no GPU needed).
-    Each position is augmented with all 8 D4 symmetries.
-
-    Returns list of (obs, policy_one_hot, value_target) tuples.
-    """
-    num_workers = min(8, num_games)
-    task_args = [(minimax_depth, noise)] * num_games
-
-    examples = []
-    pbar = tqdm(total=num_games, desc="BC data", unit="game")
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        for game_examples in pool.imap_unordered(_worker_bc_game, task_args):
-            examples.extend(game_examples)
-            pbar.update(1)
-            pbar.set_postfix(examples=len(examples))
-    pbar.close()
-
-    return examples
-
-
-def pretrain_bc(network, bc_data: list, epochs: int = BC_EPOCHS,
-                batch_size: int = 256, device: str | torch.device = 'cpu',
-                writer: SummaryWriter | None = None) -> None:
-    """
-    Train network on minimax demonstrations before MCTS self-play begins.
-
-    Uses a fresh Adam optimizer so the main training scheduler is unaffected.
-    """
-    if not bc_data:
-        return
-
-    obs_np    = np.array([ex[0] for ex in bc_data])
-    policy_np = np.array([ex[1] for ex in bc_data])
-    value_np  = np.array([ex[2] for ex in bc_data], dtype=np.float32)
-    n = len(bc_data)
-
-    opt = torch.optim.Adam(network.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    network.train()
-
-    for epoch in range(epochs):
-        indices = np.random.permutation(n)
-        total_pol, total_val, num_batches = 0.0, 0.0, 0
-
-        for start in range(0, n - batch_size + 1, batch_size):
-            idx = indices[start:start + batch_size]
-            batch_obs    = torch.from_numpy(obs_np[idx]).to(device)
-            batch_policy = torch.from_numpy(policy_np[idx]).to(device)
-            batch_value  = torch.from_numpy(value_np[idx]).to(device).unsqueeze(-1)
-
-            opt.zero_grad()
-            pred_logits, pred_value = network(batch_obs)
-            log_probs   = F.log_softmax(pred_logits, dim=-1)
-            policy_loss = -torch.sum(batch_policy * log_probs, dim=-1).mean()
-            value_loss  = F.mse_loss(pred_value, batch_value)
-            (policy_loss + value_loss).backward()
-            torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
-            opt.step()
-
-            total_pol += policy_loss.item()
-            total_val += value_loss.item()
-            num_batches += 1
-
-        if num_batches:
-            avg_pol = total_pol / num_batches
-            avg_val = total_val / num_batches
-            print(f"    Epoch {epoch + 1}/{epochs}:  policy={avg_pol:.4f}  value={avg_val:.4f}")
-            if writer:
-                writer.add_scalar("bc/policy_loss", avg_pol, epoch)
-                writer.add_scalar("bc/value_loss",  avg_val, epoch)
-
-
-# ============================================================
-# Evaluation (parallel, mirrors the self-play worker pattern)
-# ============================================================
-
-def _play_eval_game(mcts: MCTS, minimax_depth: int, noise: float,
-                    engine: str, vary_depth: bool, mcts_is_blue: bool) -> float:
-    """Play one eval game; return +1 win / -1 loss / 0 draw from MCTS perspective."""
-    board = new_board()
-    mcts.root = None        # fresh tree each game
-    turn = True             # Blue moves first
-    board_history: dict = {}
-    move_count = 0
-
-    while True:
-        state_key = board.tobytes() + bytes([turn])
-        board_history[state_key] = board_history.get(state_key, 0) + 1
-        if board_history[state_key] >= 3:
-            blue, green = count_cells(board)
-            blue_result = 1.0 if blue > green else (-1.0 if green > blue else 0.0)
-            break
-
-        is_terminal, terminal_value = check_terminal(board, turn)
-        if is_terminal:
-            assert terminal_value is not None
-            blue_result = terminal_value if turn else -terminal_value
-            break
-
-        mcts_turn = (turn == mcts_is_blue)
-
-        if mcts_turn:
-            if not np.any(action_masks(board, turn)):
-                mcts.advance_tree(1225)
-                turn = not turn
-                continue
-            action_probs = mcts.search(board, turn)
-            action = mcts.select_action(action_probs, temperature=0)
-            mcts.advance_tree(action)
-        else:
-            legal = np.where(action_masks(board, turn))[0]
-            if len(legal) == 0:
-                turn = not turn
-                continue
-            if np.random.random() < noise:
-                action = int(np.random.choice(legal))
-            else:
-                depth = int(np.random.choice([4, minimax_depth])) if vary_depth else minimax_depth
-                # Randomise stauf's internal move_count so the depths[] lookup
-                # table cycles through all three %3 slots rather than always
-                # landing on slot 1 (the fresh-instance default).
-                stauf_mc = int(np.random.randint(0, 3)) if engine == 'stauf' else -1
-                action = find_best_move(board.tobytes(), depth, turn, engine, stauf_mc)
-                if action in (-1, 1225):
-                    turn = not turn
-                    continue
-
-        board = apply_move(board, action, turn)
-        turn = not turn
-        move_count += 1
-
-        if move_count > 200:
-            blue, green = count_cells(board)
-            blue_result = 1.0 if blue > green else (-1.0 if green > blue else 0.0)
-            break
-
-    return blue_result if mcts_is_blue else -blue_result
-
-
-def _worker_eval_game(args):
-    """Entry point for parallel eval workers."""
-    num_simulations, minimax_depth, noise, engine, vary_depth, mcts_is_blue = args
-    mcts = MCTS(
-        _local_network,  # type: ignore[arg-type]
-        num_simulations=num_simulations,
-        dirichlet_epsilon=0.0,
-    )
-    return _play_eval_game(mcts, minimax_depth, noise, engine, vary_depth, mcts_is_blue)
-
-
-def evaluate_vs_noisy_minimax(network, minimax_depth=2, noise=0.3,
-                              num_games=20, num_simulations=100,
-                              engine: str = 'minimax',
-                              vary_depth: bool = False):
-    """
-    Evaluate MCTS agent against an epsilon-greedy minimax opponent in parallel.
-
-    Half the games are played as Blue, half as Green. Each worker holds its
-    own local network copy so minimax calls run on multiple CPU cores simultaneously.
-
-    Returns:
-        win_rate: fraction of games won by MCTS agent
-        results: dict with wins/losses/draws
-    """
-    num_workers = min(2, num_games)
-    state_dict = {k: v.cpu() for k, v in network.state_dict().items()}
-
-    task_args = [
-        (num_simulations, minimax_depth, noise, engine, vary_depth, game_idx % 2 == 0)
-        for game_idx in range(num_games)
-    ]
-
-    engine_label = "Stauf" if engine == 'stauf' else f"MM-{minimax_depth}"
-    label = f"Eval vs {engine_label} (noise={noise:.0%})"
     wins = losses = draws = 0
-    pbar = tqdm(total=num_games, desc=label, unit="game", leave=False)
-
+    pbar = tqdm(total=len(task_args), desc=desc, unit="game", leave=False)
     try:
         with multiprocessing.Pool(
-            processes=num_workers,
-            initializer=_worker_init,
-            initargs=(state_dict,),
+            processes=num_workers, initializer=initializer, initargs=initargs
         ) as pool:
-            for mcts_result in pool.imap_unordered(_worker_eval_game, task_args):
-                if mcts_result > 0:
-                    wins += 1
-                elif mcts_result < 0:
-                    losses += 1
-                else:
-                    draws += 1
-                pbar.update(1)
-                pbar.set_postfix(win_rate=f"{wins / (wins + losses + draws):.0%}")
-    finally:
-        pbar.close()
-
-    return wins / num_games, {"wins": wins, "losses": losses, "draws": draws}
-
-
-def _play_net_vs_net_game(mcts_new: MCTS, mcts_best: MCTS, new_is_blue: bool) -> float:
-    """Play one game between two MCTS agents. Returns +1 if new wins, -1 if new loses."""
-    board = new_board()
-    mcts_new.root = None
-    mcts_best.root = None
-    # Randomise who moves first so gate scores aren't purely determined by
-    # first-mover advantage (which locks gate_wr to exactly 0.5 otherwise).
-    turn = bool(np.random.randint(2))
-    board_history: dict = {}
-    move_count = 0
-
-    while True:
-        state_key = board.tobytes() + bytes([turn])
-        board_history[state_key] = board_history.get(state_key, 0) + 1
-        if board_history[state_key] >= 3:
-            blue, green = count_cells(board)
-            blue_result = 1.0 if blue > green else (-1.0 if green > blue else 0.0)
-            break
-
-        is_terminal, terminal_value = check_terminal(board, turn)
-        if is_terminal:
-            assert terminal_value is not None
-            blue_result = terminal_value if turn else -terminal_value
-            break
-
-        new_turn = (turn == new_is_blue)
-        mcts_active  = mcts_new if new_turn else mcts_best
-        mcts_passive = mcts_best if new_turn else mcts_new
-
-        if not np.any(action_masks(board, turn)):
-            mcts_active.advance_tree(1225)
-            mcts_passive.advance_tree(1225)
-            turn = not turn
-            continue
-
-        action_probs = mcts_active.search(board, turn)
-        action = mcts_active.select_action(action_probs, temperature=0)
-        mcts_active.advance_tree(action)
-        mcts_passive.advance_tree(action)
-
-        board = apply_move(board, action, turn)
-        turn = not turn
-        move_count += 1
-
-        if move_count > 200:
-            blue, green = count_cells(board)
-            blue_result = 1.0 if blue > green else (-1.0 if green > blue else 0.0)
-            break
-
-    return blue_result if new_is_blue else -blue_result
-
-
-def _worker_gate_game(args):
-    """Entry point for gate evaluation workers (new vs best)."""
-    num_simulations, new_is_blue = args
-    mcts_new = MCTS(
-        _local_network,  # type: ignore[arg-type]
-        num_simulations=num_simulations,
-        dirichlet_epsilon=0.0,
-    )
-    mcts_best = MCTS(
-        _gate_opponent_network,  # type: ignore[arg-type]
-        num_simulations=num_simulations,
-        dirichlet_epsilon=0.0,
-    )
-    return _play_net_vs_net_game(mcts_new, mcts_best, new_is_blue)
-
-
-def evaluate_new_vs_best(network, best_state_dict: dict,
-                         num_games: int = GATE_GAMES,
-                         num_simulations: int = GATE_SIMULATIONS) -> tuple[float, dict]:
-    """
-    Gate evaluation: play new_network vs best accepted network.
-    Half games as Blue, half as Green.
-    Returns (win_rate_for_new, results_dict).
-    """
-    num_workers = min(2, num_games)
-    state_dict_new = {k: v.cpu() for k, v in network.state_dict().items()}
-    task_args = [(num_simulations, game_idx % 2 == 0) for game_idx in range(num_games)]
-
-    wins = losses = draws = 0
-    pbar = tqdm(total=num_games, desc="Gate (new vs best)", unit="game", leave=False)
-    try:
-        with multiprocessing.Pool(
-            processes=num_workers,
-            initializer=_gate_worker_init,
-            initargs=(state_dict_new, best_state_dict),
-        ) as pool:
-            for result in pool.imap_unordered(_worker_gate_game, task_args):
+            for result in pool.imap_unordered(worker_fn, task_args):
                 if result > 0:
                     wins += 1
                 elif result < 0:
@@ -749,10 +235,96 @@ def evaluate_new_vs_best(network, best_state_dict: dict,
                 pbar.set_postfix(win_rate=f"{wins / (wins + losses + draws):.0%}")
     finally:
         pbar.close()
+    return wins, losses, draws
 
-    # Score draws as ½ point so they don't count the same as losses.
-    score = (wins + 0.5 * draws) / num_games
-    return score, {"wins": wins, "losses": losses, "draws": draws}
+
+def evaluate_vs_noisy_minimax(
+    network,
+    minimax_depth: int = 2,
+    noise: float = 0.3,
+    num_games: int = 20,
+    num_simulations: int = 100,
+    engine: str = 'minimax',
+    vary_depth: bool = False,
+) -> tuple[float, dict]:
+    """
+    Evaluate MCTS agent against an epsilon-greedy minimax opponent.
+
+    Half the games are played as Blue, half as Green.
+    Returns (win_rate, {wins, losses, draws}).
+    """
+    state_dict = {k: v.cpu() for k, v in network.state_dict().items()}
+    task_args = [
+        (num_simulations, minimax_depth, noise, engine, vary_depth, game_idx % 2 == 0)
+        for game_idx in range(num_games)
+    ]
+    engine_label = "Stauf" if engine == 'stauf' else f"MM-{minimax_depth}"
+    wins = losses = draws = 0
+    wins_b = losses_b = wins_g = losses_g = 0
+    pbar = tqdm(total=num_games, desc=f"Eval vs {engine_label} (noise={noise:.0%})",
+                unit="game", leave=False)
+    try:
+        with multiprocessing.Pool(
+            processes=min(2, num_games), initializer=_worker_init, initargs=(state_dict,)
+        ) as pool:
+            for result, is_blue in pool.imap_unordered(_worker_eval_game, task_args):
+                if result > 0:
+                    wins += 1
+                    if is_blue:
+                        wins_b += 1
+                    else:
+                        wins_g += 1
+                elif result < 0:
+                    losses += 1
+                    if is_blue:
+                        losses_b += 1
+                    else:
+                        losses_g += 1
+                else:
+                    draws += 1
+                pbar.update(1)
+                pbar.set_postfix(win_rate=f"{wins / (wins + losses + draws):.0%}")
+    finally:
+        pbar.close()
+    games_b = num_games // 2
+    games_g = num_games - games_b
+    return wins / num_games, {
+        "wins": wins, "losses": losses, "draws": draws,
+        "wr_as_blue":  wins_b / games_b if games_b else 0.0,
+        "wr_as_green": wins_g / games_g if games_g else 0.0,
+    }
+
+
+# ============================================================
+# Curriculum helpers
+# ============================================================
+
+def _load_or_generate_curriculum(depth: int, path: str, n_games: int) -> tuple:
+    """
+    Return a (obs, policy, value) numpy-array tuple for MM-*depth* curriculum.
+
+    Loads from *path* if the .npz cache already exists; otherwise generates
+    *n_games* MM-depth vs MM-depth games, saves to *path*, then returns.
+    """
+    if os.path.exists(path):
+        print(f"  Loading cached MM-{depth} curriculum: {path}")
+    else:
+        print(f"  Generating MM-{depth} curriculum ({n_games} games) ...")
+        examples = generate_curriculum_data(depth, n_games)
+        obs_np = np.array([e[0] for e in examples], dtype=np.float32)
+        pol_np = np.array([e[1] for e in examples], dtype=np.float32)
+        val_np = np.array([e[2] for e in examples], dtype=np.float32)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        np.savez_compressed(path, obs=obs_np, policy=pol_np, value=val_np)
+        print(f"  Saved: {path}  ({len(examples)} examples)")
+    cur = np.load(path)
+    n = len(cur['obs'])
+    print(f"  MM-{depth} curriculum ready: {n} examples")
+    return (
+        cur['obs'].astype(np.float32),
+        cur['policy'].astype(np.float32),
+        cur['value'].astype(np.float32),
+    )
 
 
 # ============================================================
@@ -772,25 +344,19 @@ def main():
     parser.add_argument("--logdir", type=str, default="tblog/mcts",
                         help="TensorBoard log root directory")
     parser.add_argument("--run-name", type=str, default=None,
-                        help="Name for this run (default: timestamp). Logs go to logdir/run-name")
+                        help="Name for this run (default: timestamp)")
     args = parser.parse_args()
 
-    # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
-        torch.set_float32_matmul_precision("high")  # TF32 matmul on Ampere+
+        torch.set_float32_matmul_precision("high")
     print(f"Device: {device}")
 
-    # Create network
-    network = DualHeadNetwork(num_actions=1225).to(device)
-    optimizer = torch.optim.Adam(
-        network.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
-    )
+    network   = DualHeadNetwork(num_actions=1225).to(device)
+    optimizer = torch.optim.Adam(network.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    # Replay buffer
-    replay_buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
+    replay_buffer: deque = deque(maxlen=REPLAY_BUFFER_SIZE)
 
-    # Resume from checkpoint (weights only — fresh optimizer, full iteration budget)
     if args.checkpoint:
         print(f"Loading checkpoint: {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, weights_only=False)
@@ -799,36 +365,139 @@ def main():
         print(f"Loaded weights from iteration {saved_iter}; "
               f"training for {args.iterations} fresh iterations")
 
-    # Create checkpoint directory and TensorBoard writer
+        # Re-seed the replay buffer from the saved BC examples so the network
+        # has the same BC anchor as a fresh run, without re-running minimax.
+        bc_seed_path = os.path.join(CHECKPOINT_DIR, "bc_seed.npz")
+        if os.path.exists(bc_seed_path):
+            print(f"Loading BC seed: {bc_seed_path}")
+            seed_data = np.load(bc_seed_path)
+            for obs, pol, val in zip(seed_data['obs'], seed_data['policy'], seed_data['value']):
+                replay_buffer.append((obs, pol, float(val)))
+            print(f"Replay buffer seeded with {len(replay_buffer)} BC examples")
+        else:
+            # Seed file missing (e.g. first resume after upgrading the training script).
+            # Generate a quick low-depth seed instead of re-running full BC generation.
+            print("bc_seed.npz not found — generating quick seed (depth-3, 200 games)...")
+            quick_seed = generate_bc_data(
+                num_games=200, minimax_depth=3,
+                noise=BC_NOISE, blunder_depth=BC_BLUNDER_DEPTH, random_rate=BC_RANDOM_RATE,
+            )
+            n_seed = min(len(quick_seed), REPLAY_BUFFER_SIZE)
+            seed_idx = np.random.choice(len(quick_seed), n_seed, replace=False)
+            replay_buffer.extend(quick_seed[i] for i in seed_idx)
+            print(f"Replay buffer seeded with {len(replay_buffer)} quick-seed examples")
+            # Save for next resume
+            s_obs = np.array([quick_seed[i][0] for i in seed_idx])
+            s_pol = np.array([quick_seed[i][1] for i in seed_idx])
+            s_val = np.array([quick_seed[i][2] for i in seed_idx], dtype=np.float32)
+            np.savez_compressed(bc_seed_path, obs=s_obs, policy=s_pol, value=s_val)
+            print(f"Quick seed saved for future resumes: {bc_seed_path}")
+
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join(args.logdir, run_name)
-    writer = SummaryWriter(log_dir=log_dir)
+    log_dir  = os.path.join(args.logdir, run_name)
+    writer   = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logs: {log_dir}")
 
-    # Behavioral cloning pre-training (fresh runs only — skipped when resuming)
+    writer.add_custom_scalars({
+        "Game Stats": {
+            "Game Length": ["Margin", [
+                "self_play/avg_game_moves",
+                "self_play/min_game_moves",
+                "self_play/max_game_moves",
+            ]],
+            "Policy Entropy": ["Multiline", [
+                "self_play/avg_policy_entropy",
+            ]],
+        },
+        "Eval": {
+            "Ladder Progress": ["Multiline", [
+                "eval/ladder_progress",
+                "eval/win_rate_current",
+                "eval/win_rate_next",
+            ]],
+            "Win Rate by Colour": ["Multiline", [
+                "eval/win_rate_current",
+                "eval/win_rate_as_blue",
+                "eval/win_rate_as_green",
+            ]],
+            "Curriculum": ["Multiline", [
+                "curriculum/win_rate",
+                "curriculum/level",
+            ]],
+        },
+        "Training": {
+            "Per-Epoch Loss": ["Multiline", [
+                "train/epoch_policy_loss",
+                "train/epoch_value_loss",
+            ]],
+            "Iteration Loss": ["Multiline", [
+                "train/policy_loss",
+                "train/value_loss",
+            ]],
+        },
+    })
+
     if not args.checkpoint:
-        print("\nBehavioral cloning pre-training on minimax demonstrations...")
-        print(f"  {BC_GAMES} games at minimax depth {BC_DEPTH}, {BC_EPOCHS} epochs")
-        bc_data = generate_bc_data(num_games=BC_GAMES, minimax_depth=BC_DEPTH)
-        pretrain_bc(network, bc_data, epochs=BC_EPOCHS,
-                    batch_size=BATCH_SIZE, device=device, writer=writer)
-        print("BC pre-training complete.\n")
+        print(f"\nBC pre-training: {BC_GAMES} games at depth {BC_DEPTH}, {BC_EPOCHS} epochs")
+        bc_data = generate_bc_data(
+            num_games=BC_GAMES, minimax_depth=BC_DEPTH,
+            noise=BC_NOISE, blunder_depth=BC_BLUNDER_DEPTH, random_rate=BC_RANDOM_RATE,
+        )
+        pretrain_bc(network, bc_data, epochs=BC_EPOCHS, batch_size=BATCH_SIZE,
+                    device=device, learning_rate=1e-3, weight_decay=WEIGHT_DECAY,
+                    writer=writer)
+
+        # Save BC baseline so it can be loaded for comparison later
+        bc_ckpt = os.path.join(CHECKPOINT_DIR, "bc_baseline.pt")
+        torch.save({'network': network.state_dict()}, bc_ckpt)
+        print(f"BC baseline saved: {bc_ckpt}")
+
+        # Seed the replay buffer with a random sample of BC examples.
+        # This prevents the first self-play iterations from training on an
+        # empty buffer (cold-start) and gives the network a stable BC anchor
+        # while self-play data gradually takes over.
+        n_seed = min(len(bc_data), REPLAY_BUFFER_SIZE)
+        seed_idx = np.random.choice(len(bc_data), n_seed, replace=False)
+        replay_buffer.extend(bc_data[i] for i in seed_idx)
+        print(f"Replay buffer seeded with {len(replay_buffer)} BC examples "
+              f"(evicts over ~{REPLAY_BUFFER_SIZE // (GAMES_PER_ITERATION * 60)} iters)\n")
+
+        # Persist the seeded examples so resuming from bc_baseline.pt can reload
+        # them without re-running the 50-minute minimax data generation.
+        # Policy targets are one-hot → compress to a small file.
+        bc_seed_path = os.path.join(CHECKPOINT_DIR, "bc_seed.npz")
+        seed_obs = np.array([bc_data[i][0] for i in seed_idx])
+        seed_pol = np.array([bc_data[i][1] for i in seed_idx])
+        seed_val = np.array([bc_data[i][2] for i in seed_idx], dtype=np.float32)
+        np.savez_compressed(bc_seed_path, obs=seed_obs, policy=seed_pol, value=seed_val)
+        print(f"BC seed saved: {bc_seed_path}")
+
+    # ── Value curriculum ladder ───────────────────────────────────────────
+    # Start at MM-1, advance when the network beats each level >= threshold
+    # for CURRICULUM_ADVANCE_CONSECUTIVE consecutive gate evals.  Levels are
+    # generated lazily and cached as .npz files.
+    curriculum_level: int = 0         # current index into CURRICULUM_LADDER
+    curriculum_consecutive: int = 0   # consecutive gate evals beating current level
+    cur_depth, cur_path = CURRICULUM_LADDER[curriculum_level]
+    print(f"Initialising value curriculum ladder at MM-{cur_depth} ...")
+    value_curriculum: tuple | None = _load_or_generate_curriculum(
+        cur_depth, cur_path, CURRICULUM_GAMES,
+    )
 
     print("=" * 60)
     print("AlphaZero MCTS Training for Microscope")
     print("=" * 60)
-    print(f"Iterations: {args.iterations}")
-    print(f"Games/iteration: {args.games}")
-    print(f"Simulations/move: {args.simulations}")
-    print(f"Replay buffer: {REPLAY_BUFFER_SIZE}")
-    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Iterations:       {args.iterations}")
+    print(f"Games/iteration:  {args.games}")
+    print(f"Sims/move:        {args.simulations}")
+    print(f"Replay buffer:    {REPLAY_BUFFER_SIZE}")
+    print(f"Batch size:       {BATCH_SIZE}")
     print(f"Epochs/iteration: {EPOCHS_PER_ITERATION}")
+    print(f"Value curriculum: MM-{CURRICULUM_LADDER[curriculum_level][0]} "
+          f"(ladder: {' → '.join(str(d) for d, _ in CURRICULUM_LADDER)} → retire)")
     print("=" * 60)
 
-    # Persistent self-play worker pool — workers are never torn down between
-    # iterations. After each training step, fresh weights are broadcast via
-    # weight_queue so workers update in-place before their next game.
     NUM_SELF_PLAY_WORKERS = 3
     weight_queue: multiprocessing.Queue = multiprocessing.Queue()
     init_sd = {k: v.clone().cpu() for k, v in network.state_dict().items()}
@@ -838,182 +507,193 @@ def main():
         initargs=(init_sd, weight_queue),
     )
 
-    avg_game_length: float = 60.0  # seed estimate; updated each iteration
-    best_network_state: dict = init_sd  # already a cpu clone
 
-    iter_pbar = tqdm(range(args.iterations),
-                     desc="Training", unit="iter",
-                     total=args.iterations)
+    iter_pbar = tqdm(range(args.iterations), desc="Training", unit="iter")
     for iteration in iter_pbar:
         iter_start = time.time()
-
         iter_pbar.set_description(f"Iter {iteration + 1}/{args.iterations}")
+        step = iteration + 1
 
-        # 1. Generate self-play data
-        temp_threshold = max(TEMPERATURE_MIN, int(TEMPERATURE_FRACTION * avg_game_length))
-        print(f"\nGenerating until {args.games} non-truncated games "
-              f"({args.simulations} sims/move, temp threshold={temp_threshold})...")
+        # ── 1. Self-play ──────────────────────────────────────────────────
+        print(f"\nGenerating {args.games} non-truncated games "
+              f"({args.simulations} sims/move)...")
         gen_start = time.time()
-        sp_result = generate_self_play_data(
-            self_play_pool, min_non_truncated=args.games, num_simulations=args.simulations,
-            temperature_threshold=temp_threshold, num_workers=NUM_SELF_PLAY_WORKERS
+        examples, (bw, gw, dr), game_moves, game_times, truncations, avg_branching = (
+            generate_self_play_data(
+                self_play_pool,
+                min_non_truncated=args.games,
+                num_simulations=args.simulations,
+                num_workers=NUM_SELF_PLAY_WORKERS,
+            )
         )
-        examples, (bw, gw, dr), game_moves, game_times, truncations, avg_branching = sp_result
         gen_time = time.time() - gen_start
         moves_arr = np.array(game_moves)
         avg_moves = float(moves_arr.mean())
-        avg_game_length = avg_moves  # update for next iteration's threshold
         med_moves = float(np.median(moves_arr))
         std_moves = float(moves_arr.std())
         avg_gtime = sum(game_times) / len(game_times)
         trunc_pct = 100.0 * truncations / len(game_moves)
-        print(f"  Generated {len(examples)} examples in {gen_time:.1f}s")
-        print(f"  Results: Blue {bw} / Green {gw} / Draw {dr}")
-        print(f"  Game length: avg {avg_moves:.1f}  median {med_moves:.1f}  "
-              f"std {std_moves:.1f}  (min {moves_arr.min()}, max {moves_arr.max()})")
-        print(f"  Truncated:   {truncations}/{len(game_moves)} ({trunc_pct:.1f}%)")
-        print(f"  Game time:   avg {avg_gtime:.1f}s "
-              f"(min {min(game_times):.1f}s, max {max(game_times):.1f}s)")
-
-        step = iteration + 1
-        writer.add_scalar("self_play/examples_generated", len(examples), step)
-        writer.add_scalar("timing/gen_seconds", gen_time, step)
-        writer.add_scalar("self_play/avg_game_moves", avg_moves, step)
-        writer.add_scalar("self_play/median_game_moves", med_moves, step)
-        writer.add_scalar("self_play/std_game_moves", std_moves, step)
-        writer.add_scalar("self_play/min_game_moves", int(moves_arr.min()), step)
-        writer.add_scalar("self_play/max_game_moves", int(moves_arr.max()), step)
-        writer.add_scalar("self_play/truncation_pct", trunc_pct, step)
-        writer.add_scalar("self_play/temp_threshold", temp_threshold, step)
-        writer.add_scalar("self_play/avg_branching_factor", avg_branching, step)
-        print(f"  Avg branching:  {avg_branching:.1f} legal moves/position")
         total_sims = int(moves_arr.sum()) * args.simulations
         sims_per_sec = total_sims / gen_time if gen_time > 0 else 0.0
-        print(f"  Throughput:  {sims_per_sec:.0f} sims/sec")
-        writer.add_scalar("timing/avg_game_seconds", avg_gtime, step)
-        writer.add_scalar("timing/min_game_seconds", min(game_times), step)
-        writer.add_scalar("timing/max_game_seconds", max(game_times), step)
-        writer.add_scalar("timing/sims_per_sec", sims_per_sec, step)
 
-        is_gate_iter = (iteration + 1) % EVAL_INTERVAL == 0
+        print(f"  {len(examples)} examples in {gen_time:.1f}s  "
+              f"| Blue {bw} / Green {gw} / Draw {dr}")
+        print(f"  Game length: avg {avg_moves:.1f}  med {med_moves:.1f}  "
+              f"std {std_moves:.1f}  (min {moves_arr.min()}, max {moves_arr.max()})")
+        print(f"  Truncated: {truncations}/{len(game_moves)} ({trunc_pct:.1f}%)"
+              f"  |  Branching: {avg_branching:.1f}"
+              f"  |  {sims_per_sec:.0f} sims/sec")
 
-        # 2. Add to replay buffer — always, so training uses fresh data.
-        # On gate failure we revert the network weights but keep the examples;
-        # one iteration of sub-optimal data in a 25k buffer is negligible.
+        writer.add_scalar("self_play/examples_generated",   len(examples),         step)
+        writer.add_scalar("self_play/avg_game_moves",       avg_moves,             step)
+        writer.add_scalar("self_play/median_game_moves",    med_moves,             step)
+        writer.add_scalar("self_play/std_game_moves",       std_moves,             step)
+        writer.add_scalar("self_play/min_game_moves",       int(moves_arr.min()),  step)
+        writer.add_scalar("self_play/max_game_moves",       int(moves_arr.max()),  step)
+        writer.add_scalar("self_play/truncation_pct",       trunc_pct,             step)
+        writer.add_scalar("self_play/avg_branching_factor", avg_branching,         step)
+
+        # Shannon entropy of MCTS visit distributions used as policy targets.
+        # Ceiling is log(K) ≈ 2.08 nats (uniform over K Gumbel candidates),
+        # not log(branching). Decreases toward 0 as Q sharpens and one action dominates.
+        entropies = []
+        for _, policy_target, _ in examples:
+            p = policy_target[policy_target > 0]
+            if p.size > 0:
+                entropies.append(float(-np.sum(p * np.log(p))))
+        avg_policy_entropy = float(np.mean(entropies)) if entropies else 0.0
+        print(f"  Policy entropy: {avg_policy_entropy:.3f} nats  "
+              f"(max≈{np.log(GUMBEL_K):.3f} uniform over K={GUMBEL_K}, concentrated→0)")
+        writer.add_scalar("self_play/avg_policy_entropy", avg_policy_entropy, step)
+        if entropies:
+            writer.add_histogram("self_play/policy_entropy_dist", np.array(entropies), step)
+
+        writer.add_scalar("timing/gen_seconds",             gen_time,              step)
+        writer.add_scalar("timing/avg_game_seconds",        avg_gtime,             step)
+        writer.add_scalar("timing/sims_per_sec",            sims_per_sec,          step)
+
+        is_eval_iter = step % EVAL_INTERVAL == 0
+
+        # ── 2. Replay buffer ──────────────────────────────────────────────
         replay_buffer.extend(examples)
         print(f"  Replay buffer: {len(replay_buffer)} examples")
         writer.add_scalar("self_play/buffer_size", len(replay_buffer), step)
 
-        # 3. Train network
-        print(f"\nTraining ({EPOCHS_PER_ITERATION} epochs, "
-              f"batch size {BATCH_SIZE})...")
+        # ── 3. Train ──────────────────────────────────────────────────────
+        print(f"\nTraining ({EPOCHS_PER_ITERATION} epochs, batch {BATCH_SIZE})...")
         train_start = time.time()
         losses = train_network(
             network, replay_buffer, optimizer,
-            batch_size=BATCH_SIZE, epochs=EPOCHS_PER_ITERATION,
-            device=device
+            batch_size=BATCH_SIZE, epochs=EPOCHS_PER_ITERATION, device=device,
+            curriculum=value_curriculum, curriculum_ratio=CURRICULUM_RATIO,
         )
         train_time = time.time() - train_start
-        print(f"  Policy loss: {losses['policy_loss']:.4f}")
-        print(f"  Value loss:  {losses['value_loss']:.4f}")
-        print(f"  Total loss:  {losses['total_loss']:.4f}")
-        print(f"  Train time:  {train_time:.1f}s")
-
         current_lr = optimizer.param_groups[0]['lr']
+        print(f"  policy={losses['policy_loss']:.4f}  value={losses['value_loss']:.4f}"
+              f"  total={losses['total_loss']:.4f}  ({train_time:.1f}s)")
 
-        writer.add_scalar("train/policy_loss", losses['policy_loss'], step)
-        writer.add_scalar("train/value_loss",  losses['value_loss'],  step)
-        writer.add_scalar("train/total_loss",  losses['total_loss'],  step)
-        writer.add_scalar("train/lr",          current_lr,            step)
+        writer.add_scalar("train/policy_loss",  losses['policy_loss'], step)
+        writer.add_scalar("train/value_loss",   losses['value_loss'],  step)
+        writer.add_scalar("train/total_loss",   losses['total_loss'],  step)
+        writer.add_scalar("train/lr",           current_lr,            step)
+        for ep_idx, ep in enumerate(losses.get('epoch_losses', [])):
+            ep_step = (iteration * EPOCHS_PER_ITERATION) + ep_idx + 1
+            writer.add_scalar("train/epoch_policy_loss", ep['policy_loss'], ep_step)
+            writer.add_scalar("train/epoch_value_loss",  ep['value_loss'],  ep_step)
         writer.add_scalar("timing/train_seconds", train_time, step)
 
-        # Broadcast updated weights so workers pick them up before the next game
+        # Value output distribution: sample buffer, forward pass, histogram.
+        # Bimodal (mass near ±1) = value head learning; flat = still guessing.
+        _sample_n = min(1024, len(replay_buffer))
+        _buf = list(replay_buffer)
+        _idx = np.random.choice(len(_buf), _sample_n, replace=False)
+        _obs = torch.from_numpy(np.array([_buf[i][0] for i in _idx])).to(device)
+        network.eval()
+        with torch.no_grad():
+            _, _val_preds = network(_obs)
+        network.train()
+        writer.add_histogram("train/value_output_dist", _val_preds.squeeze().cpu(), step)
+
+        # Broadcast updated weights to self-play workers
         new_sd = {k: v.cpu() for k, v in network.state_dict().items()}
         for _ in range(NUM_SELF_PLAY_WORKERS):
             weight_queue.put(new_sd)
 
-        # 4. Gate + evaluate (every EVAL_INTERVAL)
-        if is_gate_iter:
-            # Gate: compare trained candidate vs last accepted network
-            gate_wr, gate_results = evaluate_new_vs_best(network, best_network_state)
-            print(f"\n  Gate ({gate_wr:.0%} vs best, threshold {GATE_THRESHOLD:.0%}): "
-                  f"W:{gate_results['wins']} L:{gate_results['losses']} "
-                  f"D:{gate_results['draws']}")
-            writer.add_scalar("gate/win_rate", gate_wr, step)
-
-            if gate_wr >= GATE_THRESHOLD:
-                print("  Gate PASSED — accepting network")
-                best_network_state = {k: v.clone().cpu()
-                                      for k, v in network.state_dict().items()}
-                writer.add_scalar("gate/accepted", 1, step)
+        # ── 4. Evaluate ───────────────────────────────────────────────────
+        if is_eval_iter:
+            # Evaluate vs current ladder depth, plus the next depth if one exists.
+            # ladder_progress = curriculum_level + win_rate_vs_current (0–4 while
+            # curriculum is active; 4 + wr_vs_final once retired).
+            if value_curriculum is not None:
+                eval_cur_depth  = CURRICULUM_LADDER[curriculum_level][0]
+                eval_next_entry = (CURRICULUM_LADDER[curriculum_level + 1]
+                                   if curriculum_level + 1 < len(CURRICULUM_LADDER)
+                                   else None)
+                level_base      = curriculum_level
             else:
-                print("  Gate FAILED — reverting to best network")
-                network.load_state_dict(best_network_state)
-                # Drain the rejected weights already in the queue (pushed after
-                # training above) before pushing the reverted weights, so workers
-                # don't consume the rejected candidate first (queue is FIFO).
-                while not weight_queue.empty():
-                    try:
-                        weight_queue.get_nowait()
-                    except Exception:
-                        break
-                for _ in range(NUM_SELF_PLAY_WORKERS):
-                    weight_queue.put(best_network_state)
-                writer.add_scalar("gate/accepted", 0, step)
+                eval_cur_depth  = CURRICULUM_LADDER[-1][0]  # keep tracking vs MM-5
+                eval_next_entry = None
+                level_base      = len(CURRICULUM_LADDER)    # = 4
 
-            print("\nEvaluating vs minimax...")
+            print(f"\nEvaluating vs ladder (MM-{eval_cur_depth}"
+                  + (f" + MM-{eval_next_entry[0]}" if eval_next_entry else "")
+                  + ")...")
 
-            # vs noisy minimax depth-3 (10% blunder rate) — every EVAL_INTERVAL
-            wr_mm3n, results_mm3n = evaluate_vs_noisy_minimax(
-                network, minimax_depth=3, noise=0.1, num_games=EVAL_GAMES,
-                num_simulations=EVAL_SIMULATIONS
+            wr_cur, res_cur = evaluate_vs_noisy_minimax(
+                network, minimax_depth=eval_cur_depth, noise=0.0,
+                num_games=EVAL_GAMES, num_simulations=EVAL_SIMULATIONS,
             )
-            print(f"  vs MM-3 (10%):  {wr_mm3n:.0%} "
-                  f"(W:{results_mm3n['wins']} L:{results_mm3n['losses']} "
-                  f"D:{results_mm3n['draws']})")
-            writer.add_scalar("eval/win_rate_mm3_noise10", wr_mm3n, step)
+            label = f"lvl {curriculum_level}" if value_curriculum is not None else "post-ladder"
+            print(f"  vs MM-{eval_cur_depth} ({label}): {wr_cur:.0%} "
+                  f"W:{res_cur['wins']} L:{res_cur['losses']} D:{res_cur['draws']}  "
+                  f"(B:{res_cur['wr_as_blue']:.0%} G:{res_cur['wr_as_green']:.0%})")
+            writer.add_scalar("eval/win_rate_current",  wr_cur,                   step)
+            writer.add_scalar("eval/win_rate_as_blue",  res_cur['wr_as_blue'],    step)
+            writer.add_scalar("eval/win_rate_as_green", res_cur['wr_as_green'],   step)
+            writer.add_scalar("eval/ladder_progress",   level_base + wr_cur,      step)
+            writer.add_scalar("curriculum/level",       curriculum_level,         step)
 
-            # vs Stauf (10 games, just to watch) — every EVAL_INTERVAL * 2
-            if (iteration + 1) % (EVAL_INTERVAL * 2) == 0:
-                wr_stauf, results_stauf = evaluate_vs_noisy_minimax(
-                    network, minimax_depth=5, noise=0.0, num_games=10,
-                    num_simulations=EVAL_SIMULATIONS, engine='stauf', vary_depth=True
+            if eval_next_entry is not None:
+                next_depth, _ = eval_next_entry
+                wr_next, res_next = evaluate_vs_noisy_minimax(
+                    network, minimax_depth=next_depth, noise=0.0,
+                    num_games=EVAL_GAMES, num_simulations=EVAL_SIMULATIONS,
                 )
-                print(f"  vs Stauf (d=5): {wr_stauf:.0%} "
-                      f"(W:{results_stauf['wins']} L:{results_stauf['losses']} "
-                      f"D:{results_stauf['draws']})")
-                writer.add_scalar("eval/win_rate_stauf_d5", wr_stauf, step)
+                print(f"  vs MM-{next_depth} (next):   {wr_next:.0%} "
+                      f"W:{res_next['wins']} L:{res_next['losses']} D:{res_next['draws']}")
+                writer.add_scalar("eval/win_rate_next", wr_next, step)
 
-            # vs pure minimax depth-3 — every EVAL_INTERVAL * 2
-            if (iteration + 1) % (EVAL_INTERVAL * 2) == 0:
-                wr_mm3, results_mm3 = evaluate_vs_noisy_minimax(
-                    network, minimax_depth=3, noise=0.0, num_games=EVAL_GAMES,
-                    num_simulations=EVAL_SIMULATIONS
-                )
-                print(f"  vs MM-3 (pure): {wr_mm3:.0%} "
-                      f"(W:{results_mm3['wins']} L:{results_mm3['losses']} "
-                      f"D:{results_mm3['draws']})")
-                writer.add_scalar("eval/win_rate_mm3_pure", wr_mm3, step)
+            # ── Curriculum ladder advancement ──────────────────────────────
+            if value_curriculum is not None:
+                writer.add_scalar("curriculum/win_rate", wr_cur, step)
 
-            # vs pure minimax depth-5 — every EVAL_INTERVAL * 4
-            if (iteration + 1) % (EVAL_INTERVAL * 4) == 0:
-                wr_mm5, results_mm5 = evaluate_vs_noisy_minimax(
-                    network, minimax_depth=5, noise=0.0, num_games=EVAL_GAMES,
-                    num_simulations=EVAL_SIMULATIONS
-                )
-                print(f"  vs MM-5 (pure): {wr_mm5:.0%} "
-                      f"(W:{results_mm5['wins']} L:{results_mm5['losses']} "
-                      f"D:{results_mm5['draws']})")
-                writer.add_scalar("eval/win_rate_mm5_pure", wr_mm5, step)
+                if wr_cur >= CURRICULUM_ADVANCE_THRESHOLD:
+                    curriculum_consecutive += 1
+                    print(f"  Curriculum beat "
+                          f"({curriculum_consecutive}/{CURRICULUM_ADVANCE_CONSECUTIVE})")
+                else:
+                    curriculum_consecutive = 0
 
-        # 5. Checkpoint
-        if (iteration + 1) % CHECKPOINT_INTERVAL == 0:
-            ckpt_path = os.path.join(
-                CHECKPOINT_DIR, f"iter_{iteration + 1:04d}.pt"
-            )
+                if curriculum_consecutive >= CURRICULUM_ADVANCE_CONSECUTIVE:
+                    curriculum_consecutive = 0
+                    curriculum_level += 1
+                    if curriculum_level >= len(CURRICULUM_LADDER):
+                        print("  Curriculum ladder complete — retiring value curriculum")
+                        value_curriculum = None
+                        writer.add_scalar("curriculum/level", curriculum_level, step)
+                    else:
+                        next_depth, next_path = CURRICULUM_LADDER[curriculum_level]
+                        print(f"  Advancing curriculum to MM-{next_depth}")
+                        value_curriculum = _load_or_generate_curriculum(
+                            next_depth, next_path, CURRICULUM_GAMES,
+                        )
+
+        # ── 5. Checkpoint ─────────────────────────────────────────────────
+        if step % CHECKPOINT_INTERVAL == 0:
+            ckpt_path = os.path.join(CHECKPOINT_DIR, f"iter_{step:04d}.pt")
             torch.save({
                 'iteration': iteration,
-                'network': network.state_dict(),
+                'network':   network.state_dict(),
                 'optimizer': optimizer.state_dict(),
             }, ckpt_path)
             print(f"\n  Checkpoint saved: {ckpt_path}")
@@ -1022,18 +702,17 @@ def main():
         iter_pbar.set_postfix(
             loss=f"{losses['total_loss']:.3f}",
             buf=len(replay_buffer),
-            time=f"{iter_time:.0f}s"
+            time=f"{iter_time:.0f}s",
         )
 
     self_play_pool.terminate()
     self_play_pool.join()
     writer.close()
 
-    # Save final model
     final_path = os.path.join(CHECKPOINT_DIR, "final.pt")
     torch.save({
         'iteration': args.iterations - 1,
-        'network': network.state_dict(),
+        'network':   network.state_dict(),
         'optimizer': optimizer.state_dict(),
     }, final_path)
     print(f"\nTraining complete! Final model: {final_path}")

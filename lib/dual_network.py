@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lib.mcts import board_to_obs
+from lib.t7g import board_to_obs
 
 
 class ResidualBlock(nn.Module):
