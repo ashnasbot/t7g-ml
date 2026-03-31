@@ -38,12 +38,13 @@ _IN_BOUNDS = (
 _DEST_Y = numpy.clip(_DEST_Y_RAW, 0, 6)   # safe indices for empty_mask lookup
 _DEST_X = numpy.clip(_DEST_X_RAW, 0, 6)
 
+
 def _find_dll(name: str) -> pathlib.Path:
-    """Locate a DLL by checking lib/ (installed wheel), then the project root (dev)."""
+    """Locate a DLL, preferring the native (-march=native) build in the project root."""
     candidates = [
-        pathlib.Path(__file__).parent / name,   # installed wheel: alongside t7g.py
-        pathlib.Path(__file__).parent.parent / name,  # dev: project root
-        pathlib.Path().absolute() / name,        # CWD fallback
+        pathlib.Path().absolute() / name,                      # native (cwd/root)
+        pathlib.Path(__file__).parent.parent / name,           # native (abs project root)
+        pathlib.Path(__file__).parent / name,                  # portable (lib/)
     ]
     for p in candidates:
         if p.exists():
@@ -51,15 +52,76 @@ def _find_dll(name: str) -> pathlib.Path:
     raise FileNotFoundError(f"Cannot locate {name}; searched: {candidates}")
 
 
-_minimax_lib = ctypes.CDLL(str(_find_dll("micro3.dll")))
-_minimax_lib.find_best_move.restype = ctypes.c_int
+_minimax_lib = ctypes.CDLL(str(_find_dll("micro4.dll")))
+_minimax_lib.find_best_move.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+_minimax_lib.find_best_move.restype  = ctypes.c_int
+_minimax_lib.minimax_score.argtypes  = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+_minimax_lib.minimax_score.restype   = ctypes.c_float
+_minimax_lib.score_root_moves.argtypes = [
+    ctypes.POINTER(ctypes.c_bool),   # bool game_board[7][7][2] (98 bytes)
+    ctypes.c_int,                    # depth
+    ctypes.c_bool,                   # as_blue
+    ctypes.POINTER(ctypes.c_float),  # float out_scores[1225]
+]
+_minimax_lib.score_root_moves.restype = None
+
+_micro3_lib = ctypes.CDLL(str(_find_dll("micro3.dll")))
+_micro3_lib.find_best_move.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+_micro3_lib.find_best_move.restype  = ctypes.c_int
+_micro3_lib.score_root_moves.argtypes = [
+    ctypes.POINTER(ctypes.c_bool),
+    ctypes.c_int,
+    ctypes.c_bool,
+    ctypes.POINTER(ctypes.c_float),
+]
+_micro3_lib.score_root_moves.restype = None
 
 _stauf_lib = ctypes.CDLL(str(_find_dll("cell_dll.dll")))
 _stauf_lib.find_best_move.restype = ctypes.c_int
 
+_hmcts_lib = ctypes.CDLL(str(_find_dll("micro_mcts_heuristic.dll")))
+_hmcts_lib.hmcts_find_best_move.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+_hmcts_lib.hmcts_find_best_move.restype  = ctypes.c_int
+_hmcts_lib.hmcts_init()
+
+
+def soft_policy_from_mm(
+    board: Board, depth: int, as_blue: bool, temperature: float = 0.02,
+    engine: str = 'micro3',
+) -> npt.NDArray[numpy.float32]:
+    """
+    Soft policy derived from minimax-N scores over all legal moves.
+
+    Scores all legal moves at *depth* via score_root_moves, then applies softmax
+    at *temperature* to produce a probability distribution.  Lower temperature
+    concentrates mass on the best move; temperature=0.02 keeps a small amount of
+    exploration while essentially following the best move.
+
+    Returns a 1225-length float32 array (zero on illegal moves).
+    Falls back to a zero array if score_root_moves is unavailable.
+    """
+    lib = _micro3_lib if engine == 'micro3' else _minimax_lib
+    out = numpy.full(1225, -2.0, dtype=numpy.float32)
+    board_c = numpy.ascontiguousarray(board, dtype=numpy.bool_)
+    lib.score_root_moves(
+        board_c.ctypes.data_as(ctypes.POINTER(ctypes.c_bool)),
+        ctypes.c_int(depth),
+        ctypes.c_bool(as_blue),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    legal_mask = out > -1.5
+    policy = numpy.zeros(1225, dtype=numpy.float32)
+    if numpy.any(legal_mask):
+        scores = out[legal_mask].astype(numpy.float64) / temperature
+        scores -= scores.max()
+        probs = numpy.exp(scores)
+        probs /= probs.sum()
+        policy[legal_mask] = probs.astype(numpy.float32)
+    return policy
+
 
 def count_cells(board: Board) -> tuple[int, int]:
-    return numpy.count_nonzero(board[:, :, 1]), numpy.count_nonzero(board[:, :, 0])
+    return int(numpy.count_nonzero(board[:, :, 1])), int(numpy.count_nonzero(board[:, :, 0]))
 
 
 def show_board(board: Board) -> None:
@@ -182,7 +244,7 @@ def is_action_valid(board: Board, action: int, as_blue: bool) -> bool:
     else:
         player_cell = GREEN
 
-    from_x, from_y, to_x, to_y, _ = action_to_move(action)
+    from_x, from_y, to_x, to_y, _ = action_to_move(int(action))
     if numpy.array_equal(board[from_y, from_x], player_cell):
         # We are trying to move our own piece
 
@@ -195,17 +257,21 @@ def is_action_valid(board: Board, action: int, as_blue: bool) -> bool:
     return False
 
 
-def debug_move(action: int, is_player: bool) -> None:
-    from_x, from_y, to_x, to_y, _ = action_to_move(action)
-    t = "B:" if is_player else "G:"
-    print(f"{t} [{from_x}, {from_y}]=> [{to_x}, {to_y}]")
+def evaluate_position(board: Board, depth: int, as_blue: bool) -> float:
+    """Evaluate board from as_blue's perspective; returns value in [-1, +1]."""
+    return float(_minimax_lib.minimax_score(board.tobytes(), depth, as_blue))
 
 
-def find_best_move(board: Any, depth: int, as_blue: bool, engine: str = 'minimax',
-                   move_count: int = -1) -> int:
+def find_best_move(board: Any, depth: int, as_blue: bool,
+                   engine: str = 'minimax', move_count: int = -1) -> int:
     if engine == 'stauf':
         return _stauf_lib.find_best_move(board, depth, as_blue, move_count)
-    return _minimax_lib.find_best_move(board, depth, as_blue)
+    if engine == 'micro3':
+        return int(_micro3_lib.find_best_move(board, depth, as_blue))
+    if engine == 'hmcts':
+        # depth repurposed as simulation count for MCTS
+        return int(_hmcts_lib.hmcts_find_best_move(board, depth, as_blue))
+    return int(_minimax_lib.find_best_move(board, depth, as_blue))
 
 
 def apply_move(board: Board, action: int, as_blue: bool) -> Board:
@@ -251,8 +317,35 @@ def encode_action(x: int, y: int, dx: int, dy: int) -> int:
     Returns:
         action index in 0-1224 range
     """
-    move_idx = (dy + 2) * 5 + (dx + 2)
-    return y * 7 * 25 + x * 25 + move_idx
+    move_idx = (int(dy) + 2) * 5 + (int(dx) + 2)
+    return int(y) * 7 * 25 + int(x) * 25 + move_idx
+
+
+# ---------------------------------------------------------------
+# Action encoding
+#
+# action = piece * 25 + move
+#   piece = from_y * 7 + from_x          (source cell, 0-48)
+#   move  = (mv_y + 2) * 5 + (mv_x + 2) (delta, 0-24)
+#   dest  = to_y * 7 + to_x              (destination cell, 0-48)
+#
+# ACTION_TO_DEST[a]: destination cell index for action a, or -1 if out-of-bounds
+# ---------------------------------------------------------------
+
+def _build_action_dest_map() -> npt.NDArray[numpy.int32]:
+    dest_arr = numpy.full(1225, -1, dtype=numpy.int32)
+    for action in range(1225):
+        piece, move = divmod(action, 25)
+        fy, fx = divmod(piece, 7)
+        dy = (move // 5) - 2
+        dx = (move % 5) - 2
+        ty, tx = fy + dy, fx + dx
+        if 0 <= ty < 7 and 0 <= tx < 7:
+            dest_arr[action] = ty * 7 + tx
+    return dest_arr
+
+
+ACTION_TO_DEST: npt.NDArray[numpy.int32] = _build_action_dest_map()
 
 
 # ---------------------------------------------------------------
@@ -300,7 +393,43 @@ SYMMETRY_INV_PERMS: list[npt.NDArray[numpy.int32]] = [
 ]
 
 
-def apply_obs_symmetry(obs_batch: npt.NDArray[numpy.float32], k: int) -> npt.NDArray[numpy.float32]:
+def _build_symmetry_perms_49() -> list[npt.NDArray[numpy.int32]]:
+    """Precompute destination-cell permutation tables for all 8 D4 symmetries.
+
+    Same group as _build_symmetry_perms but operating on 49 destination cell
+    indices (y*7+x) only — no delta component.
+    """
+    transforms_pos = [
+        lambda y, x: (y,   x),    # 0 identity
+        lambda y, x: (6-x, y),    # 1 rot90 CCW
+        lambda y, x: (6-y, 6-x),  # 2 rot180
+        lambda y, x: (x,   6-y),  # 3 rot270 CCW
+        lambda y, x: (y,   6-x),  # 4 flipH
+        lambda y, x: (6-y, x),    # 5 flipV
+        lambda y, x: (x,   y),    # 6 flipD1 (main diagonal)
+        lambda y, x: (6-x, 6-y),  # 7 flipD2 (anti-diagonal)
+    ]
+    perms = []
+    for tf in transforms_pos:
+        perm = numpy.empty(49, dtype=numpy.int32)
+        for cell in range(49):
+            y, x = divmod(cell, 7)
+            ny, nx = tf(y, x)
+            perm[cell] = ny * 7 + nx
+        perms.append(perm)
+    return perms
+
+
+# 49-dim destination permutation tables (for D4 symmetry augmentation on dest indices).
+SYMMETRY_PERMS_49: list[npt.NDArray[numpy.int32]] = _build_symmetry_perms_49()
+SYMMETRY_INV_PERMS_49: list[npt.NDArray[numpy.int32]] = [
+    numpy.argsort(p).astype(numpy.int32) for p in SYMMETRY_PERMS_49
+]
+
+
+def apply_obs_symmetry(
+    obs_batch: npt.NDArray[numpy.float32], k: int,
+) -> npt.NDArray[numpy.float32]:
     """Apply the k-th D4 symmetry to a batch of obs arrays of shape (N, 7, 7, 4).
 
     Returns a view or copy — always call np.ascontiguousarray before torch.from_numpy.
@@ -381,9 +510,4 @@ def check_terminal(board: Board, turn: bool) -> tuple[bool, Optional[float]]:
         return False, None
 
     score = (blue_count - green_count) if turn else (green_count - blue_count)
-    if score > 0:
-        return True, 1.0
-    elif score < 0:
-        return True, -1.0
-    else:
-        return True, 0.0
+    return True, 1.0 if score > 0 else (-1.0 if score < 0 else 0.0)

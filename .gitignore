@@ -15,6 +15,7 @@ __pycache__/
 # Compiled C / build artifacts
 *.dll
 *.so
+*.pyd
 *.gcda
 *.gcno
 build/
@@ -34,3 +35,21 @@ positions/
 movecache.pk
 *.zip
 TODO.txt
+preseed_data.h
+
+# Local-only scripts (environment-specific or incomplete)
+scripts/read_tb.py
+
+# Debug / scratch scripts
+debug/
+
+# Build / packaging artifacts
+dist/
+t7g_ml_gym.egg-info/
+lib/*.pt
+
+# Generated images
+heatmap*.png
+
+# Research papers (large PDFs, not code)
+papers/

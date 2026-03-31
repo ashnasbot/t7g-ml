@@ -1,21 +1,22 @@
 """
-Gumbel AlphaZero Monte Carlo Graph Search (MCGS) for Microscope board game.
+Gumbel AlphaZero MCGS backed by micro_mcts.c (C extension via ctypes).
 
-Shared transposition table so positions reachable via multiple paths
-accumulate visits from all paths, giving tighter Q estimates.
+The C extension manages the search tree and transposition table in C heap
+memory (malloc/free), eliminating the Python arena allocator leak that
+accumulates ~8 MB per game when the Python-object MCGS graph is used.
 
-Replaces Dirichlet noise + visit-count policy with Gumbel search:
-  - Gumbel top-K root sampling   — diverse candidates without spending sims
-  - Sequential Halving           — allocate budget across K candidates, halve each round
-  - Completed-Q policy           — softmax(gumbel + Q) provably beats the prior at any sim count
+Network inference still happens in Python; the step-wise interface lets the
+game pool batch leaf evaluations across all concurrent games into one GPU pass.
 
-Internal nodes (below the root) keep PUCT unchanged.
-
-Reference: Danihelka et al. 2022, "Policy improvement by planning with Gumbel"
+Public surface (same as the old pure-Python version):
+  MCGS          — search driver; owns one C MCGSInstance (one TT)
+  MCGSSearch    — step-wise search handle returned by MCGS.start_search()
+  MCGSNode      — kept for import compatibility (type-hint only)
 """
 from __future__ import annotations
 
-import math
+import ctypes
+import pathlib
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -23,82 +24,254 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lib.t7g import (
-    action_masks, apply_move, board_to_obs, check_terminal,
     Board,
+    count_cells, ACTION_TO_DEST,
 )
 
-# Sentinel action for forced-pass positions (no legal moves but game not terminal).
-# Never appears in the action_probs returned by search().
-PASS_ACTION = 1225
+
+# ── Search heuristics ────────────────────────────────────────────────────────
+
+def _heuristic_value(board: Board, turn: bool) -> float:
+    """
+    Raw cell-count value from the current player's perspective, normalised to
+    [-1, 1].  Pure numpy — no C minimax call, negligible overhead per leaf.
+    """
+    blue, green = count_cells(board)
+    total = blue + green
+    if total == 0:
+        return 0.0
+    return (blue - green) / total if turn else (green - blue) / total
 
 
-# ============================================================
-# Game simulation
-# ============================================================
+def _capture_heuristic_49(board: Board, turn: bool) -> npt.NDArray[np.float32]:
+    """
+    49-dim destination prior: captures (adjacent opponent pieces) plus a clone
+    reachability bonus.  Cloning adds a piece unconditionally so clone-reachable
+    destinations are preferred over jump-only destinations even with zero captures.
+    A small floor (1e-2) keeps all destinations in the distribution.
+    """
+    own = board[:, :, 1 if turn else 0].astype(np.float32)
+    opp = board[:, :, 0 if turn else 1].astype(np.float32)
+    kernel = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+              if not (dy == 0 and dx == 0)]
+    own_pad = np.pad(own, 1, mode='constant')
+    opp_pad = np.pad(opp, 1, mode='constant')
+    own_neighbors = np.stack(
+        [own_pad[1+dy:8+dy, 1+dx:8+dx] for dy, dx in kernel], axis=0).sum(axis=0)
+    opp_neighbors = np.stack(
+        [opp_pad[1+dy:8+dy, 1+dx:8+dx] for dy, dx in kernel], axis=0).sum(axis=0)
+    h = opp_neighbors + 0.3 * (own_neighbors > 0).astype(np.float32) + 1e-2
+    return (h / h.sum()).flatten().astype(np.float32)
 
-def get_legal_moves(board: Board, turn: bool) -> list[int]:
-    """Get list of valid action indices in 1225-action space."""
-    return list(np.where(action_masks(board, turn))[0])
+
+def _capture_heuristic_1225(board: Board, turn: bool) -> npt.NDArray[np.float32]:
+    """1225-dim version: broadcast the 49-dim capture heuristic via ACTION_TO_DEST."""
+    h49 = _capture_heuristic_49(board, turn)
+    h = np.zeros(1225, dtype=np.float32)
+    valid = ACTION_TO_DEST >= 0
+    h[valid] = h49[ACTION_TO_DEST[valid]]
+    total = h.sum()
+    return h / total if total > 0 else h
 
 
-# ============================================================
-# MCGS Node
-# ============================================================
+# ── DLL loading ─────────────────────────────────────────────────────────────
+
+def _find_mcts_dll() -> pathlib.Path:
+    candidates = [
+        pathlib.Path(__file__).parent / "micro_mcts.dll",       # installed wheel
+        pathlib.Path().absolute() / "lib" / "micro_mcts.dll",   # dev: standard build
+        pathlib.Path().absolute() / "micro_mcts.dll",           # dev: native build
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "Cannot locate micro_mcts.dll; build with: make dll\n"
+        f"Searched: {candidates}"
+    )
+
+
+_lib = ctypes.CDLL(str(_find_mcts_dll()))
+
+# mcgs_init / create / clear / destroy
+_lib.mcgs_init.argtypes = []
+_lib.mcgs_init.restype  = None
+
+_lib.mcgs_create.argtypes = [ctypes.c_int, ctypes.c_float, ctypes.c_int]
+_lib.mcgs_create.restype  = ctypes.c_void_p
+
+_lib.mcgs_clear.argtypes = [ctypes.c_void_p]
+_lib.mcgs_clear.restype  = None
+
+_lib.mcgs_destroy.argtypes = [ctypes.c_void_p]
+_lib.mcgs_destroy.restype  = None
+
+_lib.mcgs_tt_size.argtypes = [ctypes.c_void_p]
+_lib.mcgs_tt_size.restype  = ctypes.c_int
+
+# search lifecycle
+_lib.mcgs_start_search.argtypes = [
+    ctypes.c_void_p,              # MCGSInstance*
+    ctypes.POINTER(ctypes.c_bool),  # bool py_board[7][7][2]  (flat 98 bytes)
+    ctypes.c_bool,                # bool turn
+]
+_lib.mcgs_start_search.restype = ctypes.c_void_p  # MCGSSearchState*
+
+_lib.mcgs_search_destroy.argtypes = [ctypes.c_void_p]
+_lib.mcgs_search_destroy.restype  = None
+
+_lib.mcgs_pending_count.argtypes = [ctypes.c_void_p]
+_lib.mcgs_pending_count.restype  = ctypes.c_int
+
+_lib.mcgs_is_done.argtypes = [ctypes.c_void_p]
+_lib.mcgs_is_done.restype  = ctypes.c_int
+
+_lib.mcgs_get_leaf_board.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_bool),
+]
+_lib.mcgs_get_leaf_board.restype = None
+
+_lib.mcgs_get_leaf_turn.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_lib.mcgs_get_leaf_turn.restype  = ctypes.c_bool
+
+_lib.mcgs_commit_expansion.argtypes = [
+    ctypes.c_void_p, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_float),  # float policy[1225]
+    ctypes.c_float,                  # float value
+]
+_lib.mcgs_commit_expansion.restype = None
+
+_lib.mcgs_step.argtypes = [ctypes.c_void_p]
+_lib.mcgs_step.restype  = ctypes.c_int
+
+_lib.mcgs_get_result.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float)]
+_lib.mcgs_get_result.restype  = None
+
+_lib.mcgs_get_pending_boards.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_bool),   # bool boards_out[n * 98]
+    ctypes.POINTER(ctypes.c_bool),   # bool turns_out[n]
+]
+_lib.mcgs_get_pending_boards.restype = ctypes.c_int
+
+_lib.mcgs_commit_batch.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_float),  # float policies_flat[n * 1225]
+    ctypes.POINTER(ctypes.c_float),  # float values[n]
+    ctypes.c_int,
+]
+_lib.mcgs_commit_batch.restype = None
+
+_lib.mcgs_init()
+
+
+# ── Pending leaf proxy ───────────────────────────────────────────────────────
+
+class _PendingLeaf:
+    """
+    Thin proxy for one C pending leaf node.
+
+    Carries the board/turn that _expand_batch needs for inference, plus
+    the search-state pointer and index so commit_expansion can be routed back.
+    """
+    __slots__ = ['board', 'turn', 'is_terminal', 'is_expanded',
+                 '_search_ptr', '_idx']
+
+    def __init__(self, board: npt.NDArray[np.bool_], turn: bool,
+                 search_ptr: int, idx: int) -> None:
+        self.board       = board
+        self.turn        = turn
+        self.is_terminal = False
+        self.is_expanded = False
+        self._search_ptr = search_ptr  # ctypes void* as int
+        self._idx        = idx
+
+
+# ── MCGSNode — kept for import / type-hint compatibility ────────────────────
 
 class MCGSNode:
+    """Stub kept for import compatibility.  Not used by the C backend."""
+    pass
+
+
+# ── MCGSSearch — step-wise search handle ────────────────────────────────────
+
+class MCGSSearch:
     """
-    Single node in the MCGS search graph (transposition table entry).
+    Step-wise search handle backed by a C MCGSSearchState.
 
-    A node represents a unique (board + turn) position. The same node may be
-    reachable via multiple paths from the root — this is the transposition case.
-    Visit statistics are shared across all paths that reach this position.
+    Lifecycle (same external interface as the old Python MCGSSearch):
+      1. Read pending_leaves — build leaf proxies for uncommitted nodes.
+      2. Call mcgs._expand_batch(pending_leaves) to run inference & commit.
+      3. Call step() to backprop and advance to the next set of leaves.
+      4. Repeat until done is True, then read result.
     """
 
-    __slots__ = [
-        'board', 'turn', 'children', 'key',
-        'visit_count', 'value_sum',
-        'is_terminal', 'terminal_value', 'is_expanded',
-        'move_priors', 'network_value',
-    ]
+    __slots__ = ['_ptr']
 
-    def __init__(
-        self,
-        board: Board,
-        turn: bool,
-        prior: float = 0.0,  # kept for API compatibility; not stored
-    ) -> None:
-        self.board = board
-        self.turn = turn
-        self.key: bytes = board.tobytes() + (b'\x01' if turn else b'\x00')
-        self.children: dict[int, MCGSNode] = {}
-        self.visit_count = 0
-        self.value_sum = 0.0
-        self.is_expanded = False
-        self.move_priors: dict[int, float] | None = None
-        self.network_value = 0.0
-        self.is_terminal, self.terminal_value = check_terminal(board, turn)
+    def __init__(self, ptr: int) -> None:
+        self._ptr = ptr
+
+    def __del__(self) -> None:
+        if self._ptr:
+            _lib.mcgs_search_destroy(self._ptr)
+            self._ptr = 0
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     @property
-    def q_value(self) -> float:
-        if self.visit_count == 0:
-            return 0.0
-        return self.value_sum / self.visit_count
+    def done(self) -> bool:
+        return bool(_lib.mcgs_is_done(self._ptr))
+
+    @property
+    def pending_leaves(self) -> list[_PendingLeaf]:
+        """Build fresh leaf proxies for nodes currently awaiting expansion."""
+        n = _lib.mcgs_pending_count(self._ptr)
+        leaves: list[_PendingLeaf] = []
+        for i in range(n):
+            board = np.zeros((7, 7, 2), dtype=np.bool_)
+            _lib.mcgs_get_leaf_board(
+                self._ptr, i,
+                board.ctypes.data_as(ctypes.POINTER(ctypes.c_bool)),
+            )
+            turn = bool(_lib.mcgs_get_leaf_turn(self._ptr, i))
+            leaves.append(_PendingLeaf(board, turn, self._ptr, i))
+        return leaves
+
+    @property
+    def result(self) -> npt.NDArray[np.float32]:
+        out = np.zeros(1225, dtype=np.float32)
+        _lib.mcgs_get_result(
+            self._ptr,
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        return out
+
+    def step(self) -> None:
+        _lib.mcgs_step(self._ptr)
 
 
-# ============================================================
-# MCGS Search
-# ============================================================
+# ── MCGS — search driver ─────────────────────────────────────────────────────
+
+class _TTProxy:
+    """Fake mapping whose len() returns the C TT node count for monitoring."""
+    __slots__ = ['_ptr']
+
+    def __init__(self, ptr: int) -> None:
+        self._ptr = ptr
+
+    def __len__(self) -> int:
+        return _lib.mcgs_tt_size(self._ptr)
+
 
 class MCGS:
     """
-    Gumbel AlphaZero Monte Carlo Graph Search with transposition table.
+    Gumbel AlphaZero MCGS backed by micro_mcts.c.
 
-    At the root:
-      1. Sample K actions with Gumbel top-K (log-prior + Gumbel noise)
-      2. Sequential Halving allocates the simulation budget across K candidates
-      3. Policy extracted via completed-Q: softmax(gumbel_score + Q)
-
-    Below the root: standard PUCT selection unchanged.
+    One instance owns one C MCGSInstance (one transposition table).
+    Network inference is performed in Python; the C side manages the tree.
     """
 
     def __init__(
@@ -108,124 +281,162 @@ class MCGS:
         c_puct: float = 0.75,
         gumbel_k: int = 8,
     ) -> None:
-        self.network = network
+        self.network         = network
         self.num_simulations = num_simulations
-        self.c_puct = c_puct
-        self.gumbel_k = gumbel_k
-        self.root: MCGSNode | None = None
-        self.transposition_table: dict[bytes, MCGSNode] = {}
-        self._device = next(network.parameters()).device
+        self.c_puct          = c_puct
+        self.gumbel_k        = gumbel_k
+        self._device         = next(network.parameters()).device
+        self._ptr            = _lib.mcgs_create(
+            num_simulations, ctypes.c_float(c_puct), gumbel_k,
+        )
+
+    def __del__(self) -> None:
+        ptr = getattr(self, '_ptr', None)
+        if ptr:
+            _lib.mcgs_destroy(ptr)
+            self._ptr = 0
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API (same interface as old Python MCGS)
     # ------------------------------------------------------------------
+
+    @property
+    def root(self) -> None:
+        """No-op property kept for compatibility (play_net_vs_net_game sets it to None)."""
+        return None
+
+    @root.setter
+    def root(self, _value: object) -> None:
+        pass  # no-op in C version — TT serves the same purpose
+
+    @property
+    def transposition_table(self) -> _TTProxy:
+        """Monitoring proxy: len() returns C TT node count."""
+        return _TTProxy(self._ptr)
+
+    def clear(self) -> None:
+        """Free all C nodes and reset the transposition table."""
+        _lib.mcgs_clear(self._ptr)
+
+    def advance_tree(self, action: int) -> None:  # noqa: ARG002
+        """No-op: the TT persists across moves so Q-values are reused automatically."""
+
+    def start_search(
+        self,
+        board: Board,
+        turn: bool,
+        hint_root: object = None,  # ignored in C version
+        move_count: int | None = None,
+    ) -> MCGSSearch:
+        """Start a step-wise search. hint_root is accepted but not used."""
+        import warnings
+        board_c = np.ascontiguousarray(board, dtype=np.bool_)
+        ptr = _lib.mcgs_start_search(
+            self._ptr,
+            board_c.ctypes.data_as(ctypes.POINTER(ctypes.c_bool)),
+            ctypes.c_bool(turn),
+        )
+        if not ptr:
+            tt_size = _lib.mcgs_tt_size(self._ptr)
+            move_info = f" at move {move_count}" if move_count is not None else ""
+            warnings.warn(
+                f"mcgs_start_search returned NULL (node slab full, {tt_size} nodes){move_info}; "
+                "clearing transposition table and retrying.",
+                RuntimeWarning, stacklevel=2,
+            )
+            _lib.mcgs_clear(self._ptr)
+            ptr = _lib.mcgs_start_search(
+                self._ptr,
+                board_c.ctypes.data_as(ctypes.POINTER(ctypes.c_bool)),
+                ctypes.c_bool(turn),
+            )
+            if not ptr:
+                warnings.warn(
+                    "mcgs_start_search failed again after clear — "
+                    "returning null search; game will recover via uniform-policy fallback.",
+                    RuntimeWarning, stacklevel=2,
+                )
+        return MCGSSearch(ptr)
 
     def search(self, board: Board, turn: bool) -> npt.NDArray[np.float32]:
         """
-        Run Gumbel MCGS from position, return improved action probability distribution.
+        Run Gumbel MCGS from position (single-game, non-batched).
 
-        Returns:
-            action_probs: 1225-element array (non-zero only over the K sampled actions)
+        Returns improved action probability distribution (1225 floats).
         """
-        root_key = self._board_key(board, turn)
-        if self.root is None or self.root.turn != turn or not np.array_equal(self.root.board, board):
-            # Fresh root, but preserve the transposition table: Q estimates
-            # cached earlier in this game are still valid and save re-expansion.
-            self.root = MCGSNode(board, turn)
-            self.transposition_table[root_key] = self.root
-        root = self.root
+        ss = self.start_search(board, turn)
+        while not ss.done:
+            self._expand_batch([ss])
+            ss.step()
+        return ss.result
 
-        if not root.is_terminal and not root.is_expanded:
-            self._expand_batch([root])
-
-        if root.is_terminal or not root.move_priors:
-            return np.zeros(1225, dtype=np.float32)
-
-        legal = [a for a in root.move_priors if a != PASS_ACTION]
-        if not legal:
-            return np.zeros(1225, dtype=np.float32)
-
-        # ── Gumbel top-K ──────────────────────────────────────────────
-        # score(a) = log π(a) + Gumbel noise; sample K without replacement
-        K = min(self.gumbel_k, len(legal))
-        gumbel: dict[int, float] = {
-            a: (math.log(max(root.move_priors[a], 1e-9))
-                - math.log(-math.log(np.random.uniform())))
-            for a in legal
-        }
-        top_k = sorted(legal, key=lambda a: gumbel[a], reverse=True)[:K]
-
-        # ── Sequential Halving ────────────────────────────────────────
-        # R rounds; each round allocates n_r sims per active action, then halves.
-        # Each step runs one path per active action and batch-expands their leaves
-        # in a single forward pass (batch size = len(active)).  This recovers GPU
-        # efficiency: O(n_r) forward passes per round instead of O(n_r * K).
-        #
-        # Subtle weakening: paths in a batch share Q estimates at selection time
-        # (backprop hasn't run yet), so they may converge on the same leaf.
-        # Deduplication in _expand_paths handles correctness; the effect is a
-        # slight reduction in unique expansions per batch, negligible in practice.
-        N = self.num_simulations
-        R = max(1, math.ceil(math.log2(K)))
-        active = list(top_k)
-        sims_done = 0
-
-        for _ in range(R):
-            if len(active) <= 1 or sims_done >= N:
-                break
-            n_r = max(1, N // (R * len(active)))
-            for _ in range(n_r):
-                if sims_done >= N:
-                    break
-                paths = [self._select_path(root, a) for a in active]
-                self._expand_paths(paths)
-                for nodes, is_cycle in paths:
-                    self._backprop_path(nodes, is_cycle)
-                sims_done += len(active)
-            # Keep top half by Q-value estimate
-            active.sort(key=lambda a: self._action_q(root, a), reverse=True)
-            active = active[:max(1, len(active) // 2)]
-
-        # Tail: drain remaining budget on the survivor, batched for GPU efficiency
-        while sims_done < N:
-            batch = min(K, N - sims_done)
-            paths = [self._select_path(root, active[0]) for _ in range(batch)]
-            self._expand_paths(paths)
-            for nodes, is_cycle in paths:
-                self._backprop_path(nodes, is_cycle)
-            sims_done += batch
-
-        # ── Completed-Q policy ────────────────────────────────────────
-        # logit(a) = gumbel(a) + Q̄(a)   [unvisited actions use root network value]
-        logits = np.array([gumbel[a] + self._action_q(root, a) for a in top_k])
-        logits -= logits.max()
-        probs = np.exp(logits)
-        probs /= probs.sum()
-
-        action_probs = np.zeros(1225, dtype=np.float32)
-        for a, p in zip(top_k, probs):
-            action_probs[a] = float(p)
-        return action_probs
-
-    def advance_tree(self, action: int) -> None:
-        """Reuse the subgraph rooted at the child for `action`.
-
-        On a root miss the transposition table is intentionally preserved.
-        All cached Q estimates remain valid for positions in this game, so
-        retaining them saves re-expansion work.  The cost is that pre-loaded
-        children have uneven visit counts going into Sequential Halving, which
-        weakens the equal-budget guarantee — but the free Q information
-        outweighs this in practice.
+    def _expand_batch(self, searches: 'list[MCGSSearch]') -> None:
         """
-        if self.root is not None and action in self.root.children:
-            self.root = self.root.children[action]
-        else:
-            self.root = None  # transposition table kept deliberately
+        Evaluate all pending leaves across the given searches in one GPU pass.
+
+        Uses mcgs_get_pending_boards / mcgs_commit_batch — one C call per search
+        slot instead of one per leaf — eliminating the per-leaf ctypes overhead
+        that was stalling the CPU between GPU batches.
+        """
+        seg_ptrs: list[int] = []
+        seg_counts: list[int] = []
+        board_segs: list[npt.NDArray] = []
+        turn_segs:  list[npt.NDArray] = []
+
+        for ss in searches:
+            n = _lib.mcgs_pending_count(ss._ptr)
+            if n == 0:
+                continue
+            boards = np.empty((n, 7, 7, 2), dtype=np.bool_)
+            turns  = np.empty(n, dtype=np.bool_)
+            _lib.mcgs_get_pending_boards(
+                ss._ptr,
+                boards.ctypes.data_as(ctypes.POINTER(ctypes.c_bool)),
+                turns.ctypes.data_as(ctypes.POINTER(ctypes.c_bool)),
+            )
+            board_segs.append(boards)
+            turn_segs.append(turns)
+            seg_ptrs.append(ss._ptr)
+            seg_counts.append(n)
+
+        if not board_segs:
+            return
+
+        boards_all = np.concatenate(board_segs)   # (N, 7, 7, 2)
+        turns_all  = np.concatenate(turn_segs)    # (N,)
+        N = len(turns_all)
+
+        t = turns_all[:, None, None]
+        obs_batch = np.zeros((N, 7, 7, 4), dtype=np.float32)
+        obs_batch[:, :, :, 0] = np.where(t, boards_all[:, :, :, 0], boards_all[:, :, :, 1])
+        obs_batch[:, :, :, 1] = np.where(t, boards_all[:, :, :, 1], boards_all[:, :, :, 0])
+        obs_batch[:, :, :, 2] = 1.0
+
+        obs_tensor = torch.from_numpy(obs_batch).to(self._device)
+        with torch.no_grad():
+            policy_logits, values = self.network(obs_tensor)
+            policy_probs = F.softmax(policy_logits, dim=-1).cpu().numpy()  # (N, 1225)
+            values_np    = values.cpu().numpy().flatten()                   # (N,)
+
+        # One C call per search slot instead of one per leaf
+        offset = 0
+        for ptr, n in zip(seg_ptrs, seg_counts):
+            _lib.mcgs_commit_batch(
+                ptr,
+                policy_probs[offset:offset + n].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                values_np[offset:offset + n].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                ctypes.c_int(n),
+            )
+            offset += n
 
     def select_action(
-        self, action_probs: npt.NDArray[np.float32], temperature: float = 1.0
+        self,
+        action_probs: npt.NDArray[np.float32],
+        board: Board | None = None,  # noqa: ARG002
+        turn: bool | None = None,    # noqa: ARG002
+        temperature: float = 1.0,
     ) -> int:
-        """Select action from MCGS probability distribution."""
+        """Select action from MCGS probability distribution (board/turn ignored)."""
         if temperature == 0:
             return int(np.argmax(action_probs))
         probs = action_probs ** (1.0 / temperature)
@@ -235,161 +446,3 @@ class MCGS:
         else:
             return int(np.argmax(action_probs))
         return int(np.random.choice(len(probs), p=probs))
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _board_key(self, board: Board, turn: bool) -> bytes:
-        return board.tobytes() + bytes([turn])
-
-    def _action_q(self, root: MCGSNode, action: int) -> float:
-        """Q-value for a root action from the current player's perspective."""
-        child = root.children.get(action)
-        if child is None or child.visit_count == 0:
-            return root.network_value
-        return -child.q_value  # negate: child is opponent's perspective
-
-    def _expand_paths(
-        self, paths: list[tuple[list[MCGSNode], bool]]
-    ) -> None:
-        """Batch-expand unique unexpanded leaves across a set of simulation paths."""
-        seen: set[int] = set()
-        leaves: list[MCGSNode] = []
-        for nodes, is_cycle in paths:
-            if is_cycle:
-                continue
-            leaf = nodes[-1]
-            if not leaf.is_terminal and not leaf.is_expanded and id(leaf) not in seen:
-                leaves.append(leaf)
-                seen.add(id(leaf))
-        if leaves:
-            self._expand_batch(leaves)
-
-    def _backprop_path(self, nodes: list[MCGSNode], is_cycle: bool) -> None:
-        """Backpropagate a single simulation path."""
-        leaf = nodes[-1]
-        if is_cycle:
-            self._backpropagate(nodes, 0.0)
-        elif leaf.is_terminal:
-            assert leaf.terminal_value is not None
-            self._backpropagate(nodes, leaf.terminal_value)
-        else:
-            self._backpropagate(nodes, leaf.network_value)
-
-    def _select_path(
-        self, root: MCGSNode, forced_first_action: int | None = None
-    ) -> tuple[list[MCGSNode], bool]:
-        """
-        Traverse from root to a leaf, optionally forcing the first action.
-
-        Returns (nodes, is_cycle).
-        """
-        nodes = [root]
-        visited_keys = {root.key}
-        node = root
-
-        while node.is_expanded and not node.is_terminal:
-            if forced_first_action is not None:
-                action = forced_first_action
-                forced_first_action = None
-            else:
-                action = self._best_action(node)
-
-            child = self._get_or_create_child(node, action)
-            nodes.append(child)
-
-            if child.key in visited_keys:
-                return nodes, True
-            visited_keys.add(child.key)
-            node = child
-
-        return nodes, False
-
-    def _best_action(self, node: MCGSNode) -> int:
-        """Return the action with the highest PUCT score."""
-        assert node.move_priors is not None
-        best_score = -float('inf')
-        best_action = None
-        sqrt_parent = math.sqrt(node.visit_count)
-
-        for action, prior in node.move_priors.items():
-            child = node.children.get(action)
-            q = 0.0 if child is None else -child.q_value
-            visits = 0 if child is None else child.visit_count
-            score = q + self.c_puct * prior * sqrt_parent / (1 + visits)
-            if score > best_score:
-                best_score = score
-                best_action = action
-
-        assert best_action is not None
-        return best_action
-
-    def _get_or_create_child(self, node: MCGSNode, action: int) -> MCGSNode:
-        """Return the child for `action`, creating and transposition-checking if needed."""
-        assert node.move_priors is not None
-        if action not in node.children:
-            if action == PASS_ACTION:
-                child_board, child_turn = node.board, not node.turn
-            else:
-                child_board = apply_move(node.board, action, node.turn)
-                child_turn = not node.turn
-            key = self._board_key(child_board, child_turn)
-
-            if key in self.transposition_table:
-                child = self.transposition_table[key]
-            else:
-                child = MCGSNode(child_board, child_turn)
-                self.transposition_table[key] = child
-
-            node.children[action] = child
-        return node.children[action]
-
-    def _expand_batch(self, nodes: list[MCGSNode]) -> None:
-        """Evaluate a batch of leaf nodes in a single network forward pass."""
-        to_evaluate = []
-        legal_moves_list = []
-
-        for node in nodes:
-            if node.is_terminal or node.is_expanded:
-                continue
-            legal_moves = get_legal_moves(node.board, node.turn)
-            if not legal_moves:
-                node.move_priors = {PASS_ACTION: 1.0}
-                node.network_value = 0.0
-                node.is_expanded = True
-            else:
-                to_evaluate.append(node)
-                legal_moves_list.append(legal_moves)
-
-        if not to_evaluate:
-            return
-
-        obs_batch = np.stack([board_to_obs(n.board, n.turn) for n in to_evaluate])
-        obs_tensor = torch.from_numpy(obs_batch).to(self._device)
-        self.network.eval()
-        with torch.no_grad():
-            policy_logits, values = self.network(obs_tensor)
-            policy_probs_batch = F.softmax(policy_logits, dim=-1).cpu().numpy()
-            values_flat = values.cpu().numpy().flatten()
-
-        for node, policy_probs, value, legal_moves in zip(
-            to_evaluate, policy_probs_batch, values_flat, legal_moves_list
-        ):
-            priors = {m: float(policy_probs[m]) for m in legal_moves}
-            total = sum(priors.values())
-            if total > 0:
-                priors = {m: p / total for m, p in priors.items()}
-            else:
-                uniform = 1.0 / len(legal_moves)
-                priors = {m: uniform for m in legal_moves}
-            node.move_priors = priors
-            node.network_value = float(value)
-            node.is_expanded = True
-
-    def _backpropagate(self, nodes: list[MCGSNode], value: float) -> None:
-        """Update visit counts and values from leaf to root, flipping sign each level."""
-        for node in reversed(nodes):
-            node.visit_count += 1
-            node.value_sum += value
-            value = -value

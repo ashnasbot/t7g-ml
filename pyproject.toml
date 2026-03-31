@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "t7g-ml-gym"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "tqdm",
+    "tensorboard",
+    "Pillow",
+    "pyglet",
+    "term-image",
+    # torch must be installed separately — the correct variant depends on the
+    # GPU backend (CUDA / ROCm / CPU / DirectML).  See requirements.txt.
+]
+
+[project.scripts]
+play-t7g    = "scripts.play_gui:main"
+play-t7g-real = "scripts.play_real:main"
+train-t7g   = "scripts.train_mcts:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lib*", "scripts*"]
+exclude = ["lib.build*"]
+
+[tool.setuptools.exclude-package-data]
+"scripts" = ["read_tb.py"]
+
+[tool.setuptools.package-data]
+# Bundled binaries — run `make dll` before `python -m build`.
+# best.pt is NOT tracked in git; copy manually from models/mcts/ before packaging.
+"lib" = ["*.dll", "*.pt"]

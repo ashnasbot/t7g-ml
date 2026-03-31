@@ -14,7 +14,7 @@ from tqdm import tqdm
 from lib.t7g import (
     new_board, apply_move, check_terminal,
     board_to_obs, action_masks, count_cells, find_best_move,
-    apply_obs_symmetry, SYMMETRY_PERMS,
+    apply_obs_symmetry, SYMMETRY_PERMS, SYMMETRY_PERMS_49, ACTION_TO_DEST,
 )
 
 
@@ -33,15 +33,20 @@ def _worker_bc_game(args: tuple) -> list:
     targets, and better represent the kind of imperfect positions the network
     will encounter during self-play.  A small random_rate is kept on top for
     positions that never arise in structured play at all.
+
+    If two_stage is True, policy targets are 49-dim destination one-hots
+    (marginalized from the expert 1225-action via ACTION_TO_DEST).
     """
-    minimax_depth, noise, blunder_depth, random_rate = args
+    minimax_depth, noise, blunder_depth, random_rate, two_stage = args
     board = new_board()
     turn = bool(np.random.randint(2))
     game_examples = []
     move_count = 0
 
-    # Play 2-3 random opening moves to diversify starting positions
-    num_random = np.random.randint(2, 4)
+    # Random prefix to diversify starting positions across all game stages.
+    # Range covers the full typical self-play game length so BC positions
+    # are representative of what an untrained model will encounter.
+    num_random = np.random.randint(0, 101)
     for _ in range(num_random):
         is_terminal, _ = check_terminal(board, turn)
         if is_terminal:
@@ -95,12 +100,21 @@ def _worker_bc_game(args: tuple) -> list:
     for obs, action, ex_turn in game_examples:
         value_target = float(winner if ex_turn else -winner)
         obs_batch = obs[np.newaxis]
-        for k in range(8):
-            aug_obs = np.ascontiguousarray(apply_obs_symmetry(obs_batch, k)[0])
-            aug_action = int(SYMMETRY_PERMS[k][action])
-            policy_target = np.zeros(1225, dtype=np.float32)
-            policy_target[aug_action] = 1.0
-            examples.append((aug_obs, policy_target, value_target))
+        if two_stage:
+            dest = int(ACTION_TO_DEST[action])
+            for k in range(8):
+                aug_obs  = np.ascontiguousarray(apply_obs_symmetry(obs_batch, k)[0])
+                aug_dest = int(SYMMETRY_PERMS_49[k][dest])
+                policy_target = np.zeros(49, dtype=np.float32)
+                policy_target[aug_dest] = 1.0
+                examples.append((aug_obs, policy_target, value_target))
+        else:
+            for k in range(8):
+                aug_obs    = np.ascontiguousarray(apply_obs_symmetry(obs_batch, k)[0])
+                aug_action = int(SYMMETRY_PERMS[k][action])
+                policy_target = np.zeros(1225, dtype=np.float32)
+                policy_target[aug_action] = 1.0
+                examples.append((aug_obs, policy_target, value_target))
     return examples
 
 
@@ -110,6 +124,7 @@ def generate_bc_data(
     noise: float = 0.10,
     blunder_depth: int = 2,
     random_rate: float = 0.02,
+    two_stage: bool = False,
 ) -> list:
     """
     Generate supervised examples by playing minimax against itself (parallel).
@@ -126,7 +141,7 @@ def generate_bc_data(
     list of (obs, policy_one_hot, value_target) tuples.
     """
     num_workers = min(16, num_games)
-    task_args = [(minimax_depth, noise, blunder_depth, random_rate)] * num_games
+    task_args = [(minimax_depth, noise, blunder_depth, random_rate, two_stage)] * num_games
 
     examples: list = []
     pbar = tqdm(total=num_games, desc="BC data", unit="game")
@@ -152,6 +167,7 @@ def pretrain_bc(
     learning_rate: float = 1e-3,
     weight_decay: float = 1e-4,
     writer=None,
+    value_only: bool = False,
 ) -> None:
     """
     Train *network* on minimax demonstrations before MCTS self-play begins.
@@ -159,6 +175,11 @@ def pretrain_bc(
     Uses a fresh Adam optimizer so the caller's optimizer/scheduler state is
     not affected.  BC can use a higher LR than self-play (1e-3 is fine here)
     because the labels are clean one-hot minimax moves.
+
+    value_only : if True, skip the policy loss entirely.  Use this when BC
+        data is generated at a high minimax depth where policy targets would be
+        too sharp and suppress exploration.  Value-only BC bootstraps the value
+        head without biasing the policy prior.
     """
     if not bc_data:
         return
@@ -183,10 +204,15 @@ def pretrain_bc(
 
             opt.zero_grad()
             pred_logits, pred_value = network(batch_obs)
-            log_probs   = F.log_softmax(pred_logits, dim=-1)
-            policy_loss = -torch.sum(batch_policy * log_probs, dim=-1).mean()
-            value_loss  = F.mse_loss(pred_value, batch_value)
-            (policy_loss + value_loss).backward()
+            value_loss = F.mse_loss(pred_value, batch_value)
+            if value_only:
+                loss = value_loss
+                policy_loss = torch.tensor(0.0)
+            else:
+                log_probs   = F.log_softmax(pred_logits, dim=-1)
+                policy_loss = -torch.sum(batch_policy * log_probs, dim=-1).mean()
+                loss = policy_loss + value_loss
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
             opt.step()
 

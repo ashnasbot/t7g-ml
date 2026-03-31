@@ -6,17 +6,11 @@ in various board positions.
 
 Run with: pytest tests/test_minimax_correctness.py -v
 """
-import sys
-from pathlib import Path
-
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 import numpy as np
 import pytest
 from lib.t7g import (
     find_best_move, action_to_move, action_masks, is_action_valid,
-    apply_move, count_cells, BLUE, GREEN, CLEAR
+    apply_move, count_cells, BLUE, GREEN
 )
 
 
@@ -296,6 +290,78 @@ def test_minimax_full_game_simulation():
     # Board should have pieces
     blue_count, green_count = count_cells(board)
     assert blue_count > 0 or green_count > 0, "Board should have pieces"
+
+
+def test_edge_moves_reachable():
+    """
+    Pieces on column 5 must be able to clone to column 6.
+    Regression test for off-by-one in get_valid_moves bounds clamping
+    that silently dropped moves to the right board edge.
+
+    Blue at (5,3), Green at (6,3). Green occupies col 6 so Blue must clone to
+    an empty col-6 square such as (6,2) or (6,4), converting Green adjacently.
+    """
+    board = setup_board(
+        blue_positions=[(5, 3)],
+        green_positions=[(6, 3)],
+    )
+    legal = np.where(action_masks(board, True))[0]
+    # Python movegen must see at least one move landing in column 6
+    col6_moves = [a for a in legal if action_to_move(int(a))[2] == 6]
+    assert len(col6_moves) > 0, "Python action_masks should see moves into column 6"
+
+    move = find_best_move(board.tobytes(), depth=1, as_blue=True)
+    assert move >= 0, "C minimax must find at least one legal move (not -1)"
+
+    # After the move Green at (6,3) must be adjacent to Blue's new piece → converted
+    new_board = apply_move(board, move, as_blue=True)
+    _, green_count = count_cells(new_board)
+    assert green_count == 0, "Minimax should capture the adjacent green piece"
+
+
+def test_bottom_edge_moves_reachable():
+    """
+    Companion to test_edge_moves_reachable — checks row 6 (y-axis).
+    Blue at (3,5), Green at (3,6). Blue clones to row-6 square, converting Green.
+    """
+    board = setup_board(
+        blue_positions=[(3, 5)],
+        green_positions=[(3, 6)],
+    )
+    legal = np.where(action_masks(board, True))[0]
+    row6_moves = [a for a in legal if action_to_move(int(a))[3] == 6]
+    assert len(row6_moves) > 0, "Python action_masks should see moves into row 6"
+
+    move = find_best_move(board.tobytes(), depth=1, as_blue=True)
+    assert move >= 0, "C minimax must find at least one legal move"
+
+    new_board = apply_move(board, move, as_blue=True)
+    _, green_count = count_cells(new_board)
+    assert green_count == 0, "Minimax should capture the adjacent green piece"
+
+
+def test_minimax_moves_in_proven_loss():
+    """
+    Regression: when every move is a proven loss (minimax returns -SCORE_INF for all
+    children), find_best_move must still return a valid move rather than -1.
+
+    Previously best_score was initialised to -SCORE_INF, so the comparison
+    `score > best_score` was always false and residx stayed -1.
+    """
+    # Blue heavily dominant: 4 pieces vs Green's 1.  At depth >= 2 the engine can
+    # prove that every Green move leads to capture, but Green must still play.
+    board = setup_board(
+        blue_positions=[(0, 0), (3, 3), (4, 2), (6, 6)],
+        green_positions=[(6, 0)],
+    )
+    for depth in [2, 3, 5]:
+        move = find_best_move(board.tobytes(), depth=depth, as_blue=False)
+        assert move >= 0, (
+            f"depth={depth}: find_best_move returned {move} (proven-loss position "
+            "must still return a legal move, not -1)"
+        )
+        assert is_action_valid(board, move, False), \
+            f"depth={depth}: returned move {move} is not valid for Green"
 
 
 if __name__ == "__main__":
