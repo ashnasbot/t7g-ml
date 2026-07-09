@@ -1,28 +1,29 @@
 /*
- * micro_mcts.c — C implementation of Gumbel MCGS for Microscope (T7G).
+ * micro_mcts.c - C implementation of Gumbel MCGS for Microscope (T7G).
  *
- * Manages the MCTS tree and transposition table in C heap memory so that
- * free() actually returns pages to the OS, eliminating the Python arena
- * allocator leak that accumulates ~8 MB per game at training scale.
+ * Manages the MCTS tree and transposition table in C heap memory
+ * to avoid memory churning.
  *
  * Network inference stays in Python.  The step-wise interface lets the Python
  * game pool batch leaf nodes across all concurrent games into one GPU pass.
  *
  * Public API:
- *   mcgs_init()               — init Zobrist tables; call once at startup
- *   mcgs_create(sims,c,k)     — allocate a new MCGS instance
- *   mcgs_clear(inst)          — free all nodes, keep instance alive
- *   mcgs_destroy(inst)        — free instance and all its nodes
- *   mcgs_tt_size(inst)        — transposition table node count (monitoring)
- *   mcgs_start_search(…)      — begin a search, returns MCGSSearchState*
- *   mcgs_search_destroy(ss)   — free the search state struct
- *   mcgs_pending_count(ss)    — number of leaves needing network expansion
- *   mcgs_get_leaf_board(ss,i) — copy i-th pending leaf board (bool[7][7][2])
- *   mcgs_get_leaf_turn(ss,i)  — turn of i-th pending leaf
- *   mcgs_commit_expansion(…)  — feed policy[1225] + value for i-th leaf
- *   mcgs_step(ss)             — backprop + advance; returns new pending count
- *   mcgs_is_done(ss)          — 1 when search is complete
- *   mcgs_get_result(ss, out)  — write action_probs[1225] to out
+ *   mcgs_init()               - init Zobrist tables; call once at startup
+ *   mcgs_create(sims,c,k)     - allocate a new MCGS instance
+ *   mcgs_clear(inst)          - free all nodes, keep instance alive
+ *   mcgs_destroy(inst)        - free instance and all its nodes
+ *   mcgs_tt_size(inst)        - transposition table node count (monitoring)
+ *   mcgs_start_search(…)      - begin a search, returns MCGSSearchState*
+ *   mcgs_search_destroy(ss)   - free the search state struct
+ *   mcgs_pending_count(ss)    - number of leaves needing network expansion
+ *   mcgs_get_leaf_board(ss,i) - copy i-th pending leaf board (bool[7][7][2])
+ *   mcgs_get_leaf_turn(ss,i)  - turn of i-th pending leaf
+ *   mcgs_commit_expansion(…)  - feed policy[1225] + value for i-th leaf
+ *   mcgs_step(ss)             - backprop + advance; returns new pending count
+ *   mcgs_is_done(ss)          - 1 when search is complete
+ *   mcgs_get_result(ss, out)  - write action_probs[1225] to out
+ *   mcgs_get_root_value(ss)   - root Q (value_sum/visit_count, mover's perspective)
+ *   mcgs_apply_root_dirichlet(ss,alpha,eps) - mix Dirichlet noise into root priors
  */
 #include <stdbool.h>
 #include <stdlib.h>
@@ -32,7 +33,7 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ─── Constants ──────────────────────────────────────────────────────────── */
+/*  Constants  */
 #define BOARD_SIZE     7
 #define EMPTY          0
 #define GREEN          1
@@ -40,16 +41,24 @@
 #define PASS_ACTION    1225   /* sentinel: no legal moves but game continues */
 
 #define MAX_K          64     /* max Gumbel top-K */
+
+/* Gumbel MuZero sigma(q) transform: sigma(q) = (c_visit + max_N) * c_scale * q.
+ * Scales Q from [-1,1] into logit space so completed-Q can actually override
+ * the prior once the search is confident.  Without it the policy target is
+ * softmax(log_prior + q) which the prior dominates (q adds at most +-1 nat)
+ * and MCTS degenerates to rubber-stamping the network. */
+#define SIGMA_C_VISIT  50.0f
+#define SIGMA_C_SCALE  1.0f
 #define MAX_PATH_DEPTH 128    /* max depth of one simulation path           */
 #define MAX_PENDING    64     /* max unique leaves per batch (≤ MAX_K)      */
 
-/* Arena slab capacities — sized for one game at 250 sims × ~100 moves.
+/* Arena slab capacities - sized for one game at 250 sims × ~100 moves.
  * Peak observed TT ≈ 25k nodes; 30k + 1.5M edges gives a safety margin.
  * Per instance: ~27 MB  (node slab 2.9 MB + edge slab 24 MB + HT 0.5 MB). */
 #define NODE_SLAB_CAP  110000
 #define EDGE_SLAB_CAP  7700000
 #define HT_BITS        18
-#define HT_SIZE        (1 << HT_BITS)   /* 262144 slots — must exceed NODE_SLAB_CAP */
+#define HT_SIZE        (1 << HT_BITS)   /* 262144 slots - must exceed NODE_SLAB_CAP */
 #define HT_MASK        (HT_SIZE - 1)
 
 /* Search phase codes */
@@ -58,7 +67,7 @@
 #define PHASE_TAIL         2
 #define PHASE_DONE         3
 
-/* ─── Data structures ────────────────────────────────────────────────────── */
+/*  Data structures  */
 
 typedef struct {
     int16_t           action;
@@ -67,7 +76,7 @@ typedef struct {
 } MCGSEdge;
 
 typedef struct MCGSNode_s {
-    uint64_t  hash;            /* Zobrist hash — open-HT key             */
+    uint64_t  hash;            /* Zobrist hash - open-HT key             */
     uint8_t   board[7][7];     /* internal: EMPTY=0 / GREEN=1 / BLUE=2   */
     bool      turn;            /* true = Blue to move                    */
     int       visit_count;
@@ -89,7 +98,7 @@ typedef struct {
 typedef struct {
     /* Open-addressed hash table (fixed size, O(1) clear via memset) */
     MCGSNode **ht;             /* HT_SIZE slots, NULL-terminated probing   */
-    /* Arena slabs — bump-pointer allocation, reset on clear             */
+    /* Arena slabs - bump-pointer allocation, reset on clear             */
     MCGSNode  *node_slab;
     int        node_used;
     MCGSEdge  *edge_slab;
@@ -107,6 +116,7 @@ typedef struct {
 
     /* Gumbel / halving state */
     float   gumbel[MAX_K];
+    float   log_prior[MAX_K];
     int16_t top_k[MAX_K];
     int     K, N, R;
     int16_t active[MAX_K];
@@ -126,7 +136,7 @@ typedef struct {
     float result[1225];
 } MCGSSearchState;
 
-/* ─── Zobrist / RNG ──────────────────────────────────────────────────────── */
+/*  Zobrist / RNG  */
 
 static uint64_t zobrist_board[49][3];
 static uint64_t zobrist_turn;
@@ -163,6 +173,28 @@ static float gumbel_noise(uint64_t *rng) {
     return -logf(-logf(u));
 }
 
+/* Marsaglia-Tsang fast Gamma(alpha, 1) sampler.
+ * For alpha < 1 uses the identity: Gamma(a) = Gamma(a+1) * U^(1/a). */
+static float gamma_sample(uint64_t *rng, float alpha) {
+    if (alpha < 1.0f) {
+        return gamma_sample(rng, alpha + 1.0f) * powf(rng_uniform(rng), 1.0f / alpha);
+    }
+    float d = alpha - 1.0f / 3.0f;
+    float c = 1.0f / sqrtf(9.0f * d);
+    for (;;) {
+        float u1 = rng_uniform(rng);
+        float u2 = rng_uniform(rng);
+        float x  = sqrtf(-2.0f * logf(u1)) * cosf(6.28318530718f * u2);
+        float v  = 1.0f + c * x;
+        if (v <= 0.0f) continue;
+        v = v * v * v;
+        float u  = rng_uniform(rng);
+        float x2 = x * x;
+        if (u < 1.0f - 0.0331f * (x2 * x2)) return d * v;
+        if (logf(u) < 0.5f * x2 + d * (1.0f - v + logf(v))) return d * v;
+    }
+}
+
 static uint64_t compute_hash(uint8_t board[7][7], bool turn) {
     uint64_t h = 0;
     for (int pos = 0; pos < 49; pos++) {
@@ -173,9 +205,9 @@ static uint64_t compute_hash(uint8_t board[7][7], bool turn) {
     return h;
 }
 
-/* ─── Board utilities ────────────────────────────────────────────────────── */
+/*  Board utilities  */
 
-/* Python bool[7][7][2] (ch0=green, ch1=blue) → internal uint8_t[7][7] */
+/* Python bool[7][7][2] (ch0=green, ch1=blue) -> internal uint8_t[7][7] */
 static void convert_board(bool py[7][7][2], uint8_t out[7][7]) {
     for (int y = 0; y < 7; y++)
         for (int x = 0; x < 7; x++)
@@ -184,7 +216,7 @@ static void convert_board(bool py[7][7][2], uint8_t out[7][7]) {
                       :                EMPTY;
 }
 
-/* internal uint8_t[7][7] → Python bool[7][7][2] */
+/* internal uint8_t[7][7] -> Python bool[7][7][2] */
 static void export_board(uint8_t board[7][7], bool out[7][7][2]) {
     for (int y = 0; y < 7; y++)
         for (int x = 0; x < 7; x++) {
@@ -268,7 +300,7 @@ static bool check_terminal(uint8_t board[7][7], bool turn, float *value) {
     return true;
 }
 
-/* ─── Transposition table (open-addressing, arena-backed) ───────────────── */
+/*  Transposition table (open-addressing, arena-backed)  */
 
 static MCGSNode *tt_find(MCGSInstance *inst, uint64_t h) {
     uint32_t idx = (uint32_t)(h & HT_MASK);
@@ -299,7 +331,7 @@ static MCGSNode *tt_get_or_create(MCGSInstance *inst, uint8_t board[7][7], bool 
     MCGSNode *n = tt_find(inst, h);
     if (n) return n;
     if (inst->node_used >= NODE_SLAB_CAP) {
-        fprintf(stderr, "[mcgs] node slab full (%d nodes) — mcgs_start_search will return NULL\n",
+        fprintf(stderr, "[mcgs] node slab full (%d nodes) - mcgs_start_search will return NULL\n",
                 NODE_SLAB_CAP);
         return NULL;
     }
@@ -313,7 +345,7 @@ static MCGSNode *tt_get_or_create(MCGSInstance *inst, uint8_t board[7][7], bool 
     return n;
 }
 
-/* ─── PUCT selection helpers ─────────────────────────────────────────────── */
+/*  PUCT selection helpers  */
 
 static float node_q(MCGSNode *n) {
     return (n->visit_count > 0) ? n->value_sum / (float)n->visit_count : 0.0f;
@@ -328,6 +360,27 @@ static float action_q(MCGSNode *root, int action, float fallback) {
         return -node_q(c);
     }
     return fallback;
+}
+
+/* Visit count of a root action's child (0 if unexpanded). */
+static int action_visits(MCGSNode *root, int action) {
+    for (int i = 0; i < root->num_edges; i++) {
+        if (root->edges[i].action != (int16_t)action) continue;
+        MCGSNode *c = root->edges[i].child;
+        return c ? c->visit_count : 0;
+    }
+    return 0;
+}
+
+/* sigma(q) multiplier for the current root: (c_visit + max_a N(a)) * c_scale.
+ * max is taken over the top-K candidate actions. */
+static float sigma_mult(MCGSNode *root, const int16_t *actions, int n) {
+    int max_n = 0;
+    for (int i = 0; i < n; i++) {
+        int v = action_visits(root, (int)actions[i]);
+        if (v > max_n) max_n = v;
+    }
+    return (SIGMA_C_VISIT + (float)max_n) * SIGMA_C_SCALE;
 }
 
 static int best_action_puct(MCGSNode *node, float c_puct) {
@@ -424,22 +477,25 @@ static void backprop_path(SimPath *path) {
     }
 }
 
-/* ─── Gumbel / halving helpers ───────────────────────────────────────────── */
+/*  Gumbel / halving helpers  */
 
-typedef struct { int16_t action; float score; } SortEntry;
+typedef struct { int16_t action; float score; float log_prior; } SortEntry;
 static int cmp_score_desc(const void *a, const void *b) {
     float fa = ((SortEntry *)a)->score, fb = ((SortEntry *)b)->score;
     return (fb > fa) - (fb < fa);
 }
 
-/* Finish: compute completed-Q policy and mark PHASE_DONE. */
+/* Finish: compute completed-Q policy and mark PHASE_DONE.
+ * Improved policy = softmax(log_prior + sigma(q)) over the top-K actions,
+ * with q completed by the root network value for unvisited children. */
 static void finish_search(MCGSSearchState *ss) {
     MCGSNode *root = ss->root;
     float best_logit = -1e30f;
     float logits[MAX_K];
+    float sm = sigma_mult(root, ss->top_k, ss->K);
     for (int i = 0; i < ss->K; i++) {
         float q    = action_q(root, (int)ss->top_k[i], root->network_value);
-        logits[i]  = ss->gumbel[i] + q;
+        logits[i]  = ss->log_prior[i] + sm * q;
         if (logits[i] > best_logit) best_logit = logits[i];
     }
     float probs[MAX_K], sum = 0.0f;
@@ -489,9 +545,16 @@ static void select_paths_tail(MCGSSearchState *ss) {
 static void halving_prune(MCGSSearchState *ss) {
     SortEntry ranked[MAX_K];
     MCGSNode *root = ss->root;
+    float sm = sigma_mult(root, ss->active, ss->num_active);
     for (int i = 0; i < ss->num_active; i++) {
+        /* Sequential Halving ranks by g(a) + logits(a) + sigma(q(a)).
+         * ss->gumbel[j] already holds log_prior + gumbel noise from setup. */
+        int j = 0;
+        while (j < ss->K && ss->top_k[j] != ss->active[i]) j++;
+        float gl = (j < ss->K) ? ss->gumbel[j] : ss->log_prior[0];
         ranked[i].action = ss->active[i];
-        ranked[i].score  = action_q(root, (int)ss->active[i], root->network_value);
+        ranked[i].score  = gl + sm * action_q(root, (int)ss->active[i],
+                                              root->network_value);
     }
     qsort(ranked, ss->num_active, sizeof(SortEntry), cmp_score_desc);
     int new_n = (ss->num_active + 1) / 2;  /* ceil(K/2) per Sequential Halving */
@@ -512,8 +575,9 @@ static bool setup_halving(MCGSSearchState *ss) {
     for (int i = 0; i < root->num_edges; i++) {
         if (root->edges[i].action == (int16_t)PASS_ACTION) continue;
         float lp = logf(fmaxf(root->edges[i].prior, 1e-9f));
-        legal[n_legal].action = root->edges[i].action;
-        legal[n_legal].score  = lp + gumbel_noise(&ss->inst->rng);
+        legal[n_legal].action    = root->edges[i].action;
+        legal[n_legal].log_prior = lp;
+        legal[n_legal].score     = lp + gumbel_noise(&ss->inst->rng);
         n_legal++;
     }
     if (n_legal == 0) {
@@ -524,9 +588,10 @@ static bool setup_halving(MCGSSearchState *ss) {
     int K = (n_legal < ss->inst->gumbel_k) ? n_legal : ss->inst->gumbel_k;
     qsort(legal, n_legal, sizeof(SortEntry), cmp_score_desc);
     for (int i = 0; i < K; i++) {
-        ss->top_k[i]  = legal[i].action;
-        ss->gumbel[i] = legal[i].score;
-        ss->active[i] = legal[i].action;
+        ss->top_k[i]   = legal[i].action;
+        ss->gumbel[i]  = legal[i].score;
+        ss->log_prior[i] = legal[i].log_prior;
+        ss->active[i]  = legal[i].action;
     }
     ss->K = K; ss->N = ss->inst->num_simulations; ss->num_active = K;
     ss->sims_done = 0; ss->round_idx = 0;
@@ -544,7 +609,7 @@ static bool setup_halving(MCGSSearchState *ss) {
     return true;
 }
 
-/* ─── Public API ─────────────────────────────────────────────────────────── */
+/*  Public API  */
 
 void mcgs_init(void) {
     init_zobrist();
@@ -585,7 +650,7 @@ int mcgs_tt_size(MCGSInstance *inst) {
     return inst ? inst->node_used : 0;
 }
 
-/* ─── Search lifecycle ───────────────────────────────────────────────────── */
+/*  Search lifecycle  */
 
 MCGSSearchState *mcgs_start_search(MCGSInstance *inst,
                                    bool py_board[7][7][2], bool turn) {
@@ -664,9 +729,9 @@ void mcgs_commit_expansion(MCGSSearchState *ss, int i,
     MCGSInstance *inst = ss->inst;
 
     if (!any_moves(valid_moves)) {
-        /* Forced pass — no real legal moves */
+        /* Forced pass - no real legal moves */
         if (inst->edge_used + 1 > EDGE_SLAB_CAP) {
-            fprintf(stderr, "[mcgs] edge slab full (%d edges, %d nodes) — forced-pass expansion dropped\n",
+            fprintf(stderr, "[mcgs] edge slab full (%d edges, %d nodes) - forced-pass expansion dropped\n",
                     EDGE_SLAB_CAP, inst->node_used);
             return;
         }
@@ -702,7 +767,7 @@ void mcgs_commit_expansion(MCGSSearchState *ss, int i,
 
     if (n_legal <= 0) return;
     if (inst->edge_used + n_legal > EDGE_SLAB_CAP) {
-        fprintf(stderr, "[mcgs] edge slab full (%d edges, %d nodes) — normal expansion dropped (%d legal moves)\n",
+        fprintf(stderr, "[mcgs] edge slab full (%d edges, %d nodes) - normal expansion dropped (%d legal moves)\n",
                 EDGE_SLAB_CAP, inst->node_used, n_legal);
         return;
     }
@@ -725,7 +790,6 @@ void mcgs_commit_expansion(MCGSSearchState *ss, int i,
  */
 int mcgs_step(MCGSSearchState *ss) {
     if (!ss || ss->phase == PHASE_DONE) return 0;
-    MCGSInstance *inst = ss->inst;
 
     if (ss->phase == PHASE_ROOT_EXPAND) {
         MCGSNode *root = ss->root;
@@ -781,7 +845,33 @@ void mcgs_get_result(MCGSSearchState *ss, float out[1225]) {
     if (ss) memcpy(out, ss->result, 1225 * sizeof(float));
 }
 
-/* Batch helpers — replace per-leaf ctypes round-trips with one call per slot. */
+float mcgs_get_root_value(MCGSSearchState *ss) {
+    if (!ss || !ss->root || ss->root->visit_count == 0) return 0.0f;
+    return ss->root->value_sum / (float)ss->root->visit_count;
+}
+
+/* Mix Dirichlet(alpha) noise into the root's edge priors.
+ * Call after the root has been expanded (committed) but before mcgs_step().
+ * Only affects self-play; pass alpha=0 to skip. */
+void mcgs_apply_root_dirichlet(MCGSSearchState *ss, float alpha, float eps) {
+    if (!ss || !ss->root || !ss->root->is_expanded || alpha <= 0.0f) return;
+    MCGSNode *root = ss->root;
+    int n = root->num_edges;
+    if (n <= 1) return;
+
+    float eta[1225];
+    float eta_sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        eta[i]   = gamma_sample(&ss->inst->rng, alpha);
+        eta_sum += eta[i];
+    }
+    if (eta_sum <= 0.0f) return;
+    for (int i = 0; i < n; i++)
+        root->edges[i].prior = (1.0f - eps) * root->edges[i].prior
+                             + eps * (eta[i] / eta_sum);
+}
+
+/* Batch helpers - replace per-leaf ctypes round-trips with one call per slot. */
 
 /* Write all pending leaf boards/turns into caller-provided arrays.
  * boards_out: bool[n * 98]  (n boards of shape 7x7x2, flat)

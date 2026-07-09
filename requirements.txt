@@ -1,4 +1,4 @@
-# ── Core (AlphaZero / MCTS training pipeline) ────────────────────────────────
+#  Core (AlphaZero / MCTS training pipeline) 
 setuptools>=64
 numpy
 tqdm
@@ -8,22 +8,23 @@ psutil               # optional: memory monitoring in train_mcts.py
 
 # Rendering / UI
 term-image
+pyglet
 
-# Windows only — needed by Pillow ImageGrab
+# Windows only - needed by Pillow ImageGrab
 pywin32; sys_platform == "win32"
 
-# ── PyTorch ──────────────────────────────────────────────────────────────────
+#  PyTorch 
 # PyPI only ships the CPU build.  Install the GPU variant after the above.
 #
-#   NVIDIA (CUDA 13.0 — PyTorch 2.10+):
+#   NVIDIA (CUDA 13.0 - PyTorch 2.10+):
 #     pip install torch torchaudio torchvision \
 #         --index-url https://download.pytorch.org/whl/cu130
 #
-#   NVIDIA (CUDA 12.4 — PyTorch 2.x):
+#   NVIDIA (CUDA 12.4 - PyTorch 2.x):
 #     pip install torch torchaudio torchvision \
 #         --index-url https://download.pytorch.org/whl/cu124
 #
-#   AMD ROCm (Windows, ROCm 7.2) — pip can't auto-resolve rocm deps from PyPI,
+#   AMD ROCm (Windows, ROCm 7.2) - pip can't auto-resolve rocm deps from PyPI,
 #   so install the SDK wheels first, then torch:
 #
 #     BASE=https://repo.radeon.com/rocm/windows/rocm-rel-7.2
@@ -38,7 +39,7 @@ pywin32; sys_platform == "win32"
 #   CPU fallback (slow):
 #     pip install torch
 
-# ── Native DLLs (Windows) ────────────────────────────────────────────────────
+#  Native DLLs (Windows) 
 # micro_mcts.dll, micro_mcts_twostage.dll, micro3.dll, cell_dll.dll
 # must be compiled before running any training or benchmark script.
 #
@@ -46,7 +47,7 @@ pywin32; sys_platform == "win32"
 #   Build:    make dll          (portable x86-64-v2, outputs to lib/)
 #             make dll-native   (march=native, faster locally, NOT bundled in wheel)
 
-# ── Old PPO / Gymnasium training pipeline (env/, train.py) ──────────────────
+#  Old PPO / Gymnasium training pipeline (env/, train.py) 
 # Not required for MCTS training.  Install only if using the PPO path.
 #
 # gymnasium

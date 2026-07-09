@@ -6,7 +6,7 @@ Root cause of the bug this guards against
 PASS is encoded as action 1225, which is out of range for the 1225-element
 result array (indices 0–1224).  When a player was forced to pass, all result
 entries stayed zero.  The pool misread that as "game over" and closed the
-game with a material fraction as the winner — producing small-magnitude value
+game with a material fraction as the winner - producing small-magnitude value
 targets (~0.39 abs-mean) instead of ±1.  The value head then learned to
 predict zero (the mean of the distribution) and never moved.
 

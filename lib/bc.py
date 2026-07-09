@@ -5,6 +5,8 @@ Generates supervised demonstrations by having minimax play against itself,
 then trains the network to imitate those moves before self-play begins.
 """
 import multiprocessing
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -13,7 +15,7 @@ from tqdm import tqdm
 
 from lib.t7g import (
     new_board, apply_move, check_terminal,
-    board_to_obs, action_masks, count_cells, find_best_move,
+    board_to_obs, action_masks, count_cells, find_best_move, soft_policy_from_mm,
     apply_obs_symmetry, SYMMETRY_PERMS, SYMMETRY_PERMS_49, ACTION_TO_DEST,
 )
 
@@ -25,11 +27,11 @@ from lib.t7g import (
 def _worker_bc_game(args: tuple) -> list:
     """
     Play one BC game in a worker process and return augmented training examples.
-    Pure CPU — no network involved.
+    Pure CPU - no network involved.
 
     Non-expert moves use a shallow minimax (blunder_depth) rather than pure
     random selection.  Depth-based blunders are more coherent than random moves
-    — they look like plausible-but-suboptimal play, produce cleaner value
+    - they look like plausible-but-suboptimal play, produce cleaner value
     targets, and better represent the kind of imperfect positions the network
     will encounter during self-play.  A small random_rate is kept on top for
     positions that never arise in structured play at all.
@@ -140,7 +142,7 @@ def generate_bc_data(
     -------
     list of (obs, policy_one_hot, value_target) tuples.
     """
-    num_workers = min(16, num_games)
+    num_workers = min(4, num_games)
     task_args = [(minimax_depth, noise, blunder_depth, random_rate, two_stage)] * num_games
 
     examples: list = []
@@ -203,7 +205,7 @@ def pretrain_bc(
             batch_value  = torch.from_numpy(value_np[idx]).to(device).unsqueeze(-1)
 
             opt.zero_grad()
-            pred_logits, pred_value = network(batch_obs)
+            pred_logits, pred_value, _ = network(batch_obs)
             value_loss = F.mse_loss(pred_value, batch_value)
             if value_only:
                 loss = value_loss
@@ -227,3 +229,107 @@ def pretrain_bc(
             if writer is not None:
                 writer.add_scalar("bc/policy_loss", avg_pol, epoch)
                 writer.add_scalar("bc/value_loss",  avg_val, epoch)
+
+
+# ---------------------------------------------------------------------------
+# BC warmup (soft-policy, no D4 augmentation - used before self-play begins)
+# ---------------------------------------------------------------------------
+
+BC_WARMUP_DEPTH  = 3
+BC_WARMUP_TEMP   = 0.075   # concentrate policy mass on best moves
+BC_RANDOM_OPENS  = 2       # random moves per side at game start
+BC_BLUNDER_RATE  = 0.02    # probability of random legal move instead of MM best
+MAX_MOVES        = 500     # truncation guard
+
+
+def _bc_warmup_game(args: tuple) -> list:
+    """Play one MM vs MM game and return soft-policy training examples.
+
+    Policy targets are soft distributions from score_root_moves (not one-hot),
+    value targets are game outcomes from the active player's perspective.
+    """
+    game_idx, depth = args
+    rng   = np.random.default_rng(game_idx)
+    board = new_board()
+    turn  = True
+    history: list[tuple] = []
+    outcome = 0.0
+    move_count = 0
+
+    for _ in range(MAX_MOVES):
+        is_t, val = check_terminal(board, turn)
+        if is_t:
+            outcome = (float(val) if turn else -float(val)) if val is not None else 0.0
+            break
+
+        legal = np.where(action_masks(board, turn))[0]
+        if len(legal) == 0:
+            outcome = -1.0
+            break
+
+        in_opening = move_count < BC_RANDOM_OPENS * 2
+        if in_opening or rng.random() < BC_BLUNDER_RATE:
+            action = int(rng.choice(legal))
+        else:
+            action = find_best_move(board.tobytes(), depth, turn)
+            if action in (-1, 1225):
+                action = int(rng.choice(legal))
+
+        obs    = board_to_obs(board, turn)
+        policy = soft_policy_from_mm(board, depth, turn, BC_WARMUP_TEMP)
+        history.append((obs, policy, turn))
+        board  = apply_move(board, action, turn)
+        turn   = not turn
+        move_count += 1
+
+    return [
+        (obs, policy, outcome if was_blue else -outcome)
+        for obs, policy, was_blue in history
+    ]
+
+
+def generate_bc_warmup_data(
+    num_games: int,
+    depth: int = BC_WARMUP_DEPTH,
+    cache_path: str | None = None,
+) -> list:
+    """
+    Generate behaviour-cloning examples from MM vs MM self-play.
+
+    Each position becomes one example with a soft MM policy target and the
+    game outcome as value.  No D4 augmentation - targets are already
+    well-distributed across positions.
+
+    Games run in a thread pool (ctypes releases the GIL for true CPU
+    parallelism).  If *cache_path* is given, tries to load from disk first
+    and saves after generation.
+    """
+    if cache_path and os.path.exists(cache_path):
+        print(f"  Loading BC data from cache: {cache_path}")
+        data = np.load(cache_path)
+        examples = list(zip(data['obs'], data['policy'], data['value'].tolist()))
+        print(f"  Loaded {len(examples)} BC examples")
+        return examples
+
+    n_workers = max(1, (os.cpu_count() or 4) - 1)
+    examples: list = []
+    pbar = tqdm(total=num_games, desc=f"BC warmup (MM{depth})", unit="game")
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        for game_examples in ex.map(_bc_warmup_game, [(i, depth) for i in range(num_games)]):
+            examples.extend(game_examples)
+            pbar.update(1)
+            pbar.set_postfix(examples=len(examples))
+    pbar.close()
+    print(f"  BC warmup: {num_games} games -> {len(examples)} examples")
+
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            obs=np.stack([e[0] for e in examples]),
+            policy=np.stack([e[1] for e in examples]),
+            value=np.array([e[2] for e in examples], dtype=np.float32),
+        )
+        print(f"  Saved BC cache: {cache_path}")
+
+    return examples

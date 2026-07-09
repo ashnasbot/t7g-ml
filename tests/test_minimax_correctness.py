@@ -313,7 +313,7 @@ def test_edge_moves_reachable():
     move = find_best_move(board.tobytes(), depth=1, as_blue=True)
     assert move >= 0, "C minimax must find at least one legal move (not -1)"
 
-    # After the move Green at (6,3) must be adjacent to Blue's new piece → converted
+    # After the move Green at (6,3) must be adjacent to Blue's new piece -> converted
     new_board = apply_move(board, move, as_blue=True)
     _, green_count = count_cells(new_board)
     assert green_count == 0, "Minimax should capture the adjacent green piece"
@@ -321,7 +321,7 @@ def test_edge_moves_reachable():
 
 def test_bottom_edge_moves_reachable():
     """
-    Companion to test_edge_moves_reachable — checks row 6 (y-axis).
+    Companion to test_edge_moves_reachable - checks row 6 (y-axis).
     Blue at (3,5), Green at (3,6). Blue clones to row-6 square, converting Green.
     """
     board = setup_board(

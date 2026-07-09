@@ -5,7 +5,7 @@ Cross-reference notes:
   - Clone/jump: Python abs(mv_x/y)==2 matches C++ possibleMoves/strategy2 tables exactly.
   - Capture: C++ takeCells(dest) uses possibleMoves[dest] (Moore neighbourhood, 8 cells).
     Python 3×3 loop (+self, no-op). Same net result.
-  - Board layout: DLL wrapper uses y*7+x row-major → matches Python board[y,x].
+  - Board layout: DLL wrapper uses y*7+x row-major -> matches Python board[y,x].
   - Action encoding: DLL returns (from_y*7+from_x)*25+(dy+2)*5+(dx+2) = action_to_move.
   - Known dead-code bugs (non-training): move_to_action wrong deltas; calc_reward ignores
     as_blue param. Both unused in MCTS/training path.
@@ -24,7 +24,7 @@ from lib.t7g import (
 # ---------------------------------------------------------------------------
 
 def make_board(blue=(), green=()):
-    """(x,y) tuples → 7×7×2 board."""
+    """(x,y) tuples -> 7×7×2 board."""
     board = np.zeros((7, 7, 2), dtype=bool)
     for x, y in blue:
         board[y, x] = BLUE
@@ -46,7 +46,7 @@ class TestActionEncoding:
 
     def test_piece_coords(self):
         """Piece coords decode from action correctly."""
-        # piece=0 → (from_x=0, from_y=0); piece=48 → (from_x=6, from_y=6)
+        # piece=0 -> (from_x=0, from_y=0); piece=48 -> (from_x=6, from_y=6)
         for piece in range(49):
             action = piece * 25 + 12  # centre move (0,0 delta)
             from_x, from_y, _, _, _ = action_to_move(action)
@@ -162,20 +162,20 @@ class TestActionMasks:
 # ===========================================================================
 
 class TestApplyMove:
-    """Direct tests of apply_move — no environment layer."""
+    """Direct tests of apply_move - no environment layer."""
 
     # --- Clone (1-step): source stays ---
 
     def test_clone_keeps_source(self):
         board = make_board(blue=[(3, 3)])
-        action = encode_action(3, 3, 0, 1)   # (3,3) → (3,4): dy=1, clone
+        action = encode_action(3, 3, 0, 1)   # (3,3) -> (3,4): dy=1, clone
         new = apply_move(board, action, as_blue=True)
         assert np.array_equal(new[3, 3], BLUE), "Source must remain after clone"
         assert np.array_equal(new[4, 3], BLUE), "Destination must have piece"
 
     def test_clone_diagonal_keeps_source(self):
         board = make_board(blue=[(2, 2)])
-        action = encode_action(2, 2, 1, 1)   # (2,2) → (3,3)
+        action = encode_action(2, 2, 1, 1)   # (2,2) -> (3,3)
         new = apply_move(board, action, as_blue=True)
         assert np.array_equal(new[2, 2], BLUE)
         assert np.array_equal(new[3, 3], BLUE)
@@ -184,14 +184,14 @@ class TestApplyMove:
 
     def test_jump_removes_source(self):
         board = make_board(blue=[(3, 3)])
-        action = encode_action(3, 3, 0, 2)   # (3,3) → (3,5): dy=2, jump
+        action = encode_action(3, 3, 0, 2)   # (3,3) -> (3,5): dy=2, jump
         new = apply_move(board, action, as_blue=True)
         assert np.array_equal(new[3, 3], CLEAR), "Source must be cleared after jump"
         assert np.array_equal(new[5, 3], BLUE), "Destination must have piece"
 
     def test_jump_diagonal_removes_source(self):
         board = make_board(blue=[(3, 3)])
-        action = encode_action(3, 3, 2, 2)   # (3,3) → (5,5)
+        action = encode_action(3, 3, 2, 2)   # (3,3) -> (5,5)
         new = apply_move(board, action, as_blue=True)
         assert np.array_equal(new[3, 3], CLEAR)
         assert np.array_equal(new[5, 5], BLUE)
@@ -199,7 +199,7 @@ class TestApplyMove:
     def test_jump_mixed_delta_removes_source(self):
         """Jump with |dx|=2, |dy|=1 also removes source."""
         board = make_board(blue=[(3, 3)])
-        action = encode_action(3, 3, 2, 1)   # (3,3) → (5,4): |dx|=2 → jump
+        action = encode_action(3, 3, 2, 1)   # (3,3) -> (5,4): |dx|=2 -> jump
         new = apply_move(board, action, as_blue=True)
         assert np.array_equal(new[3, 3], CLEAR)
 
@@ -228,7 +228,7 @@ class TestApplyMove:
     def test_friendly_pieces_not_captured(self):
         """Friendly pieces adjacent to destination are not affected."""
         board = make_board(blue=[(3, 3), (5, 4)], green=[(4, 4)])
-        action = encode_action(3, 3, 1, 1)   # clone to (4,4) — captures green
+        action = encode_action(3, 3, 1, 1)   # clone to (4,4) - captures green
         new = apply_move(board, action, as_blue=True)
         assert np.array_equal(new[4, 5], BLUE), "Friendly at (5,4) must stay blue"
         assert np.array_equal(new[4, 4], BLUE), "Destination must be blue"
@@ -237,7 +237,7 @@ class TestApplyMove:
     def test_capture_at_board_edge(self):
         """Opponent at the board edge is correctly captured."""
         board = make_board(blue=[(5, 5)], green=[(6, 6)])
-        action = encode_action(5, 5, 1, 1)   # clone to (6,6) — but (6,6) occupied!
+        action = encode_action(5, 5, 1, 1)   # clone to (6,6) - but (6,6) occupied!
         # Instead clone to (6,5), adjacent to (6,6)
         action = encode_action(5, 5, 1, 0)   # clone to (6,5)
         new = apply_move(board, action, as_blue=True)
@@ -248,7 +248,7 @@ class TestApplyMove:
         board = make_board(blue=[(3, 3)], green=[(3, 6)])
         action = encode_action(3, 3, 0, 1)   # clone to (3,4)
         new = apply_move(board, action, as_blue=True)
-        # Green at (3,6) is 2 away from destination (3,4) — not captured
+        # Green at (3,6) is 2 away from destination (3,4) - not captured
         assert np.array_equal(new[6, 3], GREEN), "Green 2 away must not be captured"
 
     def test_apply_move_does_not_mutate_input(self):
@@ -262,7 +262,7 @@ class TestApplyMove:
     def test_green_clone_captures_blue(self):
         """Green can clone and capture blue pieces symmetrically."""
         board = make_board(blue=[(4, 4)], green=[(3, 3)])
-        action = encode_action(3, 3, 1, 1)   # green clones to (4,4) — occupied!
+        action = encode_action(3, 3, 1, 1)   # green clones to (4,4) - occupied!
         # Green clones to (3,4); blue at (4,4) is adjacent
         action = encode_action(3, 3, 0, 1)   # green clones to (3,4)
         new = apply_move(board, action, as_blue=False)
@@ -283,29 +283,29 @@ class TestCheckTerminal:
         assert val is None
 
     def test_blue_eliminated_terminal(self):
-        """Blue has 0 pieces → terminal regardless of whose turn."""
+        """Blue has 0 pieces -> terminal regardless of whose turn."""
         board = make_board(green=[(3, 3)])
         # Blue's turn
         is_term, val = check_terminal(board, True)
         assert is_term
-        assert val == -1.0, "Blue to move but blue eliminated → loss"
+        assert val == -1.0, "Blue to move but blue eliminated -> loss"
         # Green's turn
         is_term, val = check_terminal(board, False)
         assert is_term
-        assert val == 1.0, "Green to move but blue eliminated → win"
+        assert val == 1.0, "Green to move but blue eliminated -> win"
 
     def test_green_eliminated_terminal(self):
-        """Green has 0 pieces → terminal."""
+        """Green has 0 pieces -> terminal."""
         board = make_board(blue=[(3, 3)])
         is_term, val = check_terminal(board, True)
         assert is_term
-        assert val == 1.0, "Blue to move, green eliminated → win"
+        assert val == 1.0, "Blue to move, green eliminated -> win"
         is_term, val = check_terminal(board, False)
         assert is_term
-        assert val == -1.0, "Green to move, green eliminated → loss"
+        assert val == -1.0, "Green to move, green eliminated -> loss"
 
     def test_only_current_player_stuck_not_terminal(self):
-        """If only one player has no moves, that's a forced pass — NOT terminal."""
+        """If only one player has no moves, that's a forced pass - NOT terminal."""
         # Blue completely blocked, but green has moves
         green_sq = [(x, y) for x in range(1, 6) for y in range(1, 6)
                     if (x, y) != (3, 3)]
@@ -314,10 +314,10 @@ class TestCheckTerminal:
         assert not np.any(action_masks(board, True)), "Blue must be stuck"
         assert np.any(action_masks(board, False)), "Green must have moves"
         is_term, val = check_terminal(board, True)
-        assert not is_term, "Only blue stuck → pass, not terminal"
+        assert not is_term, "Only blue stuck -> pass, not terminal"
 
     def test_both_stuck_blue_ahead_blue_wins(self):
-        """Both players stuck, blue has more pieces → blue wins."""
+        """Both players stuck, blue has more pieces -> blue wins."""
         # Fill board fully: more blue than green
         board = np.zeros((7, 7, 2), dtype=bool)
         for y in range(7):
@@ -334,14 +334,14 @@ class TestCheckTerminal:
 
         is_term, val = check_terminal(board, True)   # Blue's turn
         assert is_term
-        assert val == 1.0, "Blue to move, blue ahead → win"
+        assert val == 1.0, "Blue to move, blue ahead -> win"
         is_term, val = check_terminal(board, False)  # Green's turn
         assert is_term
-        assert val == -1.0, "Green to move, blue ahead → Green loses"
+        assert val == -1.0, "Green to move, blue ahead -> Green loses"
 
     def test_both_stuck_green_ahead_green_wins(self):
-        """Both stuck, green has more pieces → green wins from green's perspective."""
-        # Fill entire board: no empty cells → neither can move.
+        """Both stuck, green has more pieces -> green wins from green's perspective."""
+        # Fill entire board: no empty cells -> neither can move.
         # 21 blue (rows 0-2), 28 green (rows 3-6).
         board = np.zeros((7, 7, 2), dtype=bool)
         for y in range(7):
@@ -357,26 +357,26 @@ class TestCheckTerminal:
 
         is_term, val = check_terminal(board, True)   # Blue's turn
         assert is_term
-        assert val == -1.0, "Blue to move, green ahead → Blue loses"
+        assert val == -1.0, "Blue to move, green ahead -> Blue loses"
         is_term, val = check_terminal(board, False)  # Green's turn
         assert is_term
-        assert val == 1.0, "Green to move, green ahead → Green wins"
+        assert val == 1.0, "Green to move, green ahead -> Green wins"
 
     def test_both_stuck_score_draw_value(self):
         """check_terminal returns 0.0 when both stuck and piece counts are equal.
 
         A 7×7 board has 49 (odd) cells so a fully-stuck draw cannot be
         constructed with a real both-stuck board. We test the code path by
-        using the fully-full board (0 empty → both stuck) with an equal-count
+        using the fully-full board (0 empty -> both stuck) with an equal-count
         arrangement achieved via a 7×6=42 cell region (21+21) plus 7 forced
         cells that preserve equality.
         Note: blue_count==green_count requires an even number of filled cells.
-        We fill all 49 cells: 24 blue + 25 green → not equal. Therefore we
+        We fill all 49 cells: 24 blue + 25 green -> not equal. Therefore we
         verify the draw value indirectly: confirm the inequality branches return
-        the correct sign, and that swapping the counts swaps the value — all
+        the correct sign, and that swapping the counts swaps the value - all
         consistent with the score==0 branch returning 0.0 by the same formula.
         """
-        # Full board (no legal moves), blue_count < green_count — tested above.
+        # Full board (no legal moves), blue_count < green_count - tested above.
         # Verify that reversing the counts (more blue) gives +1 for blue's turn.
         board = np.zeros((7, 7, 2), dtype=bool)
         for y in range(7):

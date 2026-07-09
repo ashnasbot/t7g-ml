@@ -50,7 +50,7 @@ Single-threaded, Windows 11 AMD CPU (`-march=native`).
 | 3 |  0.02 |   1.40 |
 | 4 |  0.13 |  16.12 |
 | 5 |  1.16 |  73.91 |
-| 6 |     — | 731.37 |
+| 6 |     - | 731.37 |
 
 **Conclusions:**
 - Mid-game branching factor is ~60–70× more expensive than the opening at depth 5.

@@ -37,10 +37,7 @@ movecache.pk
 TODO.txt
 preseed_data.h
 
-# Local-only scripts (environment-specific or incomplete)
-scripts/read_tb.py
-
-# Debug / scratch scripts
+# Debug tooling (read_tb.py lives here) — kept local
 debug/
 
 # Build / packaging artifacts
@@ -53,3 +50,17 @@ heatmap*.png
 
 # Research papers (large PDFs, not code)
 papers/
+
+# Third-party / GPL engines we test against (ScummVM Groovie, SlimeWar Ataxx
+# clone, compy3 GPL port, ONNX Runtime). Never ours to redistribute.
+3rd_party/
+
+# Retired experiments & diagnostics — kept on disk, out of the committed tree.
+archive/
+
+# Compiled test binaries / generated solver output
+test_micro_mcts
+replay.mp4
+*solution.json
+stauf_log.json
+line*.json

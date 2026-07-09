@@ -4,21 +4,21 @@ Pytest-based correctness tests for minimax implementation.
 Run with: pytest tests/test_minimax.py -v
 """
 import ctypes
-from pathlib import Path
 import numpy as np
 import pytest
 
-from lib.t7g import action_masks, BLUE, GREEN, CLEAR
+from lib.t7g import action_masks, BLUE, GREEN, CLEAR, _find_dll
 
 
 # Fixtures
 
 @pytest.fixture(scope="module")
 def minimax():
-    """Load minimax DLL"""
-    libname = Path(__file__).parent.parent / "micro3.dll"
-    if not libname.exists():
-        pytest.skip("micro3.dll not found - compile with: gcc -O3 -march=native -ffast-math micro_3.c -o micro3.dll --shared")
+    """Load minimax library"""
+    try:
+        libname = _find_dll("micro3")
+    except FileNotFoundError:
+        pytest.skip("micro3 library not found - compile with: make dll-native")
 
     lib = ctypes.CDLL(str(libname))
     lib.find_best_move.restype = ctypes.c_int

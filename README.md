@@ -1,36 +1,40 @@
-# T7G Microscope — ML Gym
+# T7G ML Gym
 
-Train RL agents to play the Microscope minigame from *The 7th Guest* — an Ataxx-like board game on a 7×7 grid.
+Board-game AI for two minigames from *The 7th Guest*:
+
+- **Microscope** — an Ataxx-like game on a 7×7 grid. Full AlphaZero-style
+  self-play training pipeline plus fast C minimax engines to train and evaluate
+  against.
+- **The Beehive** — a hexagonal Ataxx variant on a 61-cell board, with a
+  playable GUI and a C minimax opponent.
 
 ## History
-initally this project started as building a BFS solver for the game to find the 'optimal' line to beat Stauf.
-it turns out Microscope has a branching factor of 50-60, note Chess is ~35.
-this leads us to a roughly several billion year calculation to 'solve' the game, so we quickly turned to heuristic models.
-We may revisit a Retrograde analysis in the future.
 
-`micro_3.c` optimised Darkshoxx's single move solver into a general 'find-best-move' calc, using various depths.
-several rounds of optimisation later and it can calc to MM5 in less than a milisecond on average, giving us a very solid player to
-train and eval against.
+The project started as a BFS solver hunting the optimal line to beat Stauf.
+Microscope turns out to have a branching factor of 50–60 (chess is ~35), which
+puts a full solve several billion years out of reach — so it quickly became a
+heuristic-model problem. (A retrograde analysis may happen someday.)
 
-lots of experimentation followed, starting with PPO, action masking and much hair-pulling.
+`micro_3.c` grew out of Darkshoxx's single-move solver into a general
+find-best-move search. After several rounds of optimisation it evaluates to
+MM5 in under a millisecond on average, giving a solid opponent to train and
+measure against.
 
-Eventually the plan shifted towards an AlphaZero implementation - the current model.
-particular features and enhancements:
-- C implmentation
-  imposes a number of limits, but scoped to the current game
-- game pool based inference
-  had a lot of trouble getting a proper server working, so we run 32 games in parallel and batch the inferences
-- MCGS
-  we use a transposition table and loop detection to for a Monte Carlo Graph Search instead of AlphaZero's Trees
-  This is due to the large number of symmetries in Microscope vs similar games, allowing for batching of sim results (not proven)
-- Gumbel + Sequential Halving
-- replacing policy targets with a soft minimax distribution to get around bootstrapping issues (may remove)
-  This also produced micro4.c a slower/weaker minimaxer, but which shows better correllation in the midgame to W/L results
-- prototype game gym harness - can play in the real game by clicking the mouse
+A lot of experimentation followed — PPO, action masking, much hair-pulling —
+before the plan settled on an AlphaZero implementation, the current model.
+Notable pieces:
 
-## Current results
-
-~2ply minimaxer - we've a long way to go, but we may trade with the 'Stauf' UI in the real game.
+- **C game core** — the engine and search are compiled C, scoped tightly to
+  these games for speed.
+- **Pooled inference** — 32 games run in parallel and their inferences are
+  batched, in place of a separate inference server.
+- **MCGS** — a Monte-Carlo *Graph* Search (transposition table + loop
+  detection) rather than AlphaZero's trees, to exploit Microscope's many board
+  symmetries.
+- **Gumbel + Sequential Halving** for root action selection.
+- **Soft-minimax policy targets** to sidestep value bootstrapping issues on
+  short tactical games. This also produced `micro_4.c`, a slower/weaker
+  minimaxer that correlates better with midgame win/loss.
 
 ## Installation
 
@@ -40,74 +44,69 @@ cd t7g-ml-gym
 
 # Create and activate a virtual environment
 python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # Linux / macOS
+source .venv/bin/activate      # Linux / macOS
+# .venv\Scripts\activate       # Windows
 
-# Install dependencies
+# Install dependencies and this package (editable)
 pip install -r requirements.txt
-
-# Install this package in editable mode (adds the project root to sys.path)
 pip install -e .
 ```
 
-> **PyTorch**: the above installs the CPU build. For GPU training see the PyTorch
-> section at the bottom of [requirements.txt](requirements.txt) for ROCm and CUDA variants.
+> **PyTorch**: the above installs the CPU build. For GPU training see the
+> PyTorch section at the bottom of [requirements.txt](requirements.txt) for
+> ROCm and CUDA variants.
 
-### Compile the C DLLs
+### Build the C engines
 
-Two minimax solvers and the MCTS tree are compiled C extensions. Build them once after checkout:
+The minimax solvers and the MCTS graph search are compiled C extensions. Build
+them once after checkout:
 
 ```bash
 make dll
 ```
 
-This compiles `micro3.dll`, `micro4.dll`, `micro_mcts.dll`, and `cell_dll.dll` into `lib/`.
-`make dll-native` rebuilds with `-march=native` for the local CPU. `make clean` removes all built DLLs.
+This compiles `micro3`, `micro4`, `micro_mcts`, `micro_mcts_heuristic`, and
+`beehive4` into `lib/`. `make dll-native` rebuilds with `-march=native` for the
+local CPU; `make clean` removes the built libraries.
 
 ---
 
-## Training
+## Microscope
+
+### Training
 
 Train a dual-head (policy + value) network via AlphaZero-style MCTS self-play:
 
 ```bash
-.venv/Scripts/python scripts/train_mcts.py
+python scripts/train_mcts.py
 ```
 
-Checkpoints are saved to `models/mcts/` every iteration. Resume from a checkpoint:
-
-```bash
-.venv/Scripts/python scripts/train_mcts.py --checkpoint models/mcts/iter_0050.pt
-```
-
-Key options:
+Checkpoints are saved to `models/mcts/` every iteration. Resume with
+`--checkpoint models/mcts/iter_0050.pt`.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--iterations` | 500 | Number of self-play → train iterations |
+| `--checkpoint` | – | Resume from a saved checkpoint |
+| `--iterations` | 500 | Self-play → train iterations |
 | `--games` | 250 | Self-play games per iteration |
-| `--simulations` | 250 | MCTS simulations per move |
-| `--checkpoint` | — | Resume from a saved checkpoint |
+| `--simulations` | 500 | MCTS simulations per move |
+| `--lr` | 1e-4 | Learning rate (constant for the run) |
 | `--logdir` | `tblog/mcts` | TensorBoard log directory |
-| `--run-name` | auto | Run label shown in TensorBoard |
+| `--relabel` | off | Relabel MCTS visit-count targets via minimax policy distillation |
+| `--bc-warmup` | 0 | Pre-fill the replay buffer with N behavioural-cloning games before iteration 1 |
+| `--bc-depth` | 3 | Minimax depth for BC warmup data |
+| `--bc-epochs` | 100 | Training epochs on BC data before self-play begins |
+| `--bc-cache` | – | Path to save/load BC data (`.npz`); `auto` derives it from params |
 
-Monitor training:
+Monitor with `tensorboard --logdir=tblog/`.
 
-```bash
-tensorboard --logdir=tblog/
-```
-
----
-
-## Evaluation
+### Evaluation
 
 Evaluate a checkpoint against the minimax opponent:
 
 ```bash
-.venv/Scripts/python scripts/play_mcts.py --checkpoint models/mcts/iter_0050.pt
+python scripts/play_mcts.py --checkpoint models/mcts/iter_0050.pt
 ```
-
-Options:
 
 | Flag | Default | Description |
 |---|---|---|
@@ -115,51 +114,70 @@ Options:
 | `--games` | 20 | Number of evaluation games |
 | `--depth` | 2 | Minimax search depth |
 | `--simulations` | 100 | MCTS simulations per move |
-| `--watch` | off | Print board state each move |
+| `--watch` | off | Print the board each move |
 
----
+### Play (GUI)
 
-## Playing
-
-### GUI
-
-Requires `pyglet` (`pip install pyglet`):
+Requires `pyglet`. The C engines play immediately after `make dll`; the `mcts`
+opponent needs a trained checkpoint.
 
 ```bash
-# Play against bundled MCTS model (default)
-.venv/Scripts/python scripts/play_gui.py
+# Play against a minimax engine (no model needed)
+python scripts/play_gui.py --opponent micro3 --depth 3
 
-# Play against a specific checkpoint
-.venv/Scripts/python scripts/play_gui.py --checkpoint models/mcts/iter_0100.pt
-
-# Play against minimax
-.venv/Scripts/python scripts/play_gui.py --opponent micro4 --depth 3
+# Play against a trained MCTS model
+python scripts/play_gui.py --opponent mcts --checkpoint models/mcts/iter_0100.pt
 
 # Play as Green
-.venv/Scripts/python scripts/play_gui.py --human-color green
+python scripts/play_gui.py --opponent micro3 --human-color green
 ```
-
-Options:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--checkpoint` | bundled | Model file |
-| `--opponent` | `mcts` | `mcts`, `micro3`, `micro4`, or `stauf` |
+| `--opponent` | `mcts` | `mcts`, `micro3`, `micro4t`, or `hmcts` |
+| `--checkpoint` | – | MCTS model file (for `--opponent mcts`) |
 | `--depth` | 2 | Minimax search depth |
 | `--simulations` | 100 | MCTS simulations per move |
-| `--human-color` | `blue` | Your piece colour (`blue` or `green`) |
+| `--human-color` | `blue` | Your colour (`blue` or `green`) |
 
-Click a piece to select it, then click the destination. Clones land within 1 step; jumps land 2 steps away.
+Click a piece to select it, then click the destination. Clones land within 1
+step; jumps land 2 steps away.
 
 ---
 
-## Running Tests
+## The Beehive
+
+A hexagonal Ataxx variant on a 61-cell board. Play the GUI against the
+`beehive4` C minimax:
 
 ```bash
-.venv/Scripts/python -m pytest tests/ -v
+# Play against the minimax opponent
+python scripts/play_beehive.py --opponent minimax --ai-time 2000
+
+# Play as Red
+python scripts/play_beehive.py --human-color red
+
+# Practice against random moves
+python scripts/play_beehive.py --opponent random
 ```
 
+| Flag | Default | Description |
+|---|---|---|
+| `--opponent` | `minimax` | `minimax` or `random` |
+| `--human-color` | `yellow` | Your colour (`yellow` or `red`) |
+| `--ai-time` | 1000 | Minimax time budget per move (ms) |
+| `--ai-delay` | 0.4 | Pause before the AI moves (s) |
+
+Controls: click a piece then its destination (clone = 1 hex, jump = 2 hexes) ·
+`E` toggles edit mode · `R` restarts · `Esc` quits.
+
 ---
+
+## Running tests
+
+```bash
+python -m pytest tests/ -v
+```
 
 ## Acknowledgements
 

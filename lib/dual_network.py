@@ -6,11 +6,9 @@ AlphaZero-style residual backbone with:
 - Value head: scalar in [-1, 1] (board evaluation)
 
 Architecture:
-    Input (4 channels) → initial conv → N residual blocks → policy/value heads
+    Input (4 channels) -> initial conv -> N residual blocks -> policy/value heads
 
-The old design had a single dense layer policy_fc (32*49 → 1225) that
-accounted for ~87% of total parameters with no useful spatial abstraction.
-This version uses a 2-filter policy conv so the FC is only ~120k params.
+2-filter policy conv so the FC is only ~120k params.
 """
 import numpy as np
 import torch
@@ -24,7 +22,7 @@ class ResidualBlock(nn.Module):
     """
     Standard AlphaZero residual block.
 
-    conv(3×3) → BN → ReLU → conv(3×3) → BN → skip → ReLU
+    conv(3×3) -> BN -> ReLU -> conv(3×3) -> BN -> skip -> ReLU
     """
 
     def __init__(self, num_filters: int) -> None:
@@ -54,7 +52,7 @@ class DualHeadNetwork(nn.Module):
     def __init__(self, num_actions: int = 1225, num_filters: int = 128, num_blocks: int = 6) -> None:
         super().__init__()
 
-        # Input projection: 4 channels → num_filters
+        # Input projection: 4 channels -> num_filters
         self.input_conv = nn.Conv2d(4, num_filters, kernel_size=3, padding=1, bias=False)
         self.input_bn = nn.BatchNorm2d(num_filters)
 
@@ -63,17 +61,26 @@ class DualHeadNetwork(nn.Module):
             *[ResidualBlock(num_filters) for _ in range(num_blocks)]
         )
 
-        # Policy head: 2-filter conv → flatten → FC
-        # 2 * 7 * 7 = 98 → num_actions  (~120k params vs 1.92M before)
+        # Policy head: 2-filter conv -> flatten -> FC
+        # 2 * 7 * 7 = 98 -> num_actions  (~120k params vs 1.92M before)
         self.policy_conv = nn.Conv2d(num_filters, 2, kernel_size=1, bias=False)
         self.policy_bn = nn.BatchNorm2d(2)
         self.policy_fc = nn.Linear(2 * 7 * 7, num_actions)
 
-        # Value head: 1-filter conv → flatten → FC → FC → tanh
-        self.value_conv = nn.Conv2d(num_filters, 1, kernel_size=1, bias=False)
-        self.value_bn = nn.BatchNorm2d(1)
-        self.value_fc1 = nn.Linear(1 * 7 * 7, 64)
-        self.value_fc2 = nn.Linear(64, 1)
+        # Value head: 4-filter conv (spatial features) concatenated with
+        # global mean+max pooling of the trunk (global features).  The pooled
+        # trunk channels give the head direct access to board-wide quantities
+        # (material difference, mobility) that pure convs struggle to count —
+        # KataGo's global-pooling trick, which matters a lot for a
+        # material-driven game like this one.
+        self.value_conv = nn.Conv2d(num_filters, 4, kernel_size=1, bias=False)
+        self.value_bn = nn.BatchNorm2d(4)
+        self.value_fc1 = nn.Linear(4 * 7 * 7 + 2 * num_filters, 256)
+        self.value_fc2 = nn.Linear(256, 1)
+        # Auxiliary margin head: predicts final material margin scaled to
+        # [-1, 1] (margin / 49).  Dense low-noise signal from every game that
+        # trains the same trunk the win/loss value head reads from.
+        self.margin_fc = nn.Linear(256, 1)
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -84,11 +91,18 @@ class DualHeadNetwork(nn.Module):
 
         Returns:
             policy_logits: (batch, num_actions)
-            value:         (batch, 1)
+            value:         (batch, 1) — predicted game outcome in [-1, 1]
+            margin:        (batch, 1) — predicted final material margin / 49
         """
-        # Handle both NHWC and NCHW input
+        # Handle both NHWC and NCHW input. The permute from (N,7,7,4) to
+        # (N,4,7,7) produces strides that are already channels_last-compatible
+        # so the following .contiguous(...) is typically a no-op — the call
+        # is there to explicitly mark memory_format so cuDNN picks NHWC
+        # Tensor Core kernels when the model has been .to(channels_last).
         if obs.dim() == 4 and obs.shape[-1] == 4:
-            x = obs.permute(0, 3, 1, 2).float()
+            x = obs.permute(0, 3, 1, 2).contiguous(
+                memory_format=torch.channels_last
+            ).float()
         else:
             x = obs.float()
 
@@ -101,13 +115,17 @@ class DualHeadNetwork(nn.Module):
         p = p.reshape(p.size(0), -1)
         policy_logits = self.policy_fc(p)
 
-        # Value head
+        # Value head: spatial conv features + global mean/max pooled trunk
         v = F.relu(self.value_bn(self.value_conv(x)))
         v = v.reshape(v.size(0), -1)
+        g_mean = x.mean(dim=(2, 3))
+        g_max = x.amax(dim=(2, 3))
+        v = torch.cat([v, g_mean, g_max], dim=1)
         v = F.relu(self.value_fc1(v))
         value = torch.tanh(self.value_fc2(v))
+        margin = torch.tanh(self.margin_fc(v))
 
-        return policy_logits, value
+        return policy_logits, value, margin
 
     @torch.no_grad()
     def predict(self, board: np.ndarray, turn: bool) -> tuple[np.ndarray, float]:
@@ -126,7 +144,7 @@ class DualHeadNetwork(nn.Module):
         obs = board_to_obs(board, turn)
         obs_tensor = torch.from_numpy(obs).unsqueeze(0).to(next(self.parameters()).device)
 
-        policy_logits, value = self.forward(obs_tensor)
+        policy_logits, value, _ = self.forward(obs_tensor)
 
         policy_probs = F.softmax(policy_logits, dim=-1).cpu().numpy()[0]
         value_scalar = value.cpu().item()

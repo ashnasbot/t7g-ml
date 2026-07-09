@@ -1,8 +1,12 @@
 import ctypes
 import numpy
 import pathlib
+import sys
+import threading
 from PIL import Image
 try:
+    import warnings
+    warnings.filterwarnings("ignore")
     from term_image.image import AutoImage as _AutoImage
     _HAS_TERM_IMAGE = True
 except ImportError:
@@ -18,12 +22,32 @@ CLEAR = numpy.array([0, 0], dtype=bool)
 BLUE_GRID = numpy.full([7, 7, 2], BLUE)
 GREEN_GRID = numpy.full([7, 7, 2], GREEN)
 
+def draw_board(board: "npt.NDArray[numpy.bool_]") -> None:
+    """Render the 7×7 board in the terminal using term_image (no-op if not installed)."""
+    if not _HAS_TERM_IMAGE:
+        return
+    cell = 12  # pixels per cell in the rendered image
+    img_arr = numpy.zeros((7 * cell, 7 * cell, 3), dtype=numpy.uint8)
+    for gy in range(7):
+        for gx in range(7):
+            r0, r1 = gy * cell + 1, (gy + 1) * cell - 1
+            c0, c1 = gx * cell + 1, (gx + 1) * cell - 1
+            if board[gy, gx, 1]:          # Blue
+                colour = (80, 140, 255)
+            elif board[gy, gx, 0]:        # Green
+                colour = (80, 210, 80)
+            else:                          # Empty
+                colour = (50, 40, 35)
+            img_arr[r0:r1, c0:c1] = colour
+    _AutoImage(Image.fromarray(img_arr, "RGB")).draw()
+
+
 # Type aliases
 Board = npt.NDArray[numpy.bool_]    # shape (7, 7, 2)
 Obs = npt.NDArray[numpy.float32]   # shape (7, 7, 4)
 
 # Precomputed index arrays for vectorised action_masks.
-# _DEST_Y: (7,1,5,1)  _DEST_X: (1,7,1,5) — broadcast together to (7,7,5,5)
+# _DEST_Y: (7,1,5,1)  _DEST_X: (1,7,1,5) - broadcast together to (7,7,5,5)
 # where axes are [piece_y, piece_x, move_v, move_u].
 _YS = numpy.arange(7).reshape(7, 1, 1, 1)
 _XS = numpy.arange(7).reshape(1, 7, 1, 1)
@@ -40,49 +64,100 @@ _DEST_X = numpy.clip(_DEST_X_RAW, 0, 6)
 
 
 def _find_dll(name: str) -> pathlib.Path:
-    """Locate a DLL, preferring the native (-march=native) build in the project root."""
-    candidates = [
-        pathlib.Path().absolute() / name,                      # native (cwd/root)
-        pathlib.Path(__file__).parent.parent / name,           # native (abs project root)
-        pathlib.Path(__file__).parent / name,                  # portable (lib/)
+    """Locate a shared library, preferring the native (-march=native) build in the project root.
+
+    Accepts a name with either .dll or .so extension (or no extension).  On
+    Linux the .so variant is tried first; on Windows .dll is tried first.
+    """
+    stem = pathlib.Path(name).stem
+    suffixes = [".dll"] if sys.platform == "win32" else [".so"]
+    roots = [
+        pathlib.Path().absolute(),                 # native build in cwd/root
+        pathlib.Path(__file__).parent.parent,      # native build (abs project root)
+        pathlib.Path(__file__).parent,             # portable build in lib/
     ]
-    for p in candidates:
-        if p.exists():
-            return p
+    for root in roots:
+        for suffix in suffixes:
+            p = root / (stem + suffix)
+            if p.exists():
+                return p
+    candidates = [r / (stem + s) for r in roots for s in suffixes]
     raise FileNotFoundError(f"Cannot locate {name}; searched: {candidates}")
 
 
-_minimax_lib = ctypes.CDLL(str(_find_dll("micro4.dll")))
-_minimax_lib.find_best_move.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
-_minimax_lib.find_best_move.restype  = ctypes.c_int
-_minimax_lib.minimax_score.argtypes  = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
-_minimax_lib.minimax_score.restype   = ctypes.c_float
-_minimax_lib.score_root_moves.argtypes = [
-    ctypes.POINTER(ctypes.c_bool),   # bool game_board[7][7][2] (98 bytes)
-    ctypes.c_int,                    # depth
-    ctypes.c_bool,                   # as_blue
-    ctypes.POINTER(ctypes.c_float),  # float out_scores[1225]
-]
-_minimax_lib.score_root_moves.restype = None
+class _LazyLib:
+    """Wraps a C shared library and defers loading until first attribute access.
 
-_micro3_lib = ctypes.CDLL(str(_find_dll("micro3.dll")))
-_micro3_lib.find_best_move.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
-_micro3_lib.find_best_move.restype  = ctypes.c_int
-_micro3_lib.score_root_moves.argtypes = [
-    ctypes.POINTER(ctypes.c_bool),
-    ctypes.c_int,
-    ctypes.c_bool,
-    ctypes.POINTER(ctypes.c_float),
-]
-_micro3_lib.score_root_moves.restype = None
+    Thread-safe: double-checked locking ensures setup() completes before any
+    thread can call into the library, even under concurrent first-access.
+    """
 
-_stauf_lib = ctypes.CDLL(str(_find_dll("cell_dll.dll")))
-_stauf_lib.find_best_move.restype = ctypes.c_int
+    def __init__(self, name: str, setup) -> None:
+        self._name  = name
+        self._setup = setup
+        self._lib: 'ctypes.CDLL | None' = None
+        self._lock  = threading.Lock()
 
-_hmcts_lib = ctypes.CDLL(str(_find_dll("micro_mcts_heuristic.dll")))
-_hmcts_lib.hmcts_find_best_move.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
-_hmcts_lib.hmcts_find_best_move.restype  = ctypes.c_int
-_hmcts_lib.hmcts_init()
+    def __getattr__(self, attr: str):
+        if self._lib is None:
+            with self._lock:
+                if self._lib is None:          # re-check under lock
+                    lib = ctypes.CDLL(str(_find_dll(self._name)))
+                    self._setup(lib)           # argtypes/restype set before publish
+                    self._lib = lib            # visible to other threads only after setup
+        return getattr(self._lib, attr)
+
+
+def _setup_minimax(lib: ctypes.CDLL) -> None:
+    lib.find_best_move.argtypes       = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+    lib.find_best_move.restype        = ctypes.c_int
+    lib.minimax_score.argtypes        = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+    lib.minimax_score.restype         = ctypes.c_float
+    lib.score_root_moves.argtypes     = [
+        ctypes.POINTER(ctypes.c_bool),   # bool game_board[7][7][2] (98 bytes)
+        ctypes.c_int,                    # depth
+        ctypes.c_bool,                   # as_blue
+        ctypes.POINTER(ctypes.c_float),  # float out_scores[1225]
+    ]
+    lib.score_root_moves.restype      = None
+    lib.find_best_move_timed.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+    lib.find_best_move_timed.restype  = ctypes.c_int
+
+
+def _setup_micro3(lib: ctypes.CDLL) -> None:
+    lib.find_best_move.argtypes   = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+    lib.find_best_move.restype    = ctypes.c_int
+    lib.score_root_moves.argtypes = [
+        ctypes.POINTER(ctypes.c_bool),
+        ctypes.c_int,
+        ctypes.c_bool,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.score_root_moves.restype  = None
+
+
+def _setup_stauf(lib: ctypes.CDLL) -> None:
+    lib.find_best_move.restype = ctypes.c_int
+
+
+def _setup_hmcts(lib: ctypes.CDLL) -> None:
+    lib.hmcts_find_best_move.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+    lib.hmcts_find_best_move.restype  = ctypes.c_int
+    lib.hmcts_init()
+
+
+def _setup_compy3(lib: ctypes.CDLL) -> None:
+    lib.find_best_move_sw.argtypes        = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+    lib.find_best_move_sw.restype         = ctypes.c_int
+    lib.find_best_move_sw_timed.argtypes  = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+    lib.find_best_move_sw_timed.restype   = ctypes.c_int
+
+
+_minimax_lib = _LazyLib("micro4",               _setup_minimax)
+_micro3_lib  = _LazyLib("micro3",               _setup_micro3)
+_stauf_lib   = _LazyLib("cell_dll",             _setup_stauf)
+_hmcts_lib   = _LazyLib("micro_mcts_heuristic", _setup_hmcts)
+_compy3_lib  = _LazyLib("compy3",               _setup_compy3)
 
 
 def soft_policy_from_mm(
@@ -231,7 +306,7 @@ def action_masks(game_grid: Board, turn: bool) -> npt.NDArray[numpy.bool_]:
     # (7,7): True where a cell is completely empty
     empty_mask = ~(game_grid[:, :, 0] | game_grid[:, :, 1])
 
-    # empty_mask indexed by precomputed dest coords → (7,7,5,5)
+    # empty_mask indexed by precomputed dest coords -> (7,7,5,5)
     dest_empty = empty_mask[_DEST_Y, _DEST_X]
 
     actions = piece_mask[:, :, numpy.newaxis, numpy.newaxis] & _IN_BOUNDS & dest_empty
@@ -271,7 +346,32 @@ def find_best_move(board: Any, depth: int, as_blue: bool,
     if engine == 'hmcts':
         # depth repurposed as simulation count for MCTS
         return int(_hmcts_lib.hmcts_find_best_move(board, depth, as_blue))
+    if engine == 'micro4t':
+        # depth repurposed as millisecond time budget for iterative deepening
+        return int(_minimax_lib.find_best_move_timed(board, depth, as_blue))
+    if engine == 'compy3':
+        return int(_compy3_lib.find_best_move_sw(board, depth, as_blue))
+    if engine == 'compy3t':
+        # depth repurposed as millisecond time budget
+        return int(_compy3_lib.find_best_move_sw_timed(board, depth, as_blue))
     return int(_minimax_lib.find_best_move(board, depth, as_blue))
+
+
+def find_best_move_timed(board: Any, max_ms: int, as_blue: bool) -> int:
+    """Iterative-deepening NegaScout search with a millisecond time budget.
+
+    Uses micro4's bitboard engine with aspiration windows and history heuristic.
+    Always returns the best move from the last completed depth.
+
+    Args:
+        board:   7×7×2 numpy bool array (or bytes via .tobytes())
+        max_ms:  time budget in milliseconds (e.g. 100–1000)
+        as_blue: True if the engine plays Blue
+
+    Returns:
+        action index in 0..1224, or -1 if no legal moves
+    """
+    return int(_minimax_lib.find_best_move_timed(board, max_ms, as_blue))
 
 
 def apply_move(board: Board, action: int, as_blue: bool) -> Board:
@@ -355,7 +455,7 @@ ACTION_TO_DEST: npt.NDArray[numpy.int32] = _build_action_dest_map()
 def _build_symmetry_perms() -> list[npt.NDArray[numpy.int32]]:
     """Precompute action-index permutation tables for all 8 D4 symmetries.
 
-    Each transform is defined by how it maps (y, x, dy, dx) → (y', x', dy', dx'):
+    Each transform is defined by how it maps (y, x, dy, dx) -> (y', x', dy', dx'):
       0: identity          1: rot90 CCW        2: rot180
       3: rot270 CCW        4: flipH (cols)     5: flipV (rows)
       6: flipD1 (main)     7: flipD2 (anti)
@@ -397,7 +497,7 @@ def _build_symmetry_perms_49() -> list[npt.NDArray[numpy.int32]]:
     """Precompute destination-cell permutation tables for all 8 D4 symmetries.
 
     Same group as _build_symmetry_perms but operating on 49 destination cell
-    indices (y*7+x) only — no delta component.
+    indices (y*7+x) only - no delta component.
     """
     transforms_pos = [
         lambda y, x: (y,   x),    # 0 identity
@@ -432,7 +532,7 @@ def apply_obs_symmetry(
 ) -> npt.NDArray[numpy.float32]:
     """Apply the k-th D4 symmetry to a batch of obs arrays of shape (N, 7, 7, 4).
 
-    Returns a view or copy — always call np.ascontiguousarray before torch.from_numpy.
+    Returns a view or copy - always call np.ascontiguousarray before torch.from_numpy.
     """
     if k == 0:
         return obs_batch
@@ -492,7 +592,7 @@ def check_terminal(board: Board, turn: bool) -> tuple[bool, Optional[float]]:
 
     The game ends only when BOTH players have no legal moves (or a side has
     zero pieces). If only the current player is stuck they pass and the other
-    continues — that is NOT a terminal state. Empty cells are never allocated;
+    continues - that is NOT a terminal state. Empty cells are never allocated;
     the final score is purely blue_count - green_count.
 
     Returns:

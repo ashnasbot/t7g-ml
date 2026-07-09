@@ -1,5 +1,5 @@
 /*
- * t7g_core.h — shared game kernel for Microscope (Ataxx 7x7) minimax solvers.
+ * t7g_core.h - shared game kernel for Microscope (Ataxx 7x7) minimax solvers.
  *
  * Included by micro_3.c (material evaluation) and micro_4.c (BFS territory).
  * All symbols are file-scoped (static) so each translation unit that includes
@@ -66,7 +66,7 @@ static uint64_t  zobrist_table[49][3];
 static bool      zobrist_initialized = false;
 
 // ---------------------------------------------------------------------------
-// Forward declaration — implemented differently by each .c file
+// Forward declaration - implemented differently by each .c file
 // ---------------------------------------------------------------------------
 
 static float get_score(uint8_t board[7][7], uint8_t player);
@@ -262,7 +262,7 @@ static int order_moves(uint8_t board[7][7], bool *moves, uint8_t player,
 }
 
 // ---------------------------------------------------------------------------
-// Alpha-beta minimax — calls get_score() for leaf evaluation
+// Alpha-beta minimax - calls get_score() for leaf evaluation
 // ---------------------------------------------------------------------------
 
 static float minimax_cached(uint8_t board[7][7], int depth,
@@ -338,7 +338,7 @@ static float minimax_cached(uint8_t board[7][7], int depth,
 }
 
 // ---------------------------------------------------------------------------
-// Public API — identical signature in every solver, thin wrapper over kernel
+// Public API - identical signature in every solver, thin wrapper over kernel
 // ---------------------------------------------------------------------------
 
 int find_best_move(bool game_board[7][7][2], int depth, bool as_blue) {

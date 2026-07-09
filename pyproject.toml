@@ -13,14 +13,15 @@ dependencies = [
     "Pillow",
     "pyglet",
     "term-image",
-    # torch must be installed separately — the correct variant depends on the
+    # torch must be installed separately - the correct variant depends on the
     # GPU backend (CUDA / ROCm / CPU / DirectML).  See requirements.txt.
 ]
 
 [project.scripts]
-play-t7g    = "scripts.play_gui:main"
+play-t7g      = "scripts.play_gui:main"
 play-t7g-real = "scripts.play_real:main"
-train-t7g   = "scripts.train_mcts:main"
+train-t7g     = "scripts.train_mcts:main"
+play-beehive  = "scripts.play_beehive:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -31,6 +32,6 @@ exclude = ["lib.build*"]
 "scripts" = ["read_tb.py"]
 
 [tool.setuptools.package-data]
-# Bundled binaries — run `make dll` before `python -m build`.
+# Bundled binaries - run `make dll` before `python -m build`.
 # best.pt is NOT tracked in git; copy manually from models/mcts/ before packaging.
-"lib" = ["*.dll", "*.pt"]
+"lib" = ["*.dll", "*.so", "*.pt"]

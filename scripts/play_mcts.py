@@ -13,15 +13,10 @@ Usage:
 """
 import argparse
 import os
-import sys
-
-import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lib.dual_network import DualHeadNetwork
-from lib.mcts import MCTS
-from lib.t7g import new_board, apply_move, check_terminal, board_to_obs, find_best_move, count_cells, show_board, action_masks, action_to_move
+from lib.mcgs import MCGS
+from lib.t7g import new_board, apply_move, check_terminal, find_best_move, count_cells, show_board, action_to_move
 
 import torch
 
@@ -34,8 +29,7 @@ def play_game(network, minimax_depth=2, num_simulations=100, verbose=False):
         result: +1 Blue win, -1 Green win, 0 draw
         move_count: number of moves played
     """
-    mcts = MCTS(network, num_simulations=num_simulations,
-                dirichlet_epsilon=0.0)
+    mcts = MCGS(network, num_simulations=num_simulations)
     board = new_board()
     turn = True
     move_count = 0

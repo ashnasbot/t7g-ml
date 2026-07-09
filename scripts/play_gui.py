@@ -2,7 +2,7 @@
 Interactive Pyglet GUI to play Microscope against a trained MCTS model or minimax.
 
 Controls:
-    Click piece → click destination    (clone = 1 step, jump = 2 steps)
+    Click piece -> click destination    (clone = 1 step, jump = 2 steps)
     E   – toggle edit mode (click cells to cycle blue/green/empty; T swaps active player)
     R   – restart
     Esc – quit
@@ -13,12 +13,18 @@ Usage:
     python scripts/play_gui.py --opponent minimax --depth 3
     python scripts/play_gui.py --opponent stauf --depth 5
     python scripts/play_gui.py --checkpoint models/mcts/iter_0040.pt --human-color green
+
+    # AI vs AI
+    python scripts/play_gui.py --player mcts --player-checkpoint models/mcts/iter_0040.pt --opponent stauf --depth 5
+    python scripts/play_gui.py --player minimax --player-depth 3 --opponent micro3 --depth 3 --ai-delay 1.0
 """
 import argparse
 import os
 import pathlib
 import sys
 import threading
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pyglet
@@ -32,7 +38,7 @@ from lib.t7g import find_best_move, count_cells, action_masks, action_to_move
 from lib.t7g import BLUE, GREEN
 
 
-# ── Layout ────────────────────────────────────────────────────────────────────
+#  Layout
 
 CELL    = 80        # pixels per board cell
 PAD     = 24        # outer padding
@@ -45,7 +51,7 @@ WIN_W   = 2 * PAD + LABEL + 7 * CELL
 WIN_H   = INFO_H + LABEL + 7 * CELL + LABEL + PAD
 
 
-# ── Colors (R, G, B) ──────────────────────────────────────────────────────────
+#  Colors (R, G, B)
 
 BG          = (22, 22, 22)
 C_EMPTY     = (62, 52, 42)
@@ -61,7 +67,7 @@ C_BAR       = (15, 15, 15)
 C_BAR_EDIT  = (38, 28, 0)      # amber tint for edit mode status bar
 
 
-# ── Game states ───────────────────────────────────────────────────────────────
+#  Game states
 
 S_SELECT = "select"     # human choosing a piece
 S_DEST   = "dest"       # human choosing a destination
@@ -70,7 +76,7 @@ S_OVER   = "over"       # game finished
 S_EDIT   = "edit"       # board editor
 
 
-# ── Coordinate helpers ────────────────────────────────────────────────────────
+#  Coordinate helpers
 
 def cell_xy(col, row):
     """Bottom-left screen pixel of board cell (col, row)."""
@@ -78,7 +84,7 @@ def cell_xy(col, row):
 
 
 def screen_to_cell(mx, my):
-    """Mouse screen coords → (col, row), or (None, None) if outside board."""
+    """Mouse screen coords -> (col, row), or (None, None) if outside board."""
     col = (mx - BOARD_X) // CELL
     row = 6 - (my - BOARD_Y) // CELL
     if 0 <= col < 7 and 0 <= row < 7:
@@ -87,7 +93,7 @@ def screen_to_cell(mx, my):
 
 
 def coords_to_action(fc, fr, tc, tr):
-    """(from_col, from_row, to_col, to_row) → 1225-action index, or None."""
+    """(from_col, from_row, to_col, to_row) -> 1225-action index, or None."""
     dx, dy = tc - fc, tr - fr
     if abs(dx) > 2 or abs(dy) > 2:
         return None
@@ -96,40 +102,58 @@ def coords_to_action(fc, fr, tc, tr):
     return piece * 25 + move
 
 
-# ── Main window ───────────────────────────────────────────────────────────────
+#  Main window
 
 class MicroscopeApp(pyglet.window.Window):
 
     def __init__(self, mcts_agent=None, opponent="mcts", minimax_depth=2,
-                 human_color="blue", engine="minimax"):
+                 human_color="blue", engine="minimax",
+                 player_mcts=None, player_engine="human", player_depth=2,
+                 ai_delay=0.5):
         super().__init__(WIN_W, WIN_H, caption="Microscope", resizable=False)
+        # Opponent (Green) config
         self.mcts_agent   = mcts_agent
         self.opponent     = opponent
         self.mm_depth     = minimax_depth
-        self.engine       = engine          # 'minimax', 'micro3', or 'stauf'
+        self.engine       = engine          # 'minimax', 'micro3', 'stauf', etc.
         self.human_blue   = (human_color == "blue")
+        # Player (Blue) config — "human" means a person is playing Blue
+        self.player_mcts   = player_mcts
+        self.player_engine = player_engine  # "human" | "mcts" | "minimax" | ...
+        self.player_depth  = player_depth
+        self.ai_delay      = ai_delay
+        self._last_pass    = None           # set by _apply_move on forced pass
         self._reset()
 
-    # ── Game reset ────────────────────────────────────────────────────────────
+    @property
+    def ai_vs_ai(self):
+        return self.player_engine != "human"
+
+    #  Game reset
 
     def _reset(self):
         self.board       = new_board()
         self.turn        = True          # Blue always goes first
         self.selected    = None          # (col, row) of selected piece
-        self.valid_dests = {}            # (col, row) → action
+        self.valid_dests = {}            # (col, row) -> action
         self.board_hist  = {}
+        self._last_pass  = None
         if self.mcts_agent:
             self.mcts_agent.root = None  # discard old search tree
+        if self.player_mcts and self.player_mcts is not self.mcts_agent:
+            self.player_mcts.root = None
 
         if self._is_human_turn():
             self.state  = S_SELECT
-            self.status = "Your turn — click a piece"
+            self.status = "Your turn - click a piece"
         else:
             self.state  = S_AI
             self.status = "AI thinking…"
             self._start_ai_move()
 
     def _is_human_turn(self):
+        if self.ai_vs_ai:
+            return False
         return self.turn == self.human_blue
 
     def _human_cell(self):
@@ -139,7 +163,37 @@ class MicroscopeApp(pyglet.window.Window):
         b, g = count_cells(self.board)
         return f"Blue {b} – Green {g}"
 
-    # ── Keyboard ──────────────────────────────────────────────────────────────
+    #  AI helpers
+
+    def _get_current_ai(self):
+        """Returns (mcts_agent, engine, depth) for the player whose turn it is."""
+        if self.turn and self.ai_vs_ai:
+            return self.player_mcts, self.player_engine, self.player_depth
+        return self.mcts_agent, self.engine, self.mm_depth
+
+    def _current_ai_label(self):
+        """Label string for the AI whose turn self.turn currently is."""
+        if self.turn and self.ai_vs_ai:
+            engine, depth = self.player_engine, self.player_depth
+            is_mcts = (engine == "mcts")
+        else:
+            is_mcts = (self.opponent == "mcts")
+            engine, depth = self.engine, self.mm_depth
+
+        if is_mcts:
+            return "MCTS"
+        elif engine == "stauf":
+            return f"Stauf-{depth}"
+        elif engine == "micro4t":
+            return f"Micro4t-{depth}ms"
+        elif engine == "micro3":
+            return f"Micro3-{depth}"
+        elif engine == "hmcts":
+            return f"HMCTS-{depth}"
+        else:
+            return f"Micro4-{depth}"
+
+    #  Keyboard
 
     def on_key_press(self, symbol, modifiers):
         if symbol == pyglet.window.key.R:
@@ -155,7 +209,7 @@ class MicroscopeApp(pyglet.window.Window):
             self.turn = not self.turn
             self._edit_status()
 
-    # ── Mouse ─────────────────────────────────────────────────────────────────
+    #  Mouse
 
     def on_mouse_press(self, mx, my, button, modifiers):
         col, row = screen_to_cell(mx, my)
@@ -174,12 +228,12 @@ class MicroscopeApp(pyglet.window.Window):
 
         elif self.state == S_DEST:
             if (col, row) == self.selected:
-                # Click same piece again → deselect
+                # Click same piece again -> deselect
                 self._deselect()
             elif (col, row) in self.valid_dests:
                 self._human_move(self.valid_dests[(col, row)])
             elif np.array_equal(self.board[row, col], self._human_cell()):
-                # Click a different own piece → reselect
+                # Click a different own piece -> reselect
                 self._try_select(col, row)
 
     def _try_select(self, col, row):
@@ -200,7 +254,7 @@ class MicroscopeApp(pyglet.window.Window):
         self.state       = S_SELECT
         self.status      = f"Your turn  [{self._fmt_score()}]"
 
-    # ── Edit mode ─────────────────────────────────────────────────────────────
+    #  Edit mode
 
     def _enter_edit(self):
         self.selected    = None
@@ -210,11 +264,11 @@ class MicroscopeApp(pyglet.window.Window):
 
     def _edit_status(self):
         player = "Blue" if self.turn else "Green"
-        self.status = (f"EDIT — {player} to move  [{self._fmt_score()}]  "
+        self.status = (f"EDIT - {player} to move  [{self._fmt_score()}]  "
                        f"[click=cycle  T=swap player  E=resume]")
 
     def _edit_cycle_cell(self, col, row):
-        """Cycle cell at (col, row): blue → green → empty → blue."""
+        """Cycle cell at (col, row): blue -> green -> empty -> blue."""
         cell = self.board[row, col]
         if np.array_equal(cell, BLUE):
             self.board[row, col] = GREEN
@@ -228,9 +282,12 @@ class MicroscopeApp(pyglet.window.Window):
         """Return to play, resetting history and MCTS tree."""
         if self.mcts_agent:
             self.mcts_agent.root = None
+        if self.player_mcts and self.player_mcts is not self.mcts_agent:
+            self.player_mcts.root = None
         self.board_hist  = {}
         self.selected    = None
         self.valid_dests = {}
+        self._last_pass  = None
 
         is_terminal, terminal_value = check_terminal(self.board, self.turn)
         if is_terminal:
@@ -251,7 +308,7 @@ class MicroscopeApp(pyglet.window.Window):
             self.status = "AI thinking…"
             self._start_ai_move()
 
-    # ── Move legality ─────────────────────────────────────────────────────────
+    #  Move legality
 
     def _legal_dests(self, fc, fr):
         masks = action_masks(self.board, self.turn)
@@ -267,7 +324,7 @@ class MicroscopeApp(pyglet.window.Window):
                         dests[(tc, tr)] = action
         return dests
 
-    # ── Move application ──────────────────────────────────────────────────────
+    #  Move application
 
     def _human_move(self, action):
         fx, fy, tx, ty, jump = action_to_move(action)
@@ -275,40 +332,65 @@ class MicroscopeApp(pyglet.window.Window):
         self._apply_move(action)
         if self.state == S_OVER:
             return
-        self.state  = S_AI
-        self.status = f"You: ({fx},{fy})→({tx},{ty}) [{label}]  [{self._fmt_score()}]  |  AI thinking…"
-        self._start_ai_move()
+        move_info = f"You: ({fx},{fy})->({tx},{ty}) [{label}]  [{self._fmt_score()}]"
+        if self._last_pass:
+            move_info += f"  ({self._last_pass} passes)"
+        if self._is_human_turn():
+            self.state  = S_SELECT
+            self.status = f"{move_info}  |  Your turn"
+        else:
+            self.state  = S_AI
+            self.status = f"{move_info}  |  AI thinking…"
+            self._start_ai_move()
 
     def _finish_ai_move(self, action):
         if action is None:
-            # AI reports no moves; check_terminal will confirm
-            self._end_game("AI has no legal moves")
+            # Forced pass: AI has no legal moves but game is not over
+            passer = "Blue" if self.turn else "Green"
+            self.turn = not self.turn
+            msg = f"{passer} passes (no moves)  [{self._fmt_score()}]"
+            if self._is_human_turn():
+                self.state  = S_SELECT
+                self.status = f"{msg}  |  Your turn"
+            else:
+                self.state  = S_AI
+                self.status = f"{msg}  |  AI thinking…"
+                if self.ai_vs_ai:
+                    pyglet.clock.schedule_once(lambda dt: self._start_ai_move(), self.ai_delay)
+                else:
+                    self._start_ai_move()
             return
+
         fx, fy, tx, ty, jump = action_to_move(action)
         label    = "jump" if jump else "clone"
-        if self.opponent == "mcts":
-            ai_label = "MCTS"
-        elif self.engine == "stauf":
-            ai_label = f"Stauf-{self.mm_depth}"
-        elif self.engine == "micro3":
-            ai_label = f"Micro3-{self.mm_depth}"
-        elif self.engine == "hmcts":
-            ai_label = f"HMCTS-{self.mm_depth}"
-        else:
-            ai_label = f"Micro4-{self.mm_depth}"
+        ai_label = self._current_ai_label()
         self._apply_move(action)
         if self.state == S_OVER:
             return
-        self.state  = S_SELECT
-        self.status = f"{ai_label}: ({fx},{fy})→({tx},{ty}) [{label}]  [{self._fmt_score()}]  |  Your turn"
+        move_info = f"{ai_label}: ({fx},{fy})->({tx},{ty}) [{label}]  [{self._fmt_score()}]"
+        if self._last_pass:
+            move_info += f"  ({self._last_pass} passes)"
+        if self._is_human_turn():
+            self.state  = S_SELECT
+            self.status = f"{move_info}  |  Your turn"
+        else:
+            self.state  = S_AI
+            self.status = f"{move_info}  |  AI thinking…"
+            if self.ai_vs_ai:
+                pyglet.clock.schedule_once(lambda dt: self._start_ai_move(), self.ai_delay)
+            else:
+                self._start_ai_move()
 
     def _apply_move(self, action):
-        """Apply action, flip turn, check repetition + terminal."""
+        """Apply action, flip turn, check repetition + terminal + forced pass."""
         self.board = apply_move(self.board, action, self.turn)
         if self.mcts_agent:
             self.mcts_agent.advance_tree(action)
+        if self.player_mcts and self.player_mcts is not self.mcts_agent:
+            self.player_mcts.advance_tree(action)
         self.selected    = None
         self.valid_dests = {}
+        self._last_pass  = None
         self.turn        = not self.turn
 
         # 3-fold repetition
@@ -317,13 +399,12 @@ class MicroscopeApp(pyglet.window.Window):
         if self.board_hist[key] >= 3:
             b, g = count_cells(self.board)
             winner = "Blue" if b > g else ("Green" if g > b else "nobody (draw)")
-            self._end_game(f"3-fold repetition — {winner} wins by cell count")
+            self._end_game(f"3-fold repetition - {winner} wins by cell count")
             return
 
         # Terminal state
         is_terminal, terminal_value = check_terminal(self.board, self.turn)
         if is_terminal:
-            # terminal_value is from current player's perspective
             blue_val = terminal_value if self.turn else -terminal_value
             if blue_val > 0:
                 self._end_game("Blue wins!")
@@ -331,27 +412,34 @@ class MicroscopeApp(pyglet.window.Window):
                 self._end_game("Green wins!")
             else:
                 self._end_game("Draw!")
+            return
+
+        # Forced pass: current player has no legal moves (game is not terminal,
+        # so the *other* player must have moves — they just continue).
+        if not np.any(action_masks(self.board, self.turn)):
+            self._last_pass = "Blue" if self.turn else "Green"
+            self.turn = not self.turn
 
     def _end_game(self, msg):
         self.state  = S_OVER
-        self.status = f"GAME OVER — {msg}  ({self._fmt_score()})  |  [R] to restart"
+        self.status = f"GAME OVER - {msg}  ({self._fmt_score()})  |  [R] to restart"
 
-    # ── AI background thread ──────────────────────────────────────────────────
+    #  AI background thread
 
     def _start_ai_move(self):
         board_snap = self.board.copy()
         turn_snap  = self.turn
+        cur_mcts, cur_engine, cur_depth = self._get_current_ai()
         result = [None]
         done   = [False]
 
         def compute():
-            if self.opponent == "mcts" and self.mcts_agent:
-                probs  = self.mcts_agent.search(board_snap, turn_snap)
-                action = self.mcts_agent.select_action(probs, temperature=0)
+            if cur_engine == "mcts" and cur_mcts:
+                probs  = cur_mcts.search(board_snap, turn_snap)
+                action = cur_mcts.select_action(probs, temperature=0)
             else:
                 board_bytes = board_snap.tobytes()
-                action = find_best_move(board_bytes, self.mm_depth, turn_snap,
-                                        self.engine)
+                action = find_best_move(board_bytes, cur_depth, turn_snap, cur_engine)
                 if action in (-1, 1225):
                     action = None
             result[0] = action
@@ -366,7 +454,7 @@ class MicroscopeApp(pyglet.window.Window):
 
         pyglet.clock.schedule_interval(poll, 0.05)
 
-    # ── Drawing ───────────────────────────────────────────────────────────────
+    #  Drawing
 
     def on_draw(self):
         self.clear()
@@ -460,58 +548,63 @@ class MicroscopeApp(pyglet.window.Window):
             shapes.Circle(WIN_W - 18, INFO_H // 2, 7, color=dot_color).draw()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+#  Entry point
+
+def _build_mcts(checkpoint, simulations, device=None):
+    if device is None:
+        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cpu")
+    print(f"Loading {checkpoint}  (device: {device})")
+    network = DualHeadNetwork(num_actions=1225).to(device)
+    ckpt    = torch.load(checkpoint, weights_only=False)
+    network.load_state_dict(ckpt["network"])
+    network.eval()
+    agent = MCGS(network, num_simulations=simulations)
+    print(f"MCTS agent ready  ({simulations} sims/move)")
+    return agent
+
 
 def main():
     parser = argparse.ArgumentParser(description="Play Microscope against AI")
     parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to MCTS checkpoint (.pt)")
-    parser.add_argument("--opponent", choices=["mcts", "micro3", "micro4", "stauf", "hmcts"], default="mcts",
-                        help="Opponent type (default: mcts)")
+                        help="Path to opponent MCTS checkpoint (.pt)")
+    parser.add_argument("--opponent", choices=["mcts", "micro3", "micro4t", "stauf", "hmcts"], default="mcts",
+                        help="Opponent (Green) type (default: mcts)")
     parser.add_argument("--depth", type=int, default=2,
-                        help="micro4/Stauf search depth (default: 2)")
+                        help="Opponent search depth (default: 2)")
     parser.add_argument("--simulations", type=int, default=100,
-                        help="MCTS simulations per move (default: 100)")
+                        help="Opponent MCTS simulations per move (default: 100)")
     parser.add_argument("--human-color", choices=["blue", "green"], default="blue",
-                        help="Color you play as (default: blue)")
+                        help="Color you play as — ignored when --player is set (default: blue)")
+    # Player (Blue) AI — when set, enables AI vs AI mode
+    parser.add_argument("--player", choices=["mcts", "micro3", "micro4t", "stauf", "hmcts"],
+                        default=None,
+                        help="Player (Blue) AI type; omit to play as human")
+    parser.add_argument("--player-checkpoint", type=str, default=None,
+                        help="MCTS checkpoint for the Blue player")
+    parser.add_argument("--player-simulations", type=int, default=100,
+                        help="Blue player MCTS simulations per move (default: 100)")
+    parser.add_argument("--player-depth", type=int, default=2,
+                        help="Blue player search depth (default: 2)")
+    parser.add_argument("--ai-delay", type=float, default=0.5,
+                        help="Seconds to pause between AI moves in AI vs AI mode (default: 0.5)")
     args = parser.parse_args()
 
-    mcts_agent = None
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
 
+    # --- Build opponent (Green) ---
+    mcts_agent = None
     if args.opponent == "mcts":
         checkpoint = args.checkpoint
         if not checkpoint:
-            # Fall back to bundled model shipped with the package.
             bundled = pathlib.Path(__file__).parent.parent / "lib" / "best.pt"
             if bundled.exists():
                 checkpoint = str(bundled)
             else:
                 print("Error: no --checkpoint given and no bundled model found at lib/best.pt")
                 return 1
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Loading {checkpoint}  (device: {device})")
-        network = DualHeadNetwork(num_actions=1225).to(device)
-        ckpt    = torch.load(checkpoint, weights_only=False)
-        network.load_state_dict(ckpt["network"])
-        network.eval()
-        mcts_agent = MCGS(network, num_simulations=args.simulations)
-        print(f"MCTS agent ready  ({args.simulations} sims/move)")
-    elif args.opponent == "stauf":
-        print(f"Stauf (cell_dll) depth-{args.depth} opponent")
-    else:
-        print(f"{args.opponent} depth-{args.depth} opponent")
-
-    human_label = args.human_color.capitalize()
-    if args.opponent == "mcts":
-        ai_label = "MCTS"
-    elif args.opponent == "hmcts":
-        ai_label = f"hmcts-{args.depth}"
-    elif args.opponent == "stauf":
-        ai_label = f"Stauf-{args.depth}"
-    else:
-        ai_label = f"{args.opponent}-{args.depth}"
-    print(f"You play as {human_label},  opponent: {ai_label}")
-    print("Controls: click to select & move  |  R = restart  |  Esc = quit")
+        mcts_agent = _build_mcts(checkpoint, args.simulations, device)
 
     if args.opponent == "stauf":
         engine = "stauf"
@@ -519,8 +612,62 @@ def main():
         engine = "micro3"
     elif args.opponent == "hmcts":
         engine = "hmcts"
+    elif args.opponent == "micro4t":
+        engine = "micro4t"
+        args.depth = 1000
     else:
         engine = "minimax"
+
+    # --- Build player (Blue) ---
+    player_mcts   = None
+    player_engine = "human"
+    player_depth  = args.player_depth
+
+    if args.player is not None:
+        player_engine = args.player
+        if args.player == "mcts":
+            pcheckpoint = args.player_checkpoint
+            if not pcheckpoint:
+                bundled = pathlib.Path(__file__).parent.parent / "lib" / "best.pt"
+                if bundled.exists():
+                    pcheckpoint = str(bundled)
+                else:
+                    print("Error: --player mcts requires --player-checkpoint (no bundled model found)")
+                    return 1
+            player_mcts = _build_mcts(pcheckpoint, args.player_simulations, device)
+        elif args.player == "micro4t":
+            player_depth = 1000
+
+    # --- Announce ---
+    if args.player:
+        if args.player == "mcts":
+            blue_label = f"MCTS ({args.player_simulations} sims)"
+        elif args.player == "micro4t":
+            blue_label = "Micro4t-1000ms"
+        else:
+            blue_label = f"{args.player}-{args.player_depth}"
+        if args.opponent == "mcts":
+            green_label = f"MCTS ({args.simulations} sims)"
+        elif args.opponent == "micro4t":
+            green_label = f"Micro4t-1000ms"
+        else:
+            green_label = f"{args.opponent}-{args.depth}"
+        print(f"AI vs AI:  Blue={blue_label}  Green={green_label}  delay={args.ai_delay}s")
+    else:
+        human_label = args.human_color.capitalize()
+        if args.opponent == "mcts":
+            ai_label = f"MCTS ({args.simulations} sims)"
+        elif args.opponent == "hmcts":
+            ai_label = f"hmcts-{args.depth}"
+        elif args.opponent == "stauf":
+            ai_label = f"Stauf-{args.depth}"
+        elif args.opponent == "micro4t":
+            ai_label = "Micro4t-1000ms"
+        else:
+            ai_label = f"{args.opponent}-{args.depth}"
+        print(f"You play as {human_label},  opponent: {ai_label}")
+
+    print("Controls: click to select & move  |  R = restart  |  Esc = quit")
 
     MicroscopeApp(
         mcts_agent=mcts_agent,
@@ -528,6 +675,10 @@ def main():
         minimax_depth=args.depth,
         human_color=args.human_color,
         engine=engine,
+        player_mcts=player_mcts,
+        player_engine=player_engine,
+        player_depth=player_depth,
+        ai_delay=args.ai_delay,
     )
     pyglet.app.run()
     return 0

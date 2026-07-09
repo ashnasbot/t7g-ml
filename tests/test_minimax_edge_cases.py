@@ -39,12 +39,12 @@ def assert_valid_at_depths(board, as_blue, depths=(1, 2, 3, 5), label=""):
 
 
 # ---------------------------------------------------------------------------
-# 1. Proven-loss positions — loser must still return a legal move
+# 1. Proven-loss positions - loser must still return a legal move
 # ---------------------------------------------------------------------------
 
 class TestProvenLoss:
     def test_blue_1v4(self):
-        """Blue 1 piece, Green 4 — proven loss at depth>=2, must still move."""
+        """Blue 1 piece, Green 4 - proven loss at depth>=2, must still move."""
         board = board_from(
             blue_positions=[(0, 0)],
             green_positions=[(2, 0), (0, 2), (3, 3), (6, 6)],
@@ -52,7 +52,7 @@ class TestProvenLoss:
         assert_valid_at_depths(board, as_blue=True, label="Blue 1v4")
 
     def test_green_1v4(self):
-        """Green 1 piece, Blue 4 — proven loss for Green."""
+        """Green 1 piece, Blue 4 - proven loss for Green."""
         board = board_from(
             blue_positions=[(0, 0), (3, 3), (4, 2), (6, 6)],
             green_positions=[(6, 0)],
@@ -60,7 +60,7 @@ class TestProvenLoss:
         assert_valid_at_depths(board, as_blue=False, label="Green 1v4")
 
     def test_blue_1v6(self):
-        """Blue 1 piece, Green 6 — deep proven loss."""
+        """Blue 1 piece, Green 6 - deep proven loss."""
         board = board_from(
             blue_positions=[(3, 3)],
             green_positions=[(0, 0), (6, 0), (0, 6), (6, 6), (3, 0), (0, 3)],
@@ -84,7 +84,7 @@ class TestProvenLoss:
 
 
 # ---------------------------------------------------------------------------
-# 2. Edge / corner pieces — regression for bounds clamping bugs
+# 2. Edge / corner pieces - regression for bounds clamping bugs
 # ---------------------------------------------------------------------------
 
 class TestEdgePieces:
@@ -99,7 +99,7 @@ class TestEdgePieces:
         (3, 6, 3, 5),   # piece already at bottom edge, Green adjacent
     ])
     def test_edge_move_captures(self, bx, by, gx, gy):
-        """Blue adjacent to Green near an edge — must find a move and capture."""
+        """Blue adjacent to Green near an edge - must find a move and capture."""
         board = board_from(blue_positions=[(bx, by)], green_positions=[(gx, gy)])
         move = find_best_move(board.tobytes(), depth=1, as_blue=True)
         assert move >= 0, f"Blue({bx},{by}) vs Green({gx},{gy}): returned -1"
@@ -110,12 +110,12 @@ class TestEdgePieces:
 
 
 # ---------------------------------------------------------------------------
-# 3. Immediate winning move — must be taken at depth >= 1
+# 3. Immediate winning move - must be taken at depth >= 1
 # ---------------------------------------------------------------------------
 
 class TestImmediateWin:
     def test_blue_captures_last_green(self):
-        """Blue adjacent to the only Green piece — must capture."""
+        """Blue adjacent to the only Green piece - must capture."""
         board = board_from(
             blue_positions=[(3, 3), (2, 2), (4, 4)],
             green_positions=[(3, 4)],
@@ -139,7 +139,7 @@ class TestImmediateWin:
 
 
 # ---------------------------------------------------------------------------
-# 4. Asymmetric piece counts — various ratios
+# 4. Asymmetric piece counts - various ratios
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("blue_n,green_n,as_blue", [
@@ -177,7 +177,7 @@ def test_piece_ratio(blue_n, green_n, as_blue):
 
 
 # ---------------------------------------------------------------------------
-# 5. Determinism — same board, same depth, same result every time
+# 5. Determinism - same board, same depth, same result every time
 # ---------------------------------------------------------------------------
 
 def test_determinism_blue():
@@ -199,7 +199,7 @@ def test_determinism_green():
 
 
 # ---------------------------------------------------------------------------
-# 6. Near-full board — very few empty squares
+# 6. Near-full board - very few empty squares
 # ---------------------------------------------------------------------------
 
 def test_near_full_board_blue():
