@@ -1,6 +1,6 @@
 # T7G ML Gym
 
-Board-game AI for two minigames from *The 7th Guest*:
+Board-game AI for two minigames from the Trilobyte games: *The 7th Guest* & *The 11th Hour*:
 
 - **Microscope** — an Ataxx-like game on a 7×7 grid. Full AlphaZero-style
   self-play training pipeline plus fast C minimax engines to train and evaluate
