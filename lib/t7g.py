@@ -71,10 +71,11 @@ def _find_dll(name: str) -> pathlib.Path:
     """
     stem = pathlib.Path(name).stem
     suffixes = [".dll"] if sys.platform == "win32" else [".so"]
+    proj = pathlib.Path(__file__).parent.parent
     roots = [
-        pathlib.Path().absolute(),                 # native build in cwd/root
-        pathlib.Path(__file__).parent.parent,      # native build (abs project root)
-        pathlib.Path(__file__).parent,             # portable build in lib/
+        proj / "build",                            # native (-march=native) build
+        pathlib.Path().absolute() / "build",       # native build, cwd-relative
+        pathlib.Path(__file__).parent,             # portable build / local libs in lib/
     ]
     for root in roots:
         for suffix in suffixes:

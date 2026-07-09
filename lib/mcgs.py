@@ -80,9 +80,9 @@ def _capture_heuristic_1225(board: Board, turn: bool) -> npt.NDArray[np.float32]
 def _find_mcts_dll() -> pathlib.Path:
     suffixes = [".dll"] if sys.platform == "win32" else [".so"]
     roots = [
-        pathlib.Path().absolute(),                # dev: project root build
-        pathlib.Path().absolute() / "lib",        # dev: lib/ build
-        pathlib.Path(__file__).parent,            # installed wheel
+        pathlib.Path(__file__).parent.parent / "build",  # dev: native build
+        pathlib.Path().absolute() / "build",             # dev: native build, cwd-relative
+        pathlib.Path(__file__).parent,                   # portable build / installed wheel
     ]
     for root in roots:
         for suffix in suffixes:
