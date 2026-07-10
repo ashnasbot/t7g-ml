@@ -8,6 +8,8 @@ Board-game AI for two minigames from the Trilobyte games: *The 7th Guest* & *The
 - **The Beehive** — a hexagonal Ataxx variant on a 61-cell board, with a
   playable GUI and a C minimax opponent.
 
+![A game of Microscope in the project GUI, 10× speed](docs/demo.gif)
+
 ## History
 
 The project started as a BFS solver hunting the optimal line to beat Stauf.
@@ -15,9 +17,11 @@ Microscope turns out to have a branching factor of 50–60 (chess is ~35), which
 puts a full solve several billion years out of reach — so it quickly became a
 heuristic-model problem. (A retrograde analysis may happen someday.)
 
-`micro_3.c` grew out of Darkshoxx's single-move solver into a general
-find-best-move search. After several rounds of optimisation it evaluates to
-MM5 in under a millisecond on average, giving a solid opponent to train and
+`micro_3.c` traces back to Darkshoxx's
+[Trilobyters](https://github.com/darkshoxx/Trilobyters): its `micro_2.py`
+single-move solver was the precursor, which we ported to C and generalised into
+a full find-best-move search. After several rounds of optimisation it evaluates
+to MM5 in under a millisecond on average, giving a solid opponent to train and
 measure against.
 
 A lot of experimentation followed — PPO, action masking, much hair-pulling —
@@ -181,5 +185,7 @@ python -m pytest tests/ -v
 
 ## Acknowledgements
 
-- Minimax implementation adapted from [Darkshoxx](https://github.com/darkshoxx)
+- The minimax solver began as a C port of `micro_2.py` from Darkshoxx's
+  [Trilobyters](https://github.com/darkshoxx/Trilobyters) — thanks for the
+  starting point.
 - Built with PyTorch
