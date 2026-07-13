@@ -47,7 +47,8 @@ def play_game(network, minimax_depth=2, num_simulations=100, verbose=False):
         if turn:
             # MCTS agent (Blue)
             action_probs = mcts.search(board, turn)
-            action = mcts.select_action(action_probs, temperature=0)
+            action = mcts.select_action(action_probs, temperature=0,
+                                        best_action=mcts.last_best_action)
             if verbose:
                 from_x, from_y, to_x, to_y, jump = action_to_move(action)
                 move_type = "jump" if jump else "clone"

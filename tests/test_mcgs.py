@@ -287,17 +287,30 @@ def test_value_targets_are_current_player_relative():
 
     # winner=+1.0 means Blue won.
     examples, _, _, _, _, _ = _slot_result(slot, winner=1.0)
-    obs_out, policy_out, value_out, margin_out, _, _ = examples[0]
+    obs_out, policy_out, value_out, margin_out, own_out, _, _, root_q_out, qw_out = examples[0]
+
+    # Default blend_alpha=1.0: blending off, q_weight must be exactly 0.
+    assert qw_out == 0.0
 
     assert value_out == 1.0, (
         "Blue-turn example with Blue winning must have value_target=+1.0"
     )
 
+    # Ownership map is side-to-move relative: on Blue's turn, Blue's cells
+    # (board plane 1) must be class 0 (mine), Green's (plane 0) class 1.
+    assert (own_out[slot.board[:, :, 1]] == 0).all()
+    assert (own_out[slot.board[:, :, 0]] == 1).all()
+    assert (own_out[~(slot.board[:, :, 0] | slot.board[:, :, 1])] == 2).all()
+
     # Same board, Green's turn, Blue still wins (winner=+1 from Blue).
     slot.examples = [(board_to_obs(board, turn=False), np.ones(1225) / 1225,
                       False, board.copy(), 0.0, 0)]
     examples, _, _, _, _, _ = _slot_result(slot, winner=1.0)
-    _, _, value_out_green, margin_out_green, _, _ = examples[0]
+    _, _, value_out_green, margin_out_green, own_out_green, _, _, _, _ = examples[0]
+
+    # Green-turn ownership must be the perspective swap of Blue-turn's map.
+    swap = own_out_green.copy()
+    assert ((own_out == 0) == (swap == 1)).all() and ((own_out == 1) == (swap == 0)).all()
 
     assert margin_out == -margin_out_green, (
         "Margin targets for opposite sides of the same game must be negations"

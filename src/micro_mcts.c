@@ -49,6 +49,7 @@
  * and MCTS degenerates to rubber-stamping the network. */
 #define SIGMA_C_VISIT  50.0f
 #define SIGMA_C_SCALE  1.0f
+#define COMPLETION_N0  50.0f  /* default visit-shrinkage strength, see finish_search */
 #define MAX_PATH_DEPTH 128    /* max depth of one simulation path           */
 #define MAX_PENDING    64     /* max unique leaves per batch (≤ MAX_K)      */
 
@@ -107,6 +108,12 @@ typedef struct {
     int       num_simulations;
     float     c_puct;
     int       gumbel_k;
+    float     sigma_scale;     /* multiplier on sigma(q); 1.0 = paper default */
+    float     completion_n0;   /* visit-shrinkage prior strength for the
+                                  completed-Q policy target: q~(a) =
+                                  (n_a*q_a + n0*v_root) / (n_a + n0).
+                                  Damps low-visit Q noise before sigma
+                                  amplifies it into target logits. */
     uint64_t  rng;             /* per-instance xorshift64 RNG state        */
 } MCGSInstance;
 
@@ -134,6 +141,7 @@ typedef struct {
 
     /* Completed result */
     float result[1225];
+    int   best_action;   /* Sequential Halving winner (-1 if none) */
 } MCGSSearchState;
 
 /*  Zobrist / RNG  */
@@ -374,13 +382,14 @@ static int action_visits(MCGSNode *root, int action) {
 
 /* sigma(q) multiplier for the current root: (c_visit + max_a N(a)) * c_scale.
  * max is taken over the top-K candidate actions. */
-static float sigma_mult(MCGSNode *root, const int16_t *actions, int n) {
+static float sigma_mult(const MCGSInstance *inst, MCGSNode *root,
+                        const int16_t *actions, int n) {
     int max_n = 0;
     for (int i = 0; i < n; i++) {
         int v = action_visits(root, (int)actions[i]);
         if (v > max_n) max_n = v;
     }
-    return (SIGMA_C_VISIT + (float)max_n) * SIGMA_C_SCALE;
+    return (SIGMA_C_VISIT + (float)max_n) * inst->sigma_scale;
 }
 
 static int best_action_puct(MCGSNode *node, float c_puct) {
@@ -486,26 +495,59 @@ static int cmp_score_desc(const void *a, const void *b) {
 }
 
 /* Finish: compute completed-Q policy and mark PHASE_DONE.
- * Improved policy = softmax(log_prior + sigma(q)) over the top-K actions,
- * with q completed by the root network value for unvisited children. */
+ *
+ * Improved policy = softmax(log_prior + sigma(q~)) over ALL legal actions
+ * (full completion, Gumbel MuZero eq. 10), with visit-count shrinkage
+ *
+ *     q~(a) = (n_a * q(a) + n0 * v_root) / (n_a + n0)
+ *
+ * so an action's Q can only move the target in proportion to how well it
+ * was actually measured.  Unvisited actions get exactly v_root - a constant
+ * logit shift - so their relative mass stays the raw prior.  Without the
+ * shrinkage, sigma_mult (~200 at 500 sims) turns the ~3x-noisier Q of a
+ * 7-visit halving loser into a target-argmax lottery: measured 15-27%
+ * argmax flip rate between two independent searches of the same position
+ * (2026-07-11 target_stability probe), which poisoned both self-play moves
+ * and training targets.
+ *
+ * The Sequential Halving winner is recorded in ss->best_action; play THAT
+ * at temperature 0 (the certified action), not argmax(result). */
 static void finish_search(MCGSSearchState *ss) {
     MCGSNode *root = ss->root;
+    float n0 = ss->inst->completion_n0;
+    float v_root = (root->visit_count > 0) ? node_q(root) : root->network_value;
+    float sm = sigma_mult(ss->inst, root, ss->top_k, ss->K);
+
+    float logits[1225];
+    int16_t acts[1225];
+    int n_out = 0;
     float best_logit = -1e30f;
-    float logits[MAX_K];
-    float sm = sigma_mult(root, ss->top_k, ss->K);
-    for (int i = 0; i < ss->K; i++) {
-        float q    = action_q(root, (int)ss->top_k[i], root->network_value);
-        logits[i]  = ss->log_prior[i] + sm * q;
-        if (logits[i] > best_logit) best_logit = logits[i];
+    for (int i = 0; i < root->num_edges; i++) {
+        MCGSEdge *e = &root->edges[i];
+        if (e->action == (int16_t)PASS_ACTION) continue;
+        MCGSNode *c = e->child;
+        float n_a = (c != NULL) ? (float)c->visit_count : 0.0f;
+        float q_a = (n_a > 0.0f) ? -node_q(c) : v_root;
+        float q_shrunk = (n_a + n0 > 0.0f)
+                       ? (n_a * q_a + n0 * v_root) / (n_a + n0)
+                       : v_root;
+        acts[n_out]   = e->action;
+        logits[n_out] = logf(fmaxf(e->prior, 1e-9f)) + sm * q_shrunk;
+        if (logits[n_out] > best_logit) best_logit = logits[n_out];
+        n_out++;
     }
-    float probs[MAX_K], sum = 0.0f;
-    for (int i = 0; i < ss->K; i++) {
-        probs[i] = expf(logits[i] - best_logit);
-        sum += probs[i];
-    }
+
     memset(ss->result, 0, 1225 * sizeof(float));
-    for (int i = 0; i < ss->K; i++)
-        ss->result[ss->top_k[i]] = probs[i] / sum;
+    if (n_out > 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < n_out; i++) {
+            logits[i] = expf(logits[i] - best_logit);
+            sum += logits[i];
+        }
+        for (int i = 0; i < n_out; i++)
+            ss->result[acts[i]] = logits[i] / sum;
+    }
+    ss->best_action = (ss->num_active > 0) ? (int)ss->active[0] : -1;
     ss->phase       = PHASE_DONE;
     ss->num_pending = 0;
     ss->num_paths   = 0;
@@ -545,7 +587,7 @@ static void select_paths_tail(MCGSSearchState *ss) {
 static void halving_prune(MCGSSearchState *ss) {
     SortEntry ranked[MAX_K];
     MCGSNode *root = ss->root;
-    float sm = sigma_mult(root, ss->active, ss->num_active);
+    float sm = sigma_mult(ss->inst, root, ss->active, ss->num_active);
     for (int i = 0; i < ss->num_active; i++) {
         /* Sequential Halving ranks by g(a) + logits(a) + sigma(q(a)).
          * ss->gumbel[j] already holds log_prior + gumbel noise from setup. */
@@ -629,6 +671,8 @@ MCGSInstance *mcgs_create(int num_simulations, float c_puct, int gumbel_k) {
     inst->num_simulations = num_simulations;
     inst->c_puct          = c_puct;
     inst->gumbel_k        = gumbel_k;
+    inst->sigma_scale     = SIGMA_C_SCALE;
+    inst->completion_n0   = COMPLETION_N0;
     inst->rng             = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)inst;
     if (inst->rng == 0) inst->rng = 0xDEADC0DEULL;
     return inst;
@@ -636,6 +680,28 @@ MCGSInstance *mcgs_create(int num_simulations, float c_puct, int gumbel_k) {
 
 void mcgs_clear(MCGSInstance *inst) {
     if (inst) tt_clear(inst);
+}
+
+/* Scale sigma(q) by s (default 1.0 = Gumbel MuZero paper setting).  Lower
+ * values make the completed-Q policy stickier to the prior - probe knob for
+ * value-noise amplification in the training targets. */
+void mcgs_set_sigma_scale(MCGSInstance *inst, float s) {
+    if (inst) inst->sigma_scale = s;
+}
+
+/* Visit-shrinkage prior strength n0 for the completed-Q target (see
+ * finish_search).  Larger = low-visit Q estimates trust the root value
+ * more; 0 disables shrinkage (raw q, pre-2026-07-11 behaviour except for
+ * the full-support completion). */
+void mcgs_set_completion_n0(MCGSInstance *inst, float n0) {
+    if (inst) inst->completion_n0 = (n0 < 0.0f) ? 0.0f : n0;
+}
+
+/* Sequential Halving winner of a finished search (-1 if the search ended
+ * degenerately: terminal/pass-only root).  This is the action the search
+ * budget certified - play it at temperature 0. */
+int mcgs_get_best_action(MCGSSearchState *ss) {
+    return (ss && ss->phase == PHASE_DONE) ? ss->best_action : -1;
 }
 
 void mcgs_destroy(MCGSInstance *inst) {
@@ -657,6 +723,7 @@ MCGSSearchState *mcgs_start_search(MCGSInstance *inst,
     MCGSSearchState *ss = (MCGSSearchState *)calloc(1, sizeof(MCGSSearchState));
     if (!ss) return NULL;
     ss->inst = inst;
+    ss->best_action = -1;
 
     uint8_t board[7][7];
     convert_board(py_board, board);
@@ -740,7 +807,10 @@ void mcgs_commit_expansion(MCGSSearchState *ss, int i,
         node->edges[0].prior    = 1.0f;
         node->edges[0].child    = NULL;
         node->num_edges         = 1;
-        node->network_value     = 0.0f;
+        /* Keep the net's evaluation: a mover forced to pass is usually in a
+         * decided position, and zeroing this injected fake draw backups into
+         * exactly the endgame lines where value is most certain. */
+        node->network_value     = value;
         node->is_expanded       = true;
         return;
     }

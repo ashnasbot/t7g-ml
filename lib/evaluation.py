@@ -280,11 +280,15 @@ def _calibrate_ladder(
 ) -> tuple[int, float]:
     """Quickly find the right ladder starting point on resume.
 
-    Runs 10 games per rung from the bottom up; advances only on 100% win rate.
+    Nets resumed from a checkpoint typically clear the whole ladder, so check
+    the *top* rung first: a 100% sweep there implies (by difficulty ordering)
+    every lower rung is cleared too - one eval instead of scanning all rungs.
+    Only when the top rung isn't a clean sweep do we fall back to a bottom-up
+    scan to locate the first rung the net can't beat.  Advances only on 100%.
     Returns (eval_level, wr_at_that_level).
     """
-    print("Calibrating ladder position (10 games/rung, advance at 100%)...")
-    for level, (depth, noise, label) in enumerate(eval_ladder):
+    def _eval_rung(level: int) -> float:
+        depth, noise, label = eval_ladder[level]
         wr, _ = evaluate_vs_noisy_minimax(
             network, minimax_depth=depth, noise=noise,
             num_games=10, num_simulations=eval_simulations,
@@ -292,6 +296,17 @@ def _calibrate_ladder(
             engine='micro3', num_workers=num_workers,
         )
         print(f"  Calibrate  {label}  {wr:.0%}")
+        return wr
+
+    print("Calibrating ladder position (10 games/rung, advance at 100%)...")
+    # Top-rung short-circuit: sweeping the hardest rung clears the ladder in a
+    # single eval - the common case for a resumed checkpoint.
+    if _eval_rung(len(eval_ladder) - 1) >= 1.0:
+        print("  Calibrate  all rungs cleared!")
+        return len(eval_ladder), 0.0
+    # Weak resume: scan bottom-up for the first rung the net can't sweep.
+    for level in range(len(eval_ladder)):
+        wr = _eval_rung(level)
         if wr < 1.0:
             return level, wr
     print("  Calibrate  all rungs cleared!")

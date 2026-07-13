@@ -63,33 +63,60 @@ EPOCHS_PER_ITERATION = 1        # 1 pass/iter; with an 8-iter buffer each exampl
                                 # still gets ~8 gradient passes over its lifetime
                                 # (5 epochs = ~40 passes -> value-head memorization)
 REPLAY_BUFFER_ITERS  = 8        # keep this many iterations of self-play data
-TARGET_EXAMPLES_ITER = 35_000   # adaptive games/iter targets this example count
+TARGET_EXAMPLES_ITER = 54_000   # adaptive games/iter targets this example count
+                                # (35k policy from full games + ~19k value-only
+                                # from fast games at FAST_PLAY_FRACTION=0.35)
 POOL_SIZE            = 64       # concurrent games per worker
 
 # Model parameters
-VALUE_BLEND_ALPHA    = 1.0      # pure terminal target; blending disabled after
-                                # diagnostic showed value head wasn't learning
-                                # (see memory/project_value_head_broken.md)
+VALUE_BLEND_ALPHA    = 1.0      # α=1 → pure terminal target (blending off).
+                                # α<1 mixes gated root-Q into the value target
+                                # AT THE LOSS as soft WDL class probabilities
+                                # (1-w)*onehot(z) + w*[(1+q)/2, 0, (1-q)/2] -
+                                # pre-blending the scalar would be quantized
+                                # away by the hard ±0.33 class thresholds.
+                                # Disabled 2026-04 when the value head was
+                                # broken (memory/project_value_head_broken.md);
+                                # that predates the WDL head + search fixes.
 VALUE_COEF           = 1.0      # value-loss weight; bumped to rebalance against
                                 # policy CE's 1225-class gradient magnitude
 MARGIN_COEF          = 0.4      # auxiliary margin-head loss weight (final
                                 # material margin / 49) - dense KataGo-style
                                 # signal that trains the trunk from every game
+WDL_VALUE            = True     # 3-way W/D/L cross-entropy value head (fixes
+                                # the tanh+MSE saturation pathology: 2026-07-10
+                                # audit found 10% of positions confidently wrong
+                                # with ~zero gradient to unlearn them)
+OWNERSHIP_AUX        = True     # per-cell final-ownership aux head (KataGo);
+OWNERSHIP_COEF       = 0.15     # 49 dense spatial targets/position teach the
+                                # trunk to count material.  Aux TRAINING signal
+                                # only - never enters search utility or move
+                                # selection (margin-maximizing play is a known
+                                # failure state)
 DIRICHLET_ALPHA      = 0.0      # OFF: Gumbel top-K sampling already explores;
 DIRICHLET_EPS        = 0.0      # root noise leaked into the completed-Q policy
                                 # targets and permanently corrupted TT priors
 GAMES_MIN            = 50
-GAMES_MAX            = 500
+GAMES_MAX            = 650
 LEARNING_RATE        = 1.0e-4  # was 1.5e-4 for the ladder climb; lowered 2026-07-09
                                # for the post-peak refinement regime (run-1 declined
                                # monotonically after iter 50 - churn, not signal)
 WEIGHT_DECAY         = 1e-4
 C_PUCT               = 1.3
 GUMBEL_K             = 16
+SIGMA_SCALE          = 1.0      # multiplier on the Gumbel sigma(q) transform;
+                                # <1 makes completed-Q targets stickier to the
+                                # prior (probe knob for value-noise amplification)
+COMPLETION_N0        = 50.0     # visit-shrinkage prior strength in the completed-Q
+                                # target: q~(a)=(n_a*q_a+n0*v_root)/(n_a+n0).  Caps
+                                # low-visit Q noise before sigma amplifies it into
+                                # target logits (2026-07-11 target-noise fix; the
+                                # temp-0 played move is the SH winner, also part of
+                                # that fix)
 SELF_PLAY_TEMP_MOVES = 16       # was 30 (~half a 73-move game adding value noise);
                                 # sigma-scaled Gumbel targets need less forcing
 ENTROPY_COEFF        = 0.00
-FAST_PLAY_FRACTION   = 0.00  # fraction of games run fast (value-only); 0=disabled
+FAST_PLAY_FRACTION   = 0.35  # fraction of games run fast (value-only); 0=disabled
 FAST_PLAY_SIMS       = 100   # simulations for fast games
 
 # MM Mix
@@ -123,6 +150,16 @@ ELO_PROMOTE_MARGIN     = 35     # candidate elo must beat the best-net bar by th
                                 # much to take over self-play (24-game rating is
                                 # ~+/-70 noisy; the margin filters false promotions
                                 # while a stall just leaves data at the proven best)
+ELO_ROLLING_WINDOW     = 2      # self-anchored rating: on each promotion the new
+                                # best is appended to the pool as an opponent, and
+                                # only the newest N such self-anchors are kept.  A
+                                # fixed set of anchors always saturates once the net
+                                # sweeps them; measuring against recent selves keeps
+                                # an opponent near current strength so the Elo (and
+                                # promotion bar) never ceilings.  The fixed engine +
+                                # seed-net anchors (pool.json "fixed": true) stay to
+                                # pin the absolute scale / flag regressions.  Can be
+                                # overridden by "rolling_window" in pool.json.
 
 # Policy distillation
 POLICY_DISTILL_DEPTH = 3
@@ -196,17 +233,18 @@ def generate_self_play_data(
                   for i in range(0, len(raw_examples), chunk_size)]
 
         def _relabel_chunk(chunk):
-            return [_fn(e[4], e[5]) for e in chunk]
+            return [_fn(e[5], e[6]) for e in chunk]
 
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             policy_chunks = list(ex.map(_relabel_chunk, chunks))
         policies = [p for pc in policy_chunks for p in pc]
         all_examples = [
-            (obs, pol, val, margin)
-            for (obs, _, val, margin, _, _), pol in zip(raw_examples, policies)
+            (obs, pol, val, margin, own, rq, qw)
+            for (obs, _, val, margin, own, _, _, rq, qw), pol in zip(raw_examples, policies)
         ]
     else:
-        all_examples = [(obs, p, v, m) for obs, p, v, m, _, _ in raw_examples]
+        all_examples = [(obs, p, v, m, o, rq, qw)
+                        for obs, p, v, m, o, _, _, rq, qw in raw_examples]
 
     avg_branching = float(np.mean(all_legal_counts)) if all_legal_counts else 0.0
     return (all_examples, (blue_wins, green_wins, draws),
@@ -218,6 +256,7 @@ def generate_self_play_data(
 # ============================================================
 
 def main():
+    global VALUE_BLEND_ALPHA
     parser = argparse.ArgumentParser(description="AlphaZero MCTS Training")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to checkpoint to resume from")
@@ -243,7 +282,13 @@ def main():
                         help="Training epochs on BC data before self-play begins (default: 100)")
     parser.add_argument("--bc-cache", type=str, default=None, metavar="PATH",
                         help="Path to save/load BC data (.npz). Use 'auto' to derive from params.")
+    parser.add_argument("--blend-alpha", type=float, default=VALUE_BLEND_ALPHA,
+                        help=f"Value-target blend: 1.0 = pure game outcome, "
+                             f"<1 mixes gated root-Q into soft WDL targets, "
+                             f"max Q weight = 1-alpha (default: {VALUE_BLEND_ALPHA})")
     args = parser.parse_args()
+
+    VALUE_BLEND_ALPHA = args.blend_alpha
 
     policy_relabel_fn = (
         lambda board, turn: soft_policy_from_mm(board, POLICY_DISTILL_DEPTH, turn,
@@ -256,7 +301,8 @@ def main():
     print(f"Device: {device}")
 
     num_actions = 1225
-    network   = DualHeadNetwork(num_actions=num_actions).to(device)
+    _net_kwargs = dict(wdl=WDL_VALUE, ownership=OWNERSHIP_AUX)
+    network   = DualHeadNetwork(num_actions=num_actions, **_net_kwargs).to(device)
     inference_network = (  # type: ignore[assignment]
         torch.compile(network) if device.type == "cuda" else network
     )
@@ -271,12 +317,26 @@ def main():
     if args.checkpoint:
         print(f"Loading checkpoint: {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, weights_only=False)
-        network.load_state_dict(checkpoint['network'])
-        if 'optimizer' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            for pg in optimizer.param_groups:
-                pg['lr'] = args.lr
-            print(f"  Restored optimizer state (LR overridden to {args.lr})")
+        _ckpt_sd = checkpoint['network']
+        if DualHeadNetwork.infer_arch(_ckpt_sd) == _net_kwargs:
+            network.load_state_dict(_ckpt_sd)
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                for pg in optimizer.param_groups:
+                    pg['lr'] = args.lr
+                print(f"  Restored optimizer state (LR overridden to {args.lr})")
+        else:
+            # Cross-architecture warm start (e.g. legacy tanh-value checkpoint
+            # into a wdl/ownership net): transfer every shape-compatible
+            # tensor, leave the rest at fresh init.  Optimizer state is NOT
+            # restored - its moments refer to the old parameterization.
+            _ref = network.state_dict()
+            _ok = {k: v for k, v in _ckpt_sd.items()
+                   if k in _ref and _ref[k].shape == v.shape}
+            network.load_state_dict(_ok, strict=False)
+            _fresh = sorted(set(_ref) - set(_ok))
+            print(f"  Cross-arch warm start: {len(_ok)}/{len(_ref)} tensors "
+                  f"transferred; fresh init: {', '.join(_fresh)}")
         saved_iter = checkpoint.get('iteration', 0) + 1
         print(f"Loaded weights from iteration {saved_iter}; "
               f"training for {args.iterations} fresh iterations")
@@ -285,7 +345,7 @@ def main():
     # net only takes over data generation when its pool Elo clears the bar -
     # run 1 showed ungated self-play walks downhill from the peak (270 Elo lost
     # over iters 50-180) because nothing enforces monotonic strength.
-    best_network = DualHeadNetwork(num_actions=num_actions).to(device)
+    best_network = DualHeadNetwork(num_actions=num_actions, **_net_kwargs).to(device)
     best_network.load_state_dict(network.state_dict())
     best_network.eval()
     best_inference_network = (  # type: ignore[assignment]
@@ -293,12 +353,17 @@ def main():
     )
     best_elo: 'float | None' = None   # promotion bar; set at the first pool rating
 
-    # Elo anchor pool: fixed opponents with known ratings (see pool.json note).
-    # The current net's Elo is solved against them each eval and logged to TB.
+    # Elo pool: a fixed part (engine + seed-net anchors that pin the absolute
+    # scale) plus a rolling part of recent promoted selves appended below, so the
+    # net always has an opponent near its own strength and the rating can't
+    # saturate.  The current net's Elo is solved against the whole pool each eval.
+    # Members carry "fixed": True (never evicted) or False (rolling self-anchor).
     elo_pool: list = []
+    rolling_window = ELO_ROLLING_WINDOW
     if os.path.exists(ELO_POOL_PATH):
         with open(ELO_POOL_PATH) as _f:
             _pool_cfg = json.load(_f)
+        rolling_window = _pool_cfg.get("rolling_window", ELO_ROLLING_WINDOW)
         for _m in _pool_cfg["members"]:
             if _m["kind"] == "net":
                 _blob = torch.load(_m["path"], map_location="cpu", weights_only=True)
@@ -306,10 +371,12 @@ def main():
             else:
                 _payload = _m["depth"]
             elo_pool.append({"name": _m["name"], "kind": _m["kind"],
-                             "payload": _payload, "elo": _m["elo"]})
-        print(f"Elo anchor pool: {', '.join(m['name'] for m in elo_pool)}")
+                             "payload": _payload, "elo": _m["elo"],
+                             "fixed": _m.get("fixed", True)})
+        print(f"Elo pool: {', '.join(m['name'] for m in elo_pool)} "
+              f"(rolling window {rolling_window} self-anchors)")
     else:
-        print(f"Elo anchor pool: none ({ELO_POOL_PATH} not found; eval/elo disabled)")
+        print(f"Elo pool: none ({ELO_POOL_PATH} not found; eval/elo disabled)")
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -349,10 +416,14 @@ def main():
     print(f"Replay buffer:    last {REPLAY_BUFFER_ITERS} iterations")
     print(f"Batch size:       {BATCH_SIZE}")
     print(f"Epochs/iteration: {EPOCHS_PER_ITERATION}")
+    print(f"Value blend:      alpha={VALUE_BLEND_ALPHA}"
+          + ("  (pure terminal)" if VALUE_BLEND_ALPHA >= 1.0
+             else f"  (max Q weight {1.0 - VALUE_BLEND_ALPHA:.2f}, gated)"))
     print(f"Eval ladder:      {' > '.join(lbl for _, _, lbl in EVAL_LADDER)} > retire")
     print("=" * 60)
 
-    _mcts_kwargs = dict(num_simulations=args.simulations, c_puct=C_PUCT, gumbel_k=GUMBEL_K)
+    _mcts_kwargs = dict(num_simulations=args.simulations, c_puct=C_PUCT, gumbel_k=GUMBEL_K,
+                        sigma_scale=SIGMA_SCALE, completion_n0=COMPLETION_N0)
     _sp_kwargs   = dict(**_mcts_kwargs,
                         dirichlet_alpha=DIRICHLET_ALPHA, dirichlet_eps=DIRICHLET_EPS)
     # AlphaGo-Zero-style ratchet: self-play uses the BEST net, not the current
@@ -444,15 +515,16 @@ def main():
         if fast_games > 0:
             fast_mcts = MCGS(inference_network,
                              num_simulations=FAST_PLAY_SIMS, c_puct=C_PUCT, gumbel_k=GUMBEL_K,
-                             dirichlet_alpha=DIRICHLET_ALPHA, dirichlet_eps=DIRICHLET_EPS)
+                             dirichlet_alpha=DIRICHLET_ALPHA, dirichlet_eps=DIRICHLET_EPS,
+                             completion_n0=COMPLETION_N0)
             fast_raw, (fbw, fgw, fdr), fmoves, ftimes, ftrunc, _ = generate_self_play_data(
                 fast_mcts,
                 min_non_truncated=fast_games,
                 temp_moves=999,
             )
             # Zero policy targets — these examples are value-only
-            fast_examples = [(obs, np.zeros_like(pol), val, m)
-                             for obs, pol, val, m in fast_raw]
+            fast_examples = [(obs, np.zeros_like(pol), val, m, o, rq, qw)
+                             for obs, pol, val, m, o, rq, qw in fast_raw]
             bw += fbw; gw += fgw; dr += fdr
             game_moves += fmoves; game_times += ftimes; truncations += ftrunc
             examples += fast_examples
@@ -543,11 +615,13 @@ def main():
             entropy_coeff=ENTROPY_COEFF,
             value_coef=VALUE_COEF,
             margin_coef=MARGIN_COEF,
+            ownership_coef=OWNERSHIP_COEF,
         )
         train_time = time.time() - train_start
         current_lr = optimizer.param_groups[0]['lr']
         print(f"  Train      pol {losses['policy_loss']:.4f}  val {losses['value_loss']:.4f}"
-              f"  marg {losses['margin_loss']:.4f}  tot {losses['total_loss']:.4f}"
+              f"  marg {losses['margin_loss']:.4f}  own {losses['ownership_loss']:.4f}"
+              f"  tot {losses['total_loss']:.4f}"
               f"  sign {losses['sign_acc']:.1%}  {train_time:.0f}s")
 
         if scheduler is not None:
@@ -556,6 +630,7 @@ def main():
         writer.add_scalar("train/policy_loss",    losses['policy_loss'], step)
         writer.add_scalar("train/value_loss",     losses['value_loss'],  step)
         writer.add_scalar("train/margin_loss",    losses['margin_loss'], step)
+        writer.add_scalar("train/ownership_loss", losses['ownership_loss'], step)
         writer.add_scalar("train/total_loss",     losses['total_loss'],  step)
         writer.add_scalar("train/value_sign_acc", losses['sign_acc'],    step)
         writer.add_scalar("train/lr",             current_lr,            step)
@@ -622,7 +697,27 @@ def main():
                     best_network.load_state_dict(network.state_dict())
                     best_network.eval()
                     best_elo = elo
-                    print(f"  Ratchet    PROMOTED - self-play net now {elo:.0f}")
+                    # Self-anchor: the just-promoted net joins the pool as a rolling
+                    # opponent so future ratings are measured against current-strength
+                    # play (never saturates).  Keep only the newest ELO_ROLLING_WINDOW.
+                    elo_pool.append({
+                        "name": f"self_iter{step:04d}", "kind": "net",
+                        "payload": {k: v.detach().cpu()
+                                    for k, v in network.state_dict().items()},
+                        "elo": elo, "fixed": False})
+                    _rolling = [m for m in elo_pool if not m["fixed"]]
+                    for _old in _rolling[:-rolling_window]:
+                        elo_pool.remove(_old)
+                    # Persist the promoted net so it can be rated offline
+                    # (scripts/eval_db.py).  The in-memory self-anchor above is
+                    # ephemeral - lost on restart - and every-N checkpoints miss
+                    # the exact promotion step; this is the rateable frontier net.
+                    promoted_path = os.path.join(CHECKPOINT_DIR, f"promoted_iter{step:04d}.pt")
+                    torch.save({'iteration': iteration, 'network': network.state_dict(),
+                                'elo': float(elo)}, promoted_path)
+                    print(f"  Ratchet    PROMOTED - self-play net now {elo:.0f} "
+                          f"(pool: {', '.join(m['name'] for m in elo_pool)}) "
+                          f"-> {promoted_path}")
                 else:
                     print(f"  Ratchet    retained (needs {best_elo + ELO_PROMOTE_MARGIN:.0f})")
                 writer.add_scalar("eval/best_elo", best_elo, step)

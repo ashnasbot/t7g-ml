@@ -47,10 +47,30 @@ class DualHeadNetwork(nn.Module):
         num_actions:  Size of the flat action space (default 1225).
         num_filters:  Convolutional filters throughout the backbone (default 128).
         num_blocks:   Number of residual blocks (default 6).
+        wdl:          Value head is a 3-way win/draw/loss classifier trained
+                      with cross-entropy instead of tanh+MSE.  Motivated by the
+                      2026-07-10 calibration audit: the tanh head saturates
+                      (38% of outputs |v|>0.9 while only ~65-83% correct there)
+                      and MSE-through-tanh gives ~zero gradient exactly on
+                      confidently-wrong predictions, so the head can never
+                      unlearn its errors.  forward() still returns a scalar
+                      value = P(win) - P(loss), so search code is unchanged.
+        ownership:    Adds an auxiliary per-cell final-ownership head
+                      (3 classes/cell: mine/opponent's/empty at game end) -
+                      KataGo-style dense spatial signal that teaches the trunk
+                      to count territory; 49 graded targets per position vs
+                      the value head's single noisy bit per game.
+
+    Defaults are the legacy configuration - checkpoints from before 2026-07-10
+    load unchanged.  Use `DualHeadNetwork.infer_arch(state_dict)` to construct
+    the right configuration for an arbitrary checkpoint.
     """
 
-    def __init__(self, num_actions: int = 1225, num_filters: int = 128, num_blocks: int = 6) -> None:
+    def __init__(self, num_actions: int = 1225, num_filters: int = 128, num_blocks: int = 6,
+                 wdl: bool = False, ownership: bool = False) -> None:
         super().__init__()
+        self.wdl = wdl
+        self.ownership = ownership
 
         # Input projection: 4 channels -> num_filters
         self.input_conv = nn.Conv2d(4, num_filters, kernel_size=3, padding=1, bias=False)
@@ -76,13 +96,28 @@ class DualHeadNetwork(nn.Module):
         self.value_conv = nn.Conv2d(num_filters, 4, kernel_size=1, bias=False)
         self.value_bn = nn.BatchNorm2d(4)
         self.value_fc1 = nn.Linear(4 * 7 * 7 + 2 * num_filters, 256)
-        self.value_fc2 = nn.Linear(256, 1)
+        # wdl: 3 logits (win/draw/loss, side-to-move); legacy: tanh scalar
+        self.value_fc2 = nn.Linear(256, 3 if wdl else 1)
         # Auxiliary margin head: predicts final material margin scaled to
         # [-1, 1] (margin / 49).  Dense low-noise signal from every game that
         # trains the same trunk the win/loss value head reads from.
         self.margin_fc = nn.Linear(256, 1)
+        if ownership:
+            # Auxiliary ownership head: per-cell 3-class logits over the
+            # *final* board (0=mine, 1=opponent's, 2=empty), side-to-move
+            # relative like the obs planes.  Read only via forward_full().
+            self.own_conv = nn.Conv2d(num_filters, 3, kernel_size=1)
 
-    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def infer_arch(state_dict: dict) -> dict:
+        """Infer constructor kwargs (wdl/ownership) from a checkpoint's shapes."""
+        v_out = state_dict["value_fc2.weight"].shape[0]
+        return {
+            "wdl": v_out == 3,
+            "ownership": any(k.startswith("own_conv.") for k in state_dict),
+        }
+
+    def forward(self, obs: torch.Tensor, full: bool = False):
         """
         Forward pass.
 
@@ -92,7 +127,10 @@ class DualHeadNetwork(nn.Module):
         Returns:
             policy_logits: (batch, num_actions)
             value:         (batch, 1) — predicted game outcome in [-1, 1]
+                           (wdl head: P(win) - P(loss); legacy head: tanh)
             margin:        (batch, 1) — predicted final material margin / 49
+        (full=True appends value_logits and ownership_logits — use
+        forward_full() instead, which labels them.)
         """
         # Handle both NHWC and NCHW input. The permute from (N,7,7,4) to
         # (N,4,7,7) produces strides that are already channels_last-compatible
@@ -122,10 +160,39 @@ class DualHeadNetwork(nn.Module):
         g_max = x.amax(dim=(2, 3))
         v = torch.cat([v, g_mean, g_max], dim=1)
         v = F.relu(self.value_fc1(v))
-        value = torch.tanh(self.value_fc2(v))
+        if self.wdl:
+            value_logits = self.value_fc2(v)
+            probs = F.softmax(value_logits, dim=-1)
+            value = (probs[:, 0] - probs[:, 2]).unsqueeze(-1)  # P(win) - P(loss)
+        else:
+            value_logits = None
+            value = torch.tanh(self.value_fc2(v))
         margin = torch.tanh(self.margin_fc(v))
 
+        if full:
+            ownership_logits = self.own_conv(x) if self.ownership else None
+            return policy_logits, value, margin, value_logits, ownership_logits
         return policy_logits, value, margin
+
+    def forward_full(self, obs: torch.Tensor) -> dict:
+        """
+        Training-time forward: everything forward() computes plus the raw
+        head logits.  Keys: policy_logits, value, margin, value_logits
+        (B,3 or None), ownership_logits (B,3,7,7 or None).
+
+        Kept separate so forward()'s 3-tuple contract (search, eval workers,
+        ONNX export) never changes shape with the architecture flags.
+        """
+        policy_logits, value, margin, value_logits, ownership_logits = (
+            self.forward(obs, full=True)
+        )
+        return {
+            "policy_logits": policy_logits,
+            "value": value,
+            "margin": margin,
+            "value_logits": value_logits,
+            "ownership_logits": ownership_logits,
+        }
 
     @torch.no_grad()
     def predict(self, board: np.ndarray, turn: bool) -> tuple[np.ndarray, float]:

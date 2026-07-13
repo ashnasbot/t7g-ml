@@ -108,6 +108,20 @@ _lib.mcgs_create.restype  = ctypes.c_void_p
 _lib.mcgs_clear.argtypes = [ctypes.c_void_p]
 _lib.mcgs_clear.restype  = None
 
+# Optional export (present from 2026-07-10 builds); guarded at call sites so
+# older .so/.dll binaries keep working as long as sigma_scale stays 1.0.
+if hasattr(_lib, "mcgs_set_sigma_scale"):
+    _lib.mcgs_set_sigma_scale.argtypes = [ctypes.c_void_p, ctypes.c_float]
+    _lib.mcgs_set_sigma_scale.restype  = None
+
+# 2026-07-11 target-noise fix exports: SH-winner action + completion shrinkage.
+# Required - the temp-0 play path depends on them; rebuild via `make dll dll-native`.
+_lib.mcgs_get_best_action.argtypes = [ctypes.c_void_p]
+_lib.mcgs_get_best_action.restype  = ctypes.c_int
+
+_lib.mcgs_set_completion_n0.argtypes = [ctypes.c_void_p, ctypes.c_float]
+_lib.mcgs_set_completion_n0.restype  = None
+
 _lib.mcgs_destroy.argtypes = [ctypes.c_void_p]
 _lib.mcgs_destroy.restype  = None
 
@@ -266,6 +280,16 @@ class MCGSSearch:
         """Root Q-value from the mover's perspective (value_sum / visit_count)."""
         return float(_lib.mcgs_get_root_value(self._ptr))
 
+    @property
+    def best_action(self) -> int:
+        """Sequential Halving winner of a finished search (-1 if degenerate).
+
+        This is the action the search budget certified; play it at
+        temperature 0 instead of argmax(result), whose completed-Q logits
+        can be reshuffled by low-visit Q noise.
+        """
+        return int(_lib.mcgs_get_best_action(self._ptr))
+
     def step(self) -> None:
         _lib.mcgs_step(self._ptr)
 
@@ -299,6 +323,8 @@ class MCGS:
         gumbel_k: int = 8,
         dirichlet_alpha: float = 0.0,
         dirichlet_eps: float = 0.0,
+        sigma_scale: float = 1.0,
+        completion_n0: float | None = None,
     ) -> None:
         self.network         = network
         self.num_simulations = num_simulations
@@ -306,10 +332,22 @@ class MCGS:
         self.gumbel_k        = gumbel_k
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_eps   = dirichlet_eps
+        self.sigma_scale     = sigma_scale
+        self.completion_n0   = completion_n0
+        self.last_root_value: float = 0.0
+        self.last_best_action: int = -1
         self._device         = next(network.parameters()).device
         self._ptr            = _lib.mcgs_create(
             num_simulations, ctypes.c_float(c_puct), gumbel_k,
         )
+        if sigma_scale != 1.0:
+            if not hasattr(_lib, "mcgs_set_sigma_scale"):
+                raise RuntimeError(
+                    "sigma_scale != 1.0 requires a micro_mcts build with "
+                    "mcgs_set_sigma_scale (rebuild via `make lib/micro_mcts.so`)")
+            _lib.mcgs_set_sigma_scale(self._ptr, ctypes.c_float(sigma_scale))
+        if completion_n0 is not None:
+            _lib.mcgs_set_completion_n0(self._ptr, ctypes.c_float(completion_n0))
 
     def __del__(self) -> None:
         ptr = getattr(self, '_ptr', None)
@@ -391,6 +429,7 @@ class MCGS:
             self._expand_batch([ss])
             ss.step()
         self.last_root_value: float = ss.root_value
+        self.last_best_action: int = ss.best_action
         return ss.result
 
     def _launch_forward(self, searches: 'list[MCGSSearch]'):
@@ -545,9 +584,17 @@ class MCGS:
         board: Board | None = None,  # noqa: ARG002
         turn: bool | None = None,    # noqa: ARG002
         temperature: float = 1.0,
+        best_action: int | None = None,
     ) -> int:
-        """Select action from MCGS probability distribution (board/turn ignored)."""
+        """Select action from MCGS probability distribution (board/turn ignored).
+
+        At temperature 0, plays `best_action` (the Sequential Halving winner)
+        when the caller provides one; falling back to argmax(result) is only
+        for callers without a live search (e.g. uniform recovery paths).
+        """
         if temperature == 0:
+            if best_action is not None and best_action >= 0:
+                return int(best_action)
             return int(np.argmax(action_probs))
         probs = action_probs ** (1.0 / temperature)
         total = probs.sum()

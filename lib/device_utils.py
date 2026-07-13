@@ -45,7 +45,11 @@ def load_compiled_network(
         The uncompiled network - required for in-place ``load_state_dict``
         updates that preserve CUDA-graph tensor addresses.
     """
-    net = DualHeadNetwork(num_actions=num_actions)
+    # Infer head configuration from the checkpoint so legacy (tanh value) and
+    # wdl/ownership checkpoints both load - the Elo anchor pool keeps old nets
+    # playable alongside new-architecture training nets.
+    net = DualHeadNetwork(num_actions=num_actions,
+                          **DualHeadNetwork.infer_arch(state_dict))
     net.load_state_dict(state_dict)
     net.to(device)
     net.eval()

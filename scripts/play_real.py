@@ -104,7 +104,8 @@ def main() -> None:
                 else:
                     action_probs = mcts.search(board, True)
                     action = mcts.select_action(action_probs, board=board,
-                                                turn=True, temperature=0)
+                                                turn=True, temperature=0,
+                                                best_action=mcts.last_best_action)
 
             board, reward, terminated, truncated, info = env.step(action)
             if not info.get('invalid'):

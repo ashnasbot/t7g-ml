@@ -25,8 +25,12 @@ from lib.t7g import (
 #
 #     value_target = α * terminal + (1 - α) * root_q
 #
-# where α is computed per-example so that Q influence is suppressed in
-# regimes where Q is known to be unreliable:
+# The blend is applied in the LOSS (lib/training.py), not here: workers store
+# the pure terminal outcome plus (root_q, q_weight) per example, and the WDL
+# head trains on soft class targets  (1-w)*onehot(z) + w*[(1+q)/2, 0, (1-q)/2].
+# Pre-blending into one scalar would be quantized away by the hard ±0.33
+# class conversion (2026-07-12 audit).  The per-example weight w suppresses
+# Q influence in regimes where Q is known to be unreliable:
 #
 #   (A) Phase ramp: Q weight ramps from 0 → full over `BLEND_RAMP_LEN`
 #       moves starting at `temp_moves` (TEMP_THRESHOLD).  Before temp
@@ -47,10 +51,7 @@ from lib.t7g import (
 BLEND_RAMP_LEN = 10  # moves past temp_moves over which Q-weight ramps to full
 
 
-def _blended_value_target(
-    winner: float,
-    was_blue: bool,
-    root_q: float,
+def _q_blend_weight(
     move_idx: int,
     policy_target: np.ndarray,
     blend_alpha: float,
@@ -58,17 +59,13 @@ def _blended_value_target(
     ramp_len: int = BLEND_RAMP_LEN,
 ) -> float:
     """
-    Compute the value target for a single (state, policy, outcome) example.
+    Gated Q weight for one example's value target.
 
-    When blend_alpha == 1.0 (default), returns pure terminal target (original
-    behaviour; no-op fast path). Otherwise applies phase × concentration
-    gating described above.
+    When blend_alpha == 1.0 (default) returns 0.0 (blending off; no-op fast
+    path). Otherwise applies the phase × concentration gating described above.
 
     Parameters
     ----------
-    winner         : +1 Blue / -1 Green / material ratio (Blue perspective)
-    was_blue       : True if the example's side-to-move was Blue
-    root_q         : MCTS root value at example generation (side-to-move perspective)
     move_idx       : move number when the example was recorded
     policy_target  : MCTS visit-weighted policy at the root (used for concentration)
     blend_alpha    : maximum α used for pure terminal (1 - blend_alpha = max Q weight)
@@ -77,12 +74,10 @@ def _blended_value_target(
 
     Returns
     -------
-    value_target in [-1, +1], side-to-move perspective
+    q_weight in [0, 1 - blend_alpha]
     """
-    terminal = winner if was_blue else -winner
-
     if blend_alpha >= 1.0:
-        return terminal  # fast path: pure terminal, no gating overhead
+        return 0.0
 
     # (A) Phase ramp: 0 before temp_moves, linear to 1 over ramp_len moves.
     phase = max(0.0, min(1.0, (move_idx - temp_moves) / max(1, ramp_len)))
@@ -96,10 +91,7 @@ def _blended_value_target(
         max_entropy = float(np.log(support.size))
         concentration = 1.0 - (entropy / max_entropy if max_entropy > 0 else 0.0)
 
-    gate        = phase * concentration     # both must fire
-    q_weight    = (1.0 - blend_alpha) * gate
-    alpha_eff   = 1.0 - q_weight
-    return alpha_eff * terminal + q_weight * root_q
+    return (1.0 - blend_alpha) * phase * concentration
 
 
 # ---------------------------------------------------------------------------
@@ -110,12 +102,14 @@ def self_play_game(mcts: MCGS, temp_moves: int = 0, blend_alpha: float = 1.0):
     """
     Play one game via MCTS self-play, collecting training examples.
 
-    blend_alpha controls terminal vs Q-value blending:
-        value_target = blend_alpha * terminal + (1 - blend_alpha) * root_q
+    blend_alpha controls terminal vs Q-value blending (applied in the loss;
+    see module header - examples carry root_q and its gated weight).
 
     Returns
     -------
-    training_examples : list of (obs, policy_target, value_target)
+    training_examples : list of (obs, policy_target, value_target, margin,
+                                 ownership, root_q, q_weight) - same field
+        layout as the replay-buffer tuples built in train_mcts.py
     winner            : +1.0 Blue / -1.0 Green / 0.0 draw (Blue perspective)
     move_count        : number of half-moves played
     elapsed           : wall time in seconds
@@ -160,7 +154,8 @@ def self_play_game(mcts: MCGS, temp_moves: int = 0, blend_alpha: float = 1.0):
         examples.append((obs, action_probs, turn, board.copy(), root_q, move_count))
 
         temp = 1.0 if move_count < temp_moves else 0.0
-        action = mcts.select_action(action_probs, board=board, turn=turn, temperature=temp)
+        action = mcts.select_action(action_probs, board=board, turn=turn, temperature=temp,
+                                    best_action=mcts.last_best_action)
 
         board = apply_move(board, action, turn)
         mcts.advance_tree(action)
@@ -176,15 +171,24 @@ def self_play_game(mcts: MCGS, temp_moves: int = 0, blend_alpha: float = 1.0):
     blue, green = count_cells(board)
     margin_blue = float(blue - green) / 49.0  # final material margin, Blue perspective
 
+    own_as_blue = np.full((7, 7), 2, dtype=np.int8)        # 2 = empty
+    own_as_blue[board[:, :, 1]] = 0                        # Blue's cells
+    own_as_blue[board[:, :, 0]] = 1                        # Green's cells
+    own_as_green = np.full((7, 7), 2, dtype=np.int8)
+    own_as_green[board[:, :, 0]] = 0
+    own_as_green[board[:, :, 1]] = 1
+
     training_examples = []
     for obs, policy_target, example_turn, _, root_q, move_idx in examples:
-        value_target = _blended_value_target(
-            winner=winner, was_blue=example_turn, root_q=root_q,
+        value_target = winner if example_turn else -winner
+        q_weight = _q_blend_weight(
             move_idx=move_idx, policy_target=policy_target,
             blend_alpha=blend_alpha, temp_moves=temp_moves,
         )
         margin = margin_blue if example_turn else -margin_blue
-        training_examples.append((obs, policy_target, value_target, margin))
+        ownership = own_as_blue if example_turn else own_as_green
+        training_examples.append((obs, policy_target, value_target, margin,
+                                  ownership, root_q, q_weight))
 
     elapsed = time.time() - game_start
     return training_examples, winner, move_count, elapsed, truncated, legal_move_counts
@@ -226,10 +230,16 @@ def _slot_result(
 
     Returns
     -------
-    training_examples : list of (obs, raw_policy, value_target, margin, board, turn)
-        6-tuples - board and turn included so the caller can apply policy
+    training_examples : list of (obs, raw_policy, value_target, margin,
+                                 ownership, board, turn, root_q, q_weight)
+        9-tuples - board and turn included so the caller can apply policy
         relabeling outside the GPU-critical pool loop.  margin is the final
         material margin / 49 from the example's side-to-move perspective.
+        ownership is a (7,7) int8 map of the *final* board from the example's
+        side-to-move perspective: 0=mine, 1=opponent's, 2=empty.
+        value_target is the PURE terminal outcome; root_q (side-to-move
+        perspective) and its gated blend weight ride along separately so the
+        loss can mix them at the class-distribution level (see module header).
     winner            : +1.0 Blue / −1.0 Green / material ratio for truncated games
     move_count        : number of half-moves played
     elapsed           : wall time in seconds
@@ -239,16 +249,28 @@ def _slot_result(
     blue, green = count_cells(slot.board)
     margin_blue = float(blue - green) / 49.0
 
+    # Final-ownership class maps (board plane 1 = Blue, plane 0 = Green).
+    # Computed once per game; each example gets the map oriented to its own
+    # side-to-move so it matches board_to_obs channel semantics.
+    own_final = np.full((7, 7), 2, dtype=np.int8)          # 2 = empty
+    own_as_blue = own_final.copy()
+    own_as_blue[slot.board[:, :, 1]] = 0                   # Blue's cells
+    own_as_blue[slot.board[:, :, 0]] = 1                   # Green's cells
+    own_as_green = own_final.copy()
+    own_as_green[slot.board[:, :, 0]] = 0
+    own_as_green[slot.board[:, :, 1]] = 1
+
     examples = []
     for obs, policy_target, example_turn, ex_board, root_q, move_idx in slot.examples:
-        value_target = _blended_value_target(
-            winner=winner, was_blue=example_turn, root_q=root_q,
+        value_target = winner if example_turn else -winner
+        q_weight = _q_blend_weight(
             move_idx=move_idx, policy_target=policy_target,
             blend_alpha=blend_alpha, temp_moves=temp_moves,
         )
         margin = margin_blue if example_turn else -margin_blue
-        examples.append((obs, policy_target, value_target, margin,
-                         ex_board, example_turn))
+        ownership = own_as_blue if example_turn else own_as_green
+        examples.append((obs, policy_target, value_target, margin, ownership,
+                         ex_board, example_turn, root_q, q_weight))
     elapsed = time.time() - slot.game_start
     return examples, winner, slot.move_count, elapsed, slot.truncated, slot.legal_move_counts
 
@@ -298,6 +320,8 @@ def _advance_group(
 
         action_probs = slot.search.result
         root_q = slot.search.root_value
+        best_action = slot.search.best_action
+        skip_example = False
         if not np.any(action_probs):
             is_terminal, terminal_value = check_terminal(slot.board, slot.turn)
             if is_terminal:
@@ -319,6 +343,7 @@ def _advance_group(
                 action_probs = masks.astype(np.float32)
                 action_probs /= action_probs.sum()
                 root_q = 0.0
+                skip_example = True
                 # Fall through to normal action-selection below.
             else:
                 # Genuine forced pass.
@@ -340,14 +365,16 @@ def _advance_group(
                     next_active.append(slot)
                 continue
 
-        obs = board_to_obs(slot.board, slot.turn)
-        slot.examples.append(
-            (obs, action_probs, slot.turn, slot.board.copy(), root_q, slot.move_count)
-        )
+        if not skip_example:
+            obs = board_to_obs(slot.board, slot.turn)
+            slot.examples.append(
+                (obs, action_probs, slot.turn, slot.board.copy(), root_q, slot.move_count)
+            )
 
         temp = 1.0 if slot.move_count < temp_moves else 0.0
         action = slot.mcts.select_action(
             action_probs, board=slot.board, turn=slot.turn, temperature=temp,
+            best_action=best_action,
         )
         slot.board = apply_move(slot.board, action, slot.turn)
         slot.turn = not slot.turn
@@ -690,6 +717,7 @@ def play_eval_game(
     turn = True  # Blue moves first (eval games always start standard)
     board_history: dict = {}
     move_count = 0
+    stauf_moves = 0   # cumulative Stauf move index, for its depths[] cycle
     end_reason = "terminal"
 
     while True:
@@ -715,7 +743,8 @@ def play_eval_game(
                 turn = not turn
                 continue
             action_probs = mcts.search(board, turn)
-            action = mcts.select_action(action_probs, board=board, turn=turn, temperature=0)
+            action = mcts.select_action(action_probs, board=board, turn=turn, temperature=0,
+                                        best_action=mcts.last_best_action)
             mcts.advance_tree(action)
         else:
             legal = np.where(action_masks(board, turn))[0]
@@ -726,8 +755,14 @@ def play_eval_game(
                 action = int(np.random.choice(legal))
             else:
                 depth = int(np.random.choice([4, minimax_depth])) if vary_depth else minimax_depth
-                stauf_mc = int(np.random.randint(0, 3)) if engine == 'stauf' else -1
-                action = find_best_move(board.tobytes(), depth, turn, engine, stauf_mc)
+                if engine == 'stauf':
+                    # Canonical Stauf: pass its cumulative move index so the
+                    # internal depths[] cycle matches the real game rather than
+                    # a random slot (identify_stauf.py / find_stauf_line.py).
+                    action = find_best_move(board.tobytes(), depth, turn, engine, stauf_moves)
+                    stauf_moves += 1
+                else:
+                    action = find_best_move(board.tobytes(), depth, turn, engine)
                 if action in (-1, 1225):
                     turn = not turn
                     continue
@@ -793,7 +828,8 @@ def play_net_vs_net_game(
             continue
 
         action_probs = mcts_active.search(board, turn)
-        action = mcts_active.select_action(action_probs, board=board, turn=turn, temperature=0)
+        action = mcts_active.select_action(action_probs, board=board, turn=turn, temperature=0,
+                                           best_action=mcts_active.last_best_action)
         mcts_active.advance_tree(action)
         mcts_passive.advance_tree(action)
 
@@ -807,6 +843,96 @@ def play_net_vs_net_game(
             break
 
     return blue_result if new_is_blue else -blue_result
+
+
+# ---------------------------------------------------------------------------
+# Deterministic engine vs engine (low-end ladder rating)
+# ---------------------------------------------------------------------------
+
+def play_engine_vs_engine(
+    spec_a: tuple[str, int],
+    spec_b: tuple[str, int],
+    a_is_blue: bool,
+    opening_plies: int = 4,
+    rng=None,
+    max_moves: int = 200,
+) -> int:
+    """Play one game between two deterministic engines from a random opening.
+
+    Each spec is ``(engine, depth)`` -- e.g. ``("stauf", 6)`` for the canonical
+    original-game AI, or ``("micro3", 7)`` for depth-7 minimax.  Both engines
+    are deterministic, so *the randomised opening is the only source of game
+    variety* and is what makes a Bradley-Terry / WHR rating identifiable: play
+    many distinct openings (and both colours) per pairing.
+
+    The opening is ``opening_plies`` uniform-random legal moves (alternating
+    colours) from the standard start; the engines then play it out.  Stauf's
+    cumulative move index is tracked and passed as ``move_count`` so its
+    depths[] cycle matches the real game.
+
+    Returns the discretised result in {+1, 0, -1} from a's perspective
+    (material-ratio truncation collapsed to a win/draw/loss, matching how the
+    net drivers are scored for BT).
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    board = new_board()
+    turn = True  # Blue moves first
+
+    # --- randomised opening: uniform-random legal plies, alternating colours ---
+    for _ in range(opening_plies):
+        is_terminal, _ = check_terminal(board, turn)
+        if is_terminal:
+            break
+        legal = np.where(action_masks(board, turn))[0]
+        if len(legal) == 0:
+            turn = not turn
+            continue
+        board = apply_move(board, int(rng.choice(legal)), turn)
+        turn = not turn
+
+    # --- engines play it out (deterministic) ---
+    board_history: dict = {}
+    stauf_moves = {"a": 0, "b": 0}   # per-side cumulative Stauf move index
+    move_count = 0
+    blue_result = 0.0
+    while True:
+        state_key = board.tobytes() + bytes([turn])
+        board_history[state_key] = board_history.get(state_key, 0) + 1
+        if board_history[state_key] >= 3:
+            blue_result = 0.0            # repetition = draw
+            break
+
+        is_terminal, terminal_value = check_terminal(board, turn)
+        if is_terminal:
+            assert terminal_value is not None
+            blue_result = terminal_value if turn else -terminal_value
+            break
+
+        side = "a" if (turn == a_is_blue) else "b"
+        engine, depth = spec_a if side == "a" else spec_b
+
+        if not np.any(action_masks(board, turn)):
+            turn = not turn
+            continue
+        if engine == "stauf":
+            action = find_best_move(board.tobytes(), depth, turn, engine, stauf_moves[side])
+            stauf_moves[side] += 1
+        else:
+            action = find_best_move(board.tobytes(), depth, turn, engine)
+        if action in (-1, 1225):
+            turn = not turn
+            continue
+
+        board = apply_move(board, action, turn)
+        turn = not turn
+        move_count += 1
+        if move_count > max_moves:
+            blue, green = count_cells(board)
+            blue_result = float(blue - green) / float(blue + green) if blue + green > 0 else 0.0
+            break
+
+    result = blue_result if a_is_blue else -blue_result
+    return 1 if result > 1e-9 else (-1 if result < -1e-9 else 0)
 
 
 # ---------------------------------------------------------------------------

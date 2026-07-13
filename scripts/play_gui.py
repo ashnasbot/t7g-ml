@@ -436,7 +436,8 @@ class MicroscopeApp(pyglet.window.Window):
         def compute():
             if cur_engine == "mcts" and cur_mcts:
                 probs  = cur_mcts.search(board_snap, turn_snap)
-                action = cur_mcts.select_action(probs, temperature=0)
+                action = cur_mcts.select_action(probs, temperature=0,
+                                                best_action=cur_mcts.last_best_action)
             else:
                 board_bytes = board_snap.tobytes()
                 action = find_best_move(board_bytes, cur_depth, turn_snap, cur_engine)
