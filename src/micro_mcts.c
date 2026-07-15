@@ -78,7 +78,8 @@ typedef struct {
 
 typedef struct MCGSNode_s {
     uint64_t  hash;            /* Zobrist hash - open-HT key             */
-    uint8_t   board[7][7];     /* internal: EMPTY=0 / GREEN=1 / BLUE=2   */
+    uint64_t  green_bb;        /* bitboards, low 49 bits, bit i = (i/7,i%7) */
+    uint64_t  blue_bb;
     bool      turn;            /* true = Blue to move                    */
     int       visit_count;
     float     value_sum;
@@ -150,6 +151,20 @@ static uint64_t zobrist_board[49][3];
 static uint64_t zobrist_turn;
 static bool     zobrist_ready = false;
 
+/* Bitboard support tables.  Hash compatibility: the legacy hash XORed
+ * zobrist_board[pos][cell] over ALL 49 cells including empties.  With
+ * hash_base = XOR of all empty-cell keys and zg/zb = (empty ^ piece) delta
+ * keys, the bitboard hash below reproduces the legacy values bit-for-bit,
+ * keeping searches byte-identical to the array-board implementation. */
+static uint64_t hash_base;
+static uint64_t zg[49], zb[49];        /* zobrist delta: empty -> green/blue */
+static uint64_t neighbor1_mask[49];    /* Chebyshev dist 1 (clone ring)      */
+static uint64_t neighbor2_mask[49];    /* Chebyshev dist <= 2 (all moves)    */
+static int16_t  action_of[49][49];     /* [from][to] -> action code, -1      */
+static int8_t   move_from_tbl[1225];
+static int8_t   move_to_tbl[1225];     /* -1 if destination off-board        */
+static bool     move_is_jump_tbl[1225];
+
 static uint64_t xorshift64(uint64_t *s) {
     uint64_t x = *s;
     x ^= x << 13; x ^= x >> 7; x ^= x << 17;
@@ -164,6 +179,49 @@ static void init_zobrist(void) {
         for (int j = 0; j < 3; j++)
             zobrist_board[i][j] = xorshift64(&seed);
     zobrist_turn  = xorshift64(&seed);
+
+    hash_base = 0;
+    for (int i = 0; i < 49; i++) {
+        hash_base ^= zobrist_board[i][EMPTY];
+        zg[i] = zobrist_board[i][EMPTY] ^ zobrist_board[i][GREEN];
+        zb[i] = zobrist_board[i][EMPTY] ^ zobrist_board[i][BLUE];
+    }
+
+    for (int sq = 0; sq < 49; sq++) {
+        int y = sq / 7, x = sq % 7;
+        neighbor1_mask[sq] = 0;
+        neighbor2_mask[sq] = 0;
+        for (int dy = -2; dy <= 2; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                if (dy == 0 && dx == 0) continue;
+                int ny = y + dy, nx = x + dx;
+                if (ny < 0 || ny >= 7 || nx < 0 || nx >= 7) continue;
+                int nsq = ny * 7 + nx;
+                neighbor2_mask[sq] |= (1ULL << nsq);
+                if (abs(dy) <= 1 && abs(dx) <= 1)
+                    neighbor1_mask[sq] |= (1ULL << nsq);
+            }
+        }
+    }
+
+    memset(action_of, -1, sizeof(action_of));
+    for (int from = 0; from < 49; from++) {
+        for (int mv = 0; mv < 25; mv++) {
+            int action = from * 25 + mv;
+            int dx = (mv % 5) - 2, dy = (mv / 5) - 2;
+            int x  = from % 7 + dx, y = from / 7 + dy;
+            move_from_tbl[action]    = (int8_t)from;
+            move_is_jump_tbl[action] = (abs(dx) == 2 || abs(dy) == 2);
+            if (x < 0 || x >= 7 || y < 0 || y >= 7) {
+                move_to_tbl[action] = -1;
+            } else {
+                int to = y * 7 + x;
+                move_to_tbl[action]  = (int8_t)to;
+                if (dx != 0 || dy != 0) action_of[from][to] = (int16_t)action;
+            }
+        }
+    }
+
     zobrist_ready = true;
 }
 
@@ -203,79 +261,75 @@ static float gamma_sample(uint64_t *rng, float alpha) {
     }
 }
 
-static uint64_t compute_hash(uint8_t board[7][7], bool turn) {
-    uint64_t h = 0;
-    for (int pos = 0; pos < 49; pos++) {
-        uint8_t cell = board[pos / 7][pos % 7];
-        h ^= zobrist_board[pos][cell];
-    }
+static uint64_t compute_hash(uint64_t green_bb, uint64_t blue_bb, bool turn) {
+    uint64_t h = hash_base;
+    uint64_t bbs = green_bb;
+    while (bbs) { h ^= zg[__builtin_ctzll(bbs)]; bbs &= bbs - 1; }
+    bbs = blue_bb;
+    while (bbs) { h ^= zb[__builtin_ctzll(bbs)]; bbs &= bbs - 1; }
     if (turn) h ^= zobrist_turn;
     return h;
 }
 
-/*  Board utilities  */
+/*  Board utilities (bitboards, low 49 bits, bit i = cell (i/7, i%7))  */
 
-/* Python bool[7][7][2] (ch0=green, ch1=blue) -> internal uint8_t[7][7] */
-static void convert_board(bool py[7][7][2], uint8_t out[7][7]) {
-    for (int y = 0; y < 7; y++)
-        for (int x = 0; x < 7; x++)
-            out[y][x] = py[y][x][1] ? BLUE
-                      : py[y][x][0]  ? GREEN
-                      :                EMPTY;
+/* Python bool[7][7][2] (ch0=green, ch1=blue) -> bitboards */
+static void convert_board(bool py[7][7][2], uint64_t *green_bb, uint64_t *blue_bb) {
+    uint64_t g = 0, b = 0;
+    const bool *flat = (const bool *)py;
+    for (int pos = 0; pos < 49; pos++) {
+        g |= (uint64_t)(flat[pos * 2 + 0] != 0) << pos;
+        b |= (uint64_t)(flat[pos * 2 + 1] != 0) << pos;
+    }
+    *green_bb = g;
+    *blue_bb  = b;
 }
 
-/* internal uint8_t[7][7] -> Python bool[7][7][2] */
-static void export_board(uint8_t board[7][7], bool out[7][7][2]) {
-    for (int y = 0; y < 7; y++)
-        for (int x = 0; x < 7; x++) {
-            out[y][x][0] = (board[y][x] == GREEN);
-            out[y][x][1] = (board[y][x] == BLUE);
-        }
-}
-
-/* action = piece*25 + move; piece = y*7+x; move = v*5+u (0..4, delta -2..+2) */
-static void get_valid_moves(uint8_t board[7][7], uint8_t player,
-                            bool valid_moves[7][7][5][5]) {
-    memset(valid_moves, 0, sizeof(bool[7][7][5][5]));
-    bool *moves = (bool *)valid_moves;
-    for (int y = 0; y < BOARD_SIZE; y++) {
-        for (int x = 0; x < BOARD_SIZE; x++) {
-            if (board[y][x] != player) continue;
-            int u_lo = (2 - x > 0) ? 2 - x : 0;
-            int u_hi = (9 - x < 5) ? 9 - x : 5;
-            int v_lo = (2 - y > 0) ? 2 - y : 0;
-            int v_hi = (9 - y < 5) ? 9 - y : 5;
-            for (int u = u_lo; u < u_hi; u++)
-                for (int v = v_lo; v < v_hi; v++)
-                    if (board[y + v - 2][x + u - 2] == EMPTY)
-                        moves[25 * (7 * y + x) + 5 * v + u] = true;
-        }
+/* bitboards -> Python bool[7][7][2] */
+static void export_board(uint64_t green_bb, uint64_t blue_bb, bool out[7][7][2]) {
+    bool *flat = (bool *)out;
+    for (int pos = 0; pos < 49; pos++) {
+        flat[pos * 2 + 0] = (green_bb >> pos) & 1;
+        flat[pos * 2 + 1] = (blue_bb  >> pos) & 1;
     }
 }
 
-static bool any_moves(bool vm[7][7][5][5]) {
-    return memchr(vm, 1, sizeof(bool[7][7][5][5])) != NULL;
+static bool has_moves_bits(uint64_t mover_bb, uint64_t occupied) {
+    uint64_t pieces = mover_bb;
+    while (pieces) {
+        int sq = __builtin_ctzll(pieces); pieces &= pieces - 1;
+        if (neighbor2_mask[sq] & ~occupied) return true;
+    }
+    return false;
 }
 
-static void make_move(uint8_t board[7][7], int action, uint8_t player) {
-    int piece = action / 25, mv = action % 25;
-    int from_x = piece % 7, from_y = piece / 7;
-    int mv_x = (mv % 5) - 2, mv_y = (mv / 5) - 2;
-    int to_x = from_x + mv_x, to_y = from_y + mv_y;
-    if (abs(mv_x) == 2 || abs(mv_y) == 2) board[from_y][from_x] = EMPTY;
-    board[to_y][to_x] = player;
-    for (int cy = (to_y > 0 ? to_y-1 : 0); cy <= (to_y < 6 ? to_y+1 : 6); cy++)
-        for (int cx = (to_x > 0 ? to_x-1 : 0); cx <= (to_x < 6 ? to_x+1 : 6); cx++)
-            if (board[cy][cx] != player && board[cy][cx] != EMPTY)
-                board[cy][cx] = player;
+/* Emit legal action codes in ascending order (pieces ascend by square; for a
+ * fixed source, ascending destination square is ascending action code) -
+ * matching the legacy 0..1224 valid-mask scan order exactly. */
+static int gen_actions(uint64_t mover_bb, uint64_t occupied, int16_t *out) {
+    int count = 0;
+    uint64_t pieces = mover_bb;
+    while (pieces) {
+        int from_sq = __builtin_ctzll(pieces); pieces &= pieces - 1;
+        const int16_t *acts = action_of[from_sq];
+        uint64_t dests = neighbor2_mask[from_sq] & ~occupied;
+        while (dests) {
+            int to_sq = __builtin_ctzll(dests); dests &= dests - 1;
+            out[count++] = acts[to_sq];
+        }
+    }
+    return count;
 }
 
-static int count_cells(uint8_t board[7][7], uint8_t player) {
-    int n = 0;
-    for (int y = 0; y < BOARD_SIZE; y++)
-        for (int x = 0; x < BOARD_SIZE; x++)
-            if (board[y][x] == player) n++;
-    return n;
+/* Apply an action for the given mover; returns updated bitboards in place. */
+static void make_move_bits(uint64_t *mover_bb, uint64_t *opp_bb, int action) {
+    uint64_t m = *mover_bb, o = *opp_bb;
+    int to_sq = move_to_tbl[action];
+    if (move_is_jump_tbl[action]) m &= ~(1ULL << move_from_tbl[action]);
+    m |= (1ULL << to_sq);
+    uint64_t captured = neighbor1_mask[to_sq] & o;
+    *mover_bb = m | captured;
+    *opp_bb   = o ^ captured;
 }
 
 /*
@@ -284,25 +338,24 @@ static int count_cells(uint8_t board[7][7], uint8_t player) {
  * Matches Python check_terminal: only terminal when one side has 0 pieces,
  * or BOTH players simultaneously have no legal moves.
  */
-static bool check_terminal(uint8_t board[7][7], bool turn, float *value) {
-    int blue  = count_cells(board, BLUE);
-    int green = count_cells(board, GREEN);
-    if (blue == 0) {
+static bool check_terminal(uint64_t green_bb, uint64_t blue_bb, bool turn,
+                           float *value) {
+    if (blue_bb == 0) {
         *value = turn ? -1.0f : 1.0f;
         return true;
     }
-    if (green == 0) {
+    if (green_bb == 0) {
         *value = turn ? 1.0f : -1.0f;
         return true;
     }
-    uint8_t mover = turn ? BLUE : GREEN;
-    uint8_t other = turn ? GREEN : BLUE;
-    bool vm_mover[7][7][5][5], vm_other[7][7][5][5];
-    get_valid_moves(board, mover, vm_mover);
-    if (any_moves(vm_mover)) return false;
-    get_valid_moves(board, other, vm_other);
-    if (any_moves(vm_other)) return false;
+    uint64_t occupied = green_bb | blue_bb;
+    uint64_t mover = turn ? blue_bb : green_bb;
+    uint64_t other = turn ? green_bb : blue_bb;
+    if (has_moves_bits(mover, occupied)) return false;
+    if (has_moves_bits(other, occupied)) return false;
     /* Both stuck: terminal by count (from mover's perspective) */
+    int blue  = __builtin_popcountll(blue_bb);
+    int green = __builtin_popcountll(green_bb);
     float raw = (blue > green) ? 1.0f : (green > blue) ? -1.0f : 0.0f;
     *value = turn ? raw : -raw;
     return true;
@@ -334,8 +387,9 @@ static void tt_clear(MCGSInstance *inst) {
 }
 
 /* Get or create node for (board, turn), inserting into TT if new. */
-static MCGSNode *tt_get_or_create(MCGSInstance *inst, uint8_t board[7][7], bool turn) {
-    uint64_t h = compute_hash(board, turn);
+static MCGSNode *tt_get_or_create(MCGSInstance *inst, uint64_t green_bb,
+                                  uint64_t blue_bb, bool turn) {
+    uint64_t h = compute_hash(green_bb, blue_bb, turn);
     MCGSNode *n = tt_find(inst, h);
     if (n) return n;
     if (inst->node_used >= NODE_SLAB_CAP) {
@@ -345,10 +399,11 @@ static MCGSNode *tt_get_or_create(MCGSInstance *inst, uint8_t board[7][7], bool 
     }
     n = &inst->node_slab[inst->node_used++];
     memset(n, 0, sizeof(MCGSNode));
-    n->hash = h;
-    memcpy(n->board, board, sizeof(n->board));
-    n->turn = turn;
-    n->is_terminal = check_terminal(board, turn, &n->terminal_value);
+    n->hash     = h;
+    n->green_bb = green_bb;
+    n->blue_bb  = blue_bb;
+    n->turn     = turn;
+    n->is_terminal = check_terminal(green_bb, blue_bb, turn, &n->terminal_value);
     tt_insert(inst, n);
     return n;
 }
@@ -414,16 +469,12 @@ static MCGSNode *get_or_create_child(MCGSInstance *inst,
         MCGSEdge *e = &node->edges[i];
         if (e->action != (int16_t)action) continue;
         if (!e->child) {
-            uint8_t cb[7][7]; bool ct;
-            if (action == PASS_ACTION) {
-                memcpy(cb, node->board, sizeof(cb));
-                ct = !node->turn;
-            } else {
-                memcpy(cb, node->board, sizeof(cb));
-                make_move(cb, action, node->turn ? BLUE : GREEN);
-                ct = !node->turn;
+            uint64_t g = node->green_bb, b = node->blue_bb;
+            if (action != PASS_ACTION) {
+                if (node->turn) make_move_bits(&b, &g, action);
+                else            make_move_bits(&g, &b, action);
             }
-            e->child = tt_get_or_create(inst, cb, ct);
+            e->child = tt_get_or_create(inst, g, b, !node->turn);
         }
         return e->child;
     }
@@ -725,9 +776,9 @@ MCGSSearchState *mcgs_start_search(MCGSInstance *inst,
     ss->inst = inst;
     ss->best_action = -1;
 
-    uint8_t board[7][7];
-    convert_board(py_board, board);
-    ss->root = tt_get_or_create(inst, board, turn);
+    uint64_t green_bb, blue_bb;
+    convert_board(py_board, &green_bb, &blue_bb);
+    ss->root = tt_get_or_create(inst, green_bb, blue_bb, turn);
     if (!ss->root) { free(ss); return NULL; }
 
     MCGSNode *root = ss->root;
@@ -769,7 +820,7 @@ int mcgs_is_done(MCGSSearchState *ss) {
 
 void mcgs_get_leaf_board(MCGSSearchState *ss, int i, bool out[7][7][2]) {
     if (!ss || i < 0 || i >= ss->num_pending) return;
-    export_board(ss->pending[i]->board, out);
+    export_board(ss->pending[i]->green_bb, ss->pending[i]->blue_bb, out);
 }
 
 bool mcgs_get_leaf_turn(MCGSSearchState *ss, int i) {
@@ -788,14 +839,15 @@ void mcgs_commit_expansion(MCGSSearchState *ss, int i,
     MCGSNode *node = ss->pending[i];
     if (node->is_expanded || node->is_terminal) return;
 
-    uint8_t player = node->turn ? BLUE : GREEN;
-    bool valid_moves[7][7][5][5];
-    get_valid_moves(node->board, player, valid_moves);
-    bool *vm = (bool *)valid_moves;
+    uint64_t mover_bb = node->turn ? node->blue_bb : node->green_bb;
+    uint64_t occupied = node->green_bb | node->blue_bb;
+
+    int16_t legal_actions[1225];
+    int n_legal = gen_actions(mover_bb, occupied, legal_actions);
 
     MCGSInstance *inst = ss->inst;
 
-    if (!any_moves(valid_moves)) {
+    if (n_legal == 0) {
         /* Forced pass - no real legal moves */
         if (inst->edge_used + 1 > EDGE_SLAB_CAP) {
             fprintf(stderr, "[mcgs] edge slab full (%d edges, %d nodes) - forced-pass expansion dropped\n",
@@ -815,17 +867,13 @@ void mcgs_commit_expansion(MCGSSearchState *ss, int i,
         return;
     }
 
-    /* Count legal moves and sum policy mass over them */
-    int   legal_actions[1225];
+    /* Gather and renormalise policy mass over the legal moves */
     float priors[1225];
-    int   n_legal = 0;
-    float total   = 0.0f;
-    for (int a = 0; a < 1225; a++) {
-        if (!vm[a]) continue;
-        legal_actions[n_legal] = a;
-        priors[n_legal]        = (policy[a] > 0.0f) ? policy[a] : 0.0f;
-        total                 += priors[n_legal];
-        n_legal++;
+    float total = 0.0f;
+    for (int j = 0; j < n_legal; j++) {
+        float p   = policy[legal_actions[j]];
+        priors[j] = (p > 0.0f) ? p : 0.0f;
+        total    += priors[j];
     }
 
     if (total > 0.0f)
@@ -835,7 +883,6 @@ void mcgs_commit_expansion(MCGSSearchState *ss, int i,
         for (int j = 0; j < n_legal; j++) priors[j] = u;
     }
 
-    if (n_legal <= 0) return;
     if (inst->edge_used + n_legal > EDGE_SLAB_CAP) {
         fprintf(stderr, "[mcgs] edge slab full (%d edges, %d nodes) - normal expansion dropped (%d legal moves)\n",
                 EDGE_SLAB_CAP, inst->node_used, n_legal);
@@ -951,7 +998,8 @@ int mcgs_get_pending_boards(MCGSSearchState *ss, bool *boards_out, bool *turns_o
     if (!ss) return 0;
     for (int i = 0; i < ss->num_pending; i++) {
         MCGSNode *node = ss->pending[i];
-        export_board(node->board, (bool (*)[7][2])(boards_out + i * 98));
+        export_board(node->green_bb, node->blue_bb,
+                     (bool (*)[7][2])(boards_out + i * 98));
         turns_out[i] = node->turn;
     }
     return ss->num_pending;

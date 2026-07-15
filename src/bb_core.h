@@ -39,7 +39,10 @@
 #define GREEN_PLAYER  1
 #define BLUE_PLAYER   2
 
-#define TT_SIZE        (1 << 20)
+#ifndef TT_SIZE_BITS
+#define TT_SIZE_BITS   20
+#endif
+#define TT_SIZE        (1 << TT_SIZE_BITS)
 #define TT_MASK        (TT_SIZE - 1)
 #define SCORE_INF      1000.0f
 #define WIN_THRESHOLD   800.0f
@@ -79,6 +82,13 @@ static uint64_t  neighbor2_mask[49];
 static float     centrality_table[49]; /* (6 - Manhattan dist from centre)  */
 static int32_t   history[49][49];
 static bool      tables_initialized = false;
+
+/* Action-code decode tables: action = from_sq*25 + (dy+2)*5 + (dx+2).
+ * Replace the div/mod chains on the hot path with lookups. */
+static int8_t    move_from_tbl[1225];
+static int8_t    move_to_tbl[1225];      /* -1 if destination off-board */
+static bool      move_is_jump_tbl[1225];
+static int16_t   action_of[49][49];      /* [from][to] -> action, -1 if dist>2 */
 
 /* ── Optional neural policy prior (ONNX) ──────────────────────────────── */
 #ifdef BB_USE_ONNX
@@ -144,6 +154,24 @@ static void init_tables(void) {
             }
         }
         centrality_table[sq] = 6.0f - (float)(abs(x - 3) + abs(y - 3));
+    }
+
+    memset(action_of, -1, sizeof(action_of));
+    for (int from = 0; from < 49; from++) {
+        for (int mv = 0; mv < 25; mv++) {
+            int action = from * 25 + mv;
+            int dx = (mv % 5) - 2, dy = (mv / 5) - 2;
+            int x  = from % 7 + dx, y = from / 7 + dy;
+            move_from_tbl[action]    = (int8_t)from;
+            move_is_jump_tbl[action] = (abs(dx) == 2 || abs(dy) == 2);
+            if (x < 0 || x >= 7 || y < 0 || y >= 7) {
+                move_to_tbl[action] = -1;
+            } else {
+                int to = y * 7 + x;
+                move_to_tbl[action]  = (int8_t)to;
+                if (dx != 0 || dy != 0) action_of[from][to] = (int16_t)action;
+            }
+        }
     }
 
     tables_initialized = true;
@@ -249,13 +277,10 @@ static int gen_moves(uint64_t mover_bb, uint64_t opp_bb, int16_t out_moves[1225]
 static MoveResult make_move_bb(uint64_t mover_bb, uint64_t opp_bb,
                                 uint64_t hash, int action, int mover_color) {
     int opp_color = 3 - mover_color;
-    int from_sq   = action / 25;
-    int mv        = action % 25;
-    int mv_x      = (mv % 5) - 2;
-    int mv_y      = (mv / 5) - 2;
-    int to_sq     = (from_sq / 7 + mv_y) * 7 + (from_sq % 7 + mv_x);
+    int from_sq   = move_from_tbl[action];
+    int to_sq     = move_to_tbl[action];
 
-    if (abs(mv_x) == 2 || abs(mv_y) == 2) {
+    if (move_is_jump_tbl[action]) {
         mover_bb &= ~(1ULL << from_sq);
         hash     ^= zobrist_piece[from_sq][mover_color];
     }
@@ -285,26 +310,54 @@ static int compare_scored_moves(const void *a, const void *b) {
     return (int)((ScoredMove *)b)->score - (int)((ScoredMove *)a)->score;
 }
 
-static void order_moves(int16_t *moves, int count, uint64_t opp_bb,
-                        int16_t tt_best, ScoredMove *out) {
-    for (int i = 0; i < count; i++) {
-        int action  = moves[i];
-        int from_sq = action / 25;
-        int mv      = action % 25;
-        int to_sq   = (from_sq / 7 + (mv / 5) - 2) * 7 + (from_sq % 7 + (mv % 5) - 2);
-
-        int16_t sc;
-        if (action == (int)tt_best) {
-            sc = 30000;
-        } else {
-            int caps   = __builtin_popcountll(neighbor1_mask[to_sq] & opp_bb);
-            int hist   = history[from_sq][to_sq] >> 8;
-            int sc_raw = caps * 200 + hist;
-            sc = (int16_t)(sc_raw < 29000 ? sc_raw : 29000);
+/* Fused move generation + ordering score, one pass, no div/mod.
+ * Emits parallel moves[]/scores[] arrays (SoA - keeps the score max-scan in
+ * pick_next_move vectorizable); consumers either qsort (root) or pick the
+ * max lazily (negamax - most nodes cut off after the first few moves, so
+ * fully sorting the list is wasted work). */
+static int gen_scored_moves(uint64_t mover_bb, uint64_t opp_bb, int16_t tt_best,
+                            int16_t *out_moves, int16_t *out_scores) {
+    int count = 0;
+    uint64_t occupied = mover_bb | opp_bb;
+    uint64_t pieces   = mover_bb;
+    while (pieces) {
+        int from_sq = __builtin_ctzll(pieces); pieces &= pieces - 1;
+        const int16_t *acts = action_of[from_sq];
+        const int32_t *hist = history[from_sq];
+        uint64_t dests = neighbor2_mask[from_sq] & ~occupied;
+        while (dests) {
+            int to_sq = __builtin_ctzll(dests); dests &= dests - 1;
+            int16_t action = acts[to_sq];
+            int16_t sc;
+            if (action == tt_best) {
+                sc = 30000;
+            } else {
+                int caps   = __builtin_popcountll(neighbor1_mask[to_sq] & opp_bb);
+                int sc_raw = caps * 200 + (hist[to_sq] >> 8);
+                sc = (int16_t)(sc_raw < 29000 ? sc_raw : 29000);
+            }
+            out_moves[count]  = action;
+            out_scores[count] = sc;
+            count++;
         }
-        out[i] = (ScoredMove){ (int16_t)action, sc };
     }
-    qsort(out, count, sizeof(ScoredMove), compare_scored_moves);
+    return count;
+}
+
+/* Select the best-scored move from index range [i, count) into position i
+ * (lazy selection sort step); returns its action.  Two-pass: a pure max
+ * reduction (auto-vectorizes over the contiguous int16 scores) then a find;
+ * picks the first max, matching strict-'>' single-pass tie-breaking. */
+static inline int pick_next_move(int16_t *moves, int16_t *scores, int i, int count) {
+    int16_t m = scores[i];
+    for (int j = i + 1; j < count; j++)
+        if (scores[j] > m) m = scores[j];
+    int best = i;
+    while (scores[best] != m) best++;
+    int16_t tm = moves[i], ts = scores[i];
+    moves[i]  = moves[best]; scores[i]  = scores[best];
+    moves[best] = tm;        scores[best] = ts;
+    return moves[i];
 }
 
 /*  Core negamax with NegaScout (PVS)  */
@@ -333,8 +386,8 @@ static float negamax(uint64_t mover_bb, uint64_t opp_bb, int mover_color,
         return s;
     }
 
-    int16_t moves[1225];
-    int move_count = gen_moves(mover_bb, opp_bb, moves);
+    int16_t moves[1225], scores[1225];
+    int move_count = gen_scored_moves(mover_bb, opp_bb, tt_best, moves, scores);
 
     if (move_count == 0) {
         if (!has_moves_bb(opp_bb, mover_bb)) {
@@ -347,21 +400,16 @@ static float negamax(uint64_t mover_bb, uint64_t opp_bb, int mover_color,
                         hash ^ zobrist_turn, ply + 1);
     }
 
-    ScoredMove scored[1225];
-    order_moves(moves, move_count, opp_bb, tt_best, scored);
-
     float   value     = -SCORE_INF;
     int16_t best_move = -1;
     int8_t  bound     = TT_UPPER_BOUND;
     int     opp_color = 3 - mover_color;
 
     for (int i = 0; i < move_count; i++) {
-        int action  = scored[i].move;
-        int from_sq = action / 25;
-        int mv      = action % 25;
-        int to_sq   = (from_sq / 7 + (mv / 5) - 2) * 7 + (from_sq % 7 + (mv % 5) - 2);
+        int action = pick_next_move(moves, scores, i, move_count);
 
         MoveResult child = make_move_bb(mover_bb, opp_bb, hash, action, mover_color);
+        __builtin_prefetch(&tt_table[child.hash & TT_MASK], 0, 3);
 
         float eval;
         if (i == 0) {
@@ -379,7 +427,7 @@ static float negamax(uint64_t mover_bb, uint64_t opp_bb, int mover_color,
         if (eval > alpha) { alpha = eval; bound = TT_EXACT; }
         if (alpha >= beta) {
             int hval = 1 << (depth < 19 ? depth : 19);
-            history[from_sq][to_sq] += hval;
+            history[move_from_tbl[action]][move_to_tbl[action]] += hval;
             bound = TT_LOWER_BOUND;
             break;
         }
@@ -395,27 +443,28 @@ static float root_negascout(uint64_t mover_bb, uint64_t opp_bb, int mover_color,
                              int depth, float alpha, float beta, uint64_t hash,
                              clock_t start, double deadline_ms,
                              int16_t *best_move_out) {
-    int16_t moves[1225];
-    int move_count = gen_moves(mover_bb, opp_bb, moves);
-    if (move_count == 0) { *best_move_out = -1; return -(SCORE_INF - 1.0f); }
-
     float   dummy;
     int16_t tt_best = -1;
     tt_probe(hash, depth, -SCORE_INF, SCORE_INF, &dummy, &tt_best, 0);
 
+    int16_t moves[1225], mscores[1225];
+    int move_count = gen_scored_moves(mover_bb, opp_bb, tt_best, moves, mscores);
+    if (move_count == 0) { *best_move_out = -1; return -(SCORE_INF - 1.0f); }
+
     ScoredMove scored[1225];
+    for (int i = 0; i < move_count; i++)
+        scored[i] = (ScoredMove){ moves[i], mscores[i] };
     if (policy_prior_valid) {
         for (int i = 0; i < move_count; i++) {
-            int   action = moves[i];
+            int   action = scored[i].move;
             float p      = policy_prior_buf[action];
-            int16_t sc   = (action == (int)tt_best) ? 30000
-                         : (int16_t)(p * 28000.0f < 29000.0f ? p * 28000.0f : 29000.0f);
-            scored[i] = (ScoredMove){ (int16_t)action, sc };
+            scored[i].score = (action == (int)tt_best) ? 30000
+                            : (int16_t)(p * 28000.0f < 29000.0f ? p * 28000.0f : 29000.0f);
         }
-        qsort(scored, move_count, sizeof(ScoredMove), compare_scored_moves);
-    } else {
-        order_moves(moves, move_count, opp_bb, tt_best, scored);
     }
+    /* Root is searched once per ID depth: full sort is cheap and keeps the
+     * losing-position fallback scan below in strict score order. */
+    qsort(scored, move_count, sizeof(ScoredMove), compare_scored_moves);
 
     float   value     = -SCORE_INF;
     int16_t best_move = scored[0].move;
