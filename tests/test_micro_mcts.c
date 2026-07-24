@@ -23,7 +23,7 @@ void *mcgs_create(int num_simulations, float c_puct, int gumbel_k);
 void  mcgs_clear(void *inst);
 void  mcgs_destroy(void *inst);
 int   mcgs_tt_size(void *inst);
-void *mcgs_start_search(void *inst, bool py_board[7][7][2], bool turn);
+void *mcgs_start_search(void *inst, bool py_board[7][7][2], bool turn, int clock);
 void  mcgs_search_destroy(void *ss);
 int   mcgs_pending_count(void *ss);
 int   mcgs_is_done(void *ss);
@@ -33,7 +33,6 @@ void  mcgs_commit_expansion(void *ss, int i, float policy[1225], float value);
 int   mcgs_step(void *ss);
 void  mcgs_get_result(void *ss, float out[1225]);
 float mcgs_get_root_value(void *ss);
-void  mcgs_apply_root_dirichlet(void *ss, float alpha, float eps);
 int   mcgs_get_pending_boards(void *ss, bool *boards_out, bool *turns_out);
 void  mcgs_commit_batch(void *ss, float *policies_flat, float *values, int n);
 
@@ -127,13 +126,13 @@ static void test_clear_and_reuse(void) {
     bool board[7][7][2];
     board_start(board);
 
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "first start_search returned NULL");
     run_full_search(ss, 0.0f);
     mcgs_search_destroy(ss);
     mcgs_clear(inst);
 
-    ss = mcgs_start_search(inst, board, true);
+    ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search after clear returned NULL");
     run_full_search(ss, 0.0f);
     mcgs_search_destroy(ss);
@@ -159,7 +158,7 @@ static void test_tt_size_grows_during_search(void) {
     void *inst = mcgs_create(16, 1.0f, 8);
     bool board[7][7][2];
     board_start(board);
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
     run_full_search(ss, 0.0f);
     mcgs_search_destroy(ss);
@@ -173,7 +172,7 @@ static void test_tt_size_zero_after_clear(void) {
     void *inst = mcgs_create(16, 1.0f, 8);
     bool board[7][7][2];
     board_start(board);
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     run_full_search(ss, 0.0f);
     mcgs_search_destroy(ss);
     CHECK(mcgs_tt_size(inst) > 0, "pre-clear: TT should have nodes");
@@ -192,7 +191,7 @@ static void test_tt_nondecreasing_during_search(void) {
     float policy[1225];
     uniform_policy(policy);
 
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
     int prev = mcgs_tt_size(inst);
     int steps = 0;
@@ -232,7 +231,7 @@ static void test_root_leaf_board_roundtrip(void) {
     place_green(board_in, 3, 0);
     place_green(board_in, 6, 4);
 
-    void *ss = mcgs_start_search(inst, board_in, true);
+    void *ss = mcgs_start_search(inst, board_in, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
     CHECK(mcgs_pending_count(ss) == 1, "root must be sole pending leaf initially");
 
@@ -264,7 +263,7 @@ static void test_root_leaf_turn_blue(void) {
     void *inst = mcgs_create(16, 1.0f, 8);
     bool board[7][7][2];
     board_start(board);
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
     CHECK(mcgs_pending_count(ss) >= 1, "must have at least one pending leaf");
     bool turn = mcgs_get_leaf_turn(ss, 0);
@@ -279,7 +278,7 @@ static void test_root_leaf_turn_green(void) {
     void *inst = mcgs_create(16, 1.0f, 8);
     bool board[7][7][2];
     board_start(board);
-    void *ss = mcgs_start_search(inst, board, false);
+    void *ss = mcgs_start_search(inst, board, false, 0);
     CHECK(ss != NULL, "start_search returned NULL");
     CHECK(mcgs_pending_count(ss) >= 1, "must have at least one pending leaf");
     bool turn = mcgs_get_leaf_turn(ss, 0);
@@ -299,7 +298,7 @@ static void test_terminal_blue_eliminated(void) {
     bool board[7][7][2];
     board_clear(board);
     place_green(board, 3, 3);   /* only Green, no Blue */
-    void *ss = mcgs_start_search(inst, board, true);   /* Blue's turn */
+    void *ss = mcgs_start_search(inst, board, true, 0);   /* Blue's turn */
     CHECK(ss != NULL, "start_search returned NULL");
     CHECK(mcgs_is_done(ss) == 1,
           "Blue eliminated -> terminal, must be immediately done");
@@ -319,7 +318,7 @@ static void test_terminal_green_eliminated(void) {
     bool board[7][7][2];
     board_clear(board);
     place_blue(board, 3, 3);    /* only Blue, no Green */
-    void *ss = mcgs_start_search(inst, board, false);   /* Green's turn */
+    void *ss = mcgs_start_search(inst, board, false, 0);   /* Green's turn */
     CHECK(ss != NULL, "start_search returned NULL");
     CHECK(mcgs_is_done(ss) == 1,
           "Green eliminated -> terminal, must be immediately done");
@@ -353,7 +352,7 @@ static void test_forced_pass_not_terminal(void) {
     place_blue(board, 5, 5);
 
     /* Green to move: Green is completely stuck, Blue has moves */
-    void *ss = mcgs_start_search(inst, board, false);
+    void *ss = mcgs_start_search(inst, board, false, 0);
     CHECK(ss != NULL, "start_search returned NULL");
     CHECK(mcgs_is_done(ss) == 0,
           "stuck-but-not-terminal position must NOT be immediately done");
@@ -383,7 +382,7 @@ static void test_both_stuck_terminal(void) {
             else       place_green(board, x, y);
         }
     /* Both have no moves since the board is full */
-    void *ss = mcgs_start_search(inst, board, true);   /* Blue to move */
+    void *ss = mcgs_start_search(inst, board, true, 0);   /* Blue to move */
     CHECK(ss != NULL, "start_search returned NULL");
     CHECK(mcgs_is_done(ss) == 1, "full board with count advantage must be terminal");
     mcgs_search_destroy(ss);
@@ -412,7 +411,7 @@ static void test_value_perspective_blue_winning(void) {
     place_blue(board,  3, 3);
     place_green(board, 3, 4);   /* one Green, adjacent to Blue */
 
-    void *ss = mcgs_start_search(inst, board, true);   /* Blue to move */
+    void *ss = mcgs_start_search(inst, board, true, 0);   /* Blue to move */
     CHECK(ss != NULL, "start_search returned NULL");
     run_full_search(ss, 0.0f);
 
@@ -433,7 +432,7 @@ static void test_value_perspective_green_winning(void) {
     place_green(board, 3, 3);
     place_blue(board,  3, 4);   /* one Blue, adjacent to Green */
 
-    void *ss = mcgs_start_search(inst, board, false);  /* Green to move */
+    void *ss = mcgs_start_search(inst, board, false, 0);  /* Green to move */
     CHECK(ss != NULL, "start_search returned NULL");
     run_full_search(ss, 0.0f);
 
@@ -455,7 +454,7 @@ static void test_policy_sums_to_one(void) {
     void *inst = mcgs_create(16, 1.0f, 8);
     bool board[7][7][2];
     board_start(board);
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
     run_full_search(ss, 0.0f);
     float result[1225];
@@ -473,7 +472,7 @@ static void test_policy_nonnegative(void) {
     void *inst = mcgs_create(16, 1.0f, 8);
     bool board[7][7][2];
     board_start(board);
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     run_full_search(ss, 0.0f);
     float result[1225];
     mcgs_get_result(ss, result);
@@ -503,7 +502,7 @@ static void test_policy_zero_on_opponent_pieces(void) {
     void *inst = mcgs_create(16, 1.0f, 8);
     bool board[7][7][2];
     board_start(board);
-    void *ss = mcgs_start_search(inst, board, true);   /* Blue to move */
+    void *ss = mcgs_start_search(inst, board, true, 0);   /* Blue to move */
     run_full_search(ss, 0.0f);
     float result[1225];
     mcgs_get_result(ss, result);
@@ -536,7 +535,7 @@ static void test_policy_nonzero_on_legal_moves(void) {
     void *inst = mcgs_create(16, 1.0f, 8);
     bool board[7][7][2];
     board_start(board);
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     run_full_search(ss, 0.0f);
     float result[1225];
     mcgs_get_result(ss, result);
@@ -559,7 +558,7 @@ static void test_tt_fully_cleared_between_games(void) {
     board_start(board);
 
     /* Game A */
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "game A: start_search returned NULL");
     run_full_search(ss, 0.5f);
     mcgs_search_destroy(ss);
@@ -572,7 +571,7 @@ static void test_tt_fully_cleared_between_games(void) {
           "from game A would corrupt game B's Q estimates");
 
     /* Game B: first search must see only fresh nodes */
-    ss = mcgs_start_search(inst, board, true);
+    ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "game B: start_search returned NULL");
     run_full_search(ss, 0.5f);
     mcgs_search_destroy(ss);
@@ -598,7 +597,7 @@ static void test_repeated_cycles_stay_bounded(void) {
     for (int g = 0; g < 6; g++) {
         mcgs_clear(inst);
         CHECK(mcgs_tt_size(inst) == 0, "TT must be 0 at start of each game");
-        void *ss = mcgs_start_search(inst, board, true);
+        void *ss = mcgs_start_search(inst, board, true, 0);
         CHECK(ss != NULL, "start_search returned NULL");
         run_full_search(ss, 0.0f);
         mcgs_search_destroy(ss);
@@ -636,14 +635,14 @@ static void test_fresh_root_after_clear(void) {
     bool board[7][7][2];
     board_start(board);
 
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     run_full_search(ss, 0.8f);   /* bias the value */
     mcgs_search_destroy(ss);
 
     mcgs_clear(inst);
 
     /* Start a new search but DON'T run it -- inspect root before any visits */
-    ss = mcgs_start_search(inst, board, true);
+    ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search after clear returned NULL");
     float rv = mcgs_get_root_value(ss);
     mcgs_search_destroy(ss);
@@ -668,7 +667,7 @@ static void test_two_instances_independent(void) {
     CHECK(mcgs_tt_size(inst_a) == 0, "inst_a must start empty");
     CHECK(mcgs_tt_size(inst_b) == 0, "inst_b must start empty");
 
-    void *ss = mcgs_start_search(inst_a, board, true);
+    void *ss = mcgs_start_search(inst_a, board, true, 0);
     run_full_search(ss, 0.0f);
     mcgs_search_destroy(ss);
 
@@ -690,7 +689,7 @@ static void test_oob_leaf_index_no_crash(void) {
     void *inst = mcgs_create(16, 1.0f, 8);
     bool board[7][7][2];
     board_start(board);
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
 
     bool out[7][7][2];
@@ -737,7 +736,7 @@ static void test_single_simulation(void) {
     void *inst = mcgs_create(1, 1.0f, 1);
     bool board[7][7][2];
     board_start(board);
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
     run_full_search(ss, 0.0f);
     CHECK(mcgs_is_done(ss) == 1, "N=1 search must complete");
@@ -760,7 +759,7 @@ static void test_k_larger_than_legal_moves(void) {
     board_clear(board);
     place_blue(board,  0, 0);
     place_green(board, 6, 6);
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
     run_full_search(ss, 0.0f);
     CHECK(mcgs_is_done(ss) == 1, "K>legal search must complete");
@@ -785,12 +784,12 @@ static void test_warm_tt_search_valid(void) {
     bool board[7][7][2];
     board_start(board);
 
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     run_full_search(ss, 0.0f);
     mcgs_search_destroy(ss);
 
     /* Second search: root is already expanded and in TT */
-    ss = mcgs_start_search(inst, board, true);
+    ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "second start_search returned NULL");
     run_full_search(ss, 0.0f);
     float result[1225];
@@ -803,54 +802,6 @@ static void test_warm_tt_search_valid(void) {
     PASS();
 }
 
-/*
- * Dirichlet noise must not produce negative priors or NaN in the result.
- */
-static void test_dirichlet_keeps_result_valid(void) {
-    TEST_BEGIN("dirichlet_keeps_result_valid");
-    void *inst = mcgs_create(16, 1.0f, 8);
-    bool board[7][7][2];
-    board_start(board);
-    float policy[1225];
-    uniform_policy(policy);
-
-    void *ss = mcgs_start_search(inst, board, true);
-    CHECK(ss != NULL, "start_search returned NULL");
-    CHECK(mcgs_pending_count(ss) == 1, "root must be first pending leaf");
-    mcgs_commit_expansion(ss, 0, policy, 0.0f);
-    mcgs_apply_root_dirichlet(ss, 0.3f, 0.25f);
-    mcgs_step(ss);
-
-    while (!mcgs_is_done(ss)) {
-        int n = mcgs_pending_count(ss);
-        for (int i = 0; i < n; i++)
-            mcgs_commit_expansion(ss, i, policy, 0.0f);
-        mcgs_step(ss);
-    }
-
-    float result[1225];
-    mcgs_get_result(ss, result);
-    float sum = 0.0f;
-    for (int i = 0; i < 1225; i++) {
-        if (result[i] < 0.0f) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "result[%d] = %.8f < 0 after Dirichlet", i, result[i]);
-            mcgs_search_destroy(ss);
-            mcgs_destroy(inst);
-            FAIL(msg);
-        }
-        if (result[i] != result[i]) {   /* NaN check */
-            mcgs_search_destroy(ss);
-            mcgs_destroy(inst);
-            FAIL("NaN in result after Dirichlet noise");
-        }
-        sum += result[i];
-    }
-    mcgs_search_destroy(ss);
-    mcgs_destroy(inst);
-    CHECK_EQ_F(sum, 1.0f, 1e-4f, "Dirichlet-perturbed policy must sum to 1.0");
-    PASS();
-}
 
 /* =========================================================================
  * Batch API consistency
@@ -864,7 +815,7 @@ static void test_batch_api_matches_individual(void) {
     void *inst = mcgs_create(8, 1.0f, 4);
     bool board[7][7][2];
     board_start(board);
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
 
     int n = mcgs_pending_count(ss);
@@ -942,7 +893,7 @@ static void test_make_move_clone_vs_jump(void) {
     place_blue(board,  3, 3);
     place_green(board, 6, 6);   /* far away, most Blue moves won't capture it */
 
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
     CHECK(mcgs_pending_count(ss) == 1, "root must be first pending leaf");
 
@@ -1062,7 +1013,7 @@ static void test_make_move_capture_works(void) {
     place_blue(board,  3, 3);
     place_green(board, 3, 4);
 
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
     run_full_search(ss, 0.0f);
 
@@ -1093,7 +1044,7 @@ static void test_make_move_jump_clears_source(void) {
     float policy[1225];
     uniform_policy(policy);
 
-    void *ss = mcgs_start_search(inst, board, true);
+    void *ss = mcgs_start_search(inst, board, true, 0);
     CHECK(ss != NULL, "start_search returned NULL");
 
     int steps = 0;
@@ -1134,6 +1085,118 @@ static void test_make_move_jump_clears_source(void) {
 /* =========================================================================
  * main
  * ========================================================================= */
+
+/* =========================================================================
+ * Halfmove clock (libataxx 50-move rule: draw after 100 plies w/o a clone)
+ * ========================================================================= */
+
+/* Blue at (3,3) fully ringed by Green: Blue's only moves are jumps. */
+static void jump_only_board(bool b[7][7][2]) {
+    board_clear(b);
+    place_blue(b, 3, 3);
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+            if (dx || dy) place_green(b, 3 + dx, 3 + dy);
+}
+
+/* Root at clock >= 100 is game over: search is immediately done, zero result. */
+static void test_clock_expired_root_is_done(void) {
+    TEST_BEGIN("clock_expired_root_is_done");
+    void *inst = mcgs_create(64, 1.0f, 8);
+    bool board[7][7][2];
+    jump_only_board(board);
+
+    void *ss = mcgs_start_search(inst, board, true, 100);
+    CHECK(ss != NULL, "start_search returned NULL");
+    CHECK(mcgs_is_done(ss), "search at clock 100 must be immediately done");
+    float result[1225];
+    mcgs_get_result(ss, result);
+    for (int i = 0; i < 1225; i++)
+        if (result[i] != 0.0f) {
+            mcgs_search_destroy(ss); mcgs_destroy(inst);
+            FAIL("clock-expired root must yield an all-zero result");
+        }
+    mcgs_search_destroy(ss);
+    mcgs_destroy(inst);
+    PASS();
+}
+
+/* At clock 99 in a jump-only position every root edge expires the clock, so
+ * every simulation backs up the draw value (root Q exactly 0) and the walk
+ * never descends past depth 1.  The same search at clock 0 must explore
+ * beyond the root's children (strictly more TT nodes). */
+static void test_clock_draw_paths_value_zero(void) {
+    TEST_BEGIN("clock_draw_paths_value_zero");
+    bool board[7][7][2];
+    jump_only_board(board);
+
+    void *inst = mcgs_create(64, 1.0f, 8);
+    void *ss = mcgs_start_search(inst, board, true, 99);
+    CHECK(ss != NULL, "start_search returned NULL");
+    run_full_search(ss, 0.9f);
+    float q99 = mcgs_get_root_value(ss);
+    int nodes99 = mcgs_tt_size(inst);
+    mcgs_search_destroy(ss);
+    mcgs_destroy(inst);
+
+    inst = mcgs_create(64, 1.0f, 8);
+    ss = mcgs_start_search(inst, board, true, 0);
+    CHECK(ss != NULL, "start_search returned NULL");
+    run_full_search(ss, 0.9f);
+    float q0 = mcgs_get_root_value(ss);
+    int nodes0 = mcgs_tt_size(inst);
+    mcgs_search_destroy(ss);
+    mcgs_destroy(inst);
+
+    CHECK(q99 > -0.01f && q99 < 0.01f,
+          "all-jump position at clock 99 must search to a draw (root Q = 0)");
+    CHECK(q0 != q99 || nodes0 > nodes99,
+          "clock-0 search must differ from the drawn clock-99 search");
+    CHECK(nodes0 > nodes99,
+          "clock-0 search must explore past depth 1 (clock-99 cannot)");
+    PASS();
+}
+
+/* Clone moves reset the clock: Blue at (3,3) with an empty neighbour gains
+ * one edge whose subtree stays searchable at clock 99, so the search must
+ * build strictly more TT nodes than the all-jumps position, where every edge
+ * expires the clock and the walk never descends past depth 1.
+ *
+ * (An earlier version asserted |root Q| > 0.1 instead; that only held for
+ * lucky RNG seeds - with a constant 0.9 leaf value the clone line backs up
+ * NEGATIVE for Blue, so a correct search concentrates visits on the drawing
+ * jumps and the root mean Q legitimately sits near 0.  gumbel_k = 32 >= all
+ * ~17 legal moves so the clone is always in the sampled candidate set
+ * regardless of the noise draw.) */
+static void test_clock_reset_on_clone(void) {
+    TEST_BEGIN("clock_reset_on_clone");
+    bool board[7][7][2];
+
+    /* Baseline: jump-only position - no searchable continuation at clock 99. */
+    jump_only_board(board);
+    void *inst = mcgs_create(64, 1.0f, 32);
+    void *ss = mcgs_start_search(inst, board, true, 99);
+    CHECK(ss != NULL, "start_search returned NULL");
+    run_full_search(ss, 0.9f);
+    int nodes_noclone = mcgs_tt_size(inst);
+    mcgs_search_destroy(ss);
+    mcgs_destroy(inst);
+
+    /* Open (2,2): Blue gains a clone move, whose subtree must be searched. */
+    jump_only_board(board);
+    board[2][2][0] = false;
+    inst = mcgs_create(64, 1.0f, 32);
+    ss = mcgs_start_search(inst, board, true, 99);
+    CHECK(ss != NULL, "start_search returned NULL");
+    run_full_search(ss, 0.9f);
+    int nodes_clone = mcgs_tt_size(inst);
+    mcgs_search_destroy(ss);
+    mcgs_destroy(inst);
+
+    CHECK(nodes_clone > nodes_noclone,
+          "clone move must reset the clock and open a searchable subtree");
+    PASS();
+}
 
 int main(void) {
     mcgs_init();
@@ -1187,13 +1250,16 @@ int main(void) {
     test_single_simulation();
     test_k_larger_than_legal_moves();
     test_warm_tt_search_valid();
-    test_dirichlet_keeps_result_valid();
     test_batch_api_matches_individual();
 
     /* make_move correctness */
     test_make_move_clone_vs_jump();
     test_make_move_capture_works();
     test_make_move_jump_clears_source();
+
+    test_clock_expired_root_is_done();
+    test_clock_draw_paths_value_zero();
+    test_clock_reset_on_clone();
 
     printf("\n=== Results: %d/%d passed", g_tests - g_failures, g_tests);
     if (g_failures == 0) printf(" -- ALL PASSED ===\n");

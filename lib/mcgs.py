@@ -1,9 +1,7 @@
 """
 Gumbel AlphaZero MCGS backed by micro_mcts.c (C extension via ctypes).
 
-The C extension manages the search tree and transposition table in C heap
-memory (malloc/free), eliminating the Python arena allocator leak that
-accumulates ~8 MB per game when the Python-object MCGS graph is used.
+The C extension manages the search tree and transposition table on a slab.
 
 Network inference still happens in Python; the step-wise interface lets the
 game pool batch leaf evaluations across all concurrent games into one GPU pass.
@@ -18,64 +16,17 @@ from __future__ import annotations
 import ctypes
 import pathlib
 import sys
+import warnings
 import numpy as np
 import numpy.typing as npt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lib.t7g import (
-    Board,
-    count_cells, ACTION_TO_DEST,
-)
+from lib.t7g import Board
 
 
-#  Search heuristics 
-
-def _heuristic_value(board: Board, turn: bool) -> float:
-    """
-    Raw cell-count value from the current player's perspective, normalised to
-    [-1, 1].  Pure numpy - no C minimax call, negligible overhead per leaf.
-    """
-    blue, green = count_cells(board)
-    total = blue + green
-    if total == 0:
-        return 0.0
-    return (blue - green) / total if turn else (green - blue) / total
-
-
-def _capture_heuristic_49(board: Board, turn: bool) -> npt.NDArray[np.float32]:
-    """
-    49-dim destination prior: captures (adjacent opponent pieces) plus a clone
-    reachability bonus.  Cloning adds a piece unconditionally so clone-reachable
-    destinations are preferred over jump-only destinations even with zero captures.
-    A small floor (1e-2) keeps all destinations in the distribution.
-    """
-    own = board[:, :, 1 if turn else 0].astype(np.float32)
-    opp = board[:, :, 0 if turn else 1].astype(np.float32)
-    kernel = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
-              if not (dy == 0 and dx == 0)]
-    own_pad = np.pad(own, 1, mode='constant')
-    opp_pad = np.pad(opp, 1, mode='constant')
-    own_neighbors = np.stack(
-        [own_pad[1+dy:8+dy, 1+dx:8+dx] for dy, dx in kernel], axis=0).sum(axis=0)
-    opp_neighbors = np.stack(
-        [opp_pad[1+dy:8+dy, 1+dx:8+dx] for dy, dx in kernel], axis=0).sum(axis=0)
-    h = opp_neighbors + 0.3 * (own_neighbors > 0).astype(np.float32) + 1e-2
-    return (h / h.sum()).flatten().astype(np.float32)
-
-
-def _capture_heuristic_1225(board: Board, turn: bool) -> npt.NDArray[np.float32]:
-    """1225-dim version: broadcast the 49-dim capture heuristic via ACTION_TO_DEST."""
-    h49 = _capture_heuristic_49(board, turn)
-    h = np.zeros(1225, dtype=np.float32)
-    valid = ACTION_TO_DEST >= 0
-    h[valid] = h49[ACTION_TO_DEST[valid]]
-    total = h.sum()
-    return h / total if total > 0 else h
-
-
-#  DLL loading 
+#  DLL loading
 
 def _find_mcts_dll() -> pathlib.Path:
     suffixes = [".dll"] if sys.platform == "win32" else [".so"]
@@ -105,36 +56,49 @@ _lib.mcgs_init.restype  = None
 _lib.mcgs_create.argtypes = [ctypes.c_int, ctypes.c_float, ctypes.c_int]
 _lib.mcgs_create.restype  = ctypes.c_void_p
 
+# Arena-sized constructor: the TT persists across a game's moves, so a high
+# simulation budget needs a much larger node/edge arena than the default (see
+# the slab-capacity comment in src/micro_mcts.c).
+_lib.mcgs_create_ex.argtypes = [ctypes.c_int, ctypes.c_float, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int]
+_lib.mcgs_create_ex.restype  = ctypes.c_void_p
+
 _lib.mcgs_clear.argtypes = [ctypes.c_void_p]
 _lib.mcgs_clear.restype  = None
 
-# Optional export (present from 2026-07-10 builds); guarded at call sites so
-# older .so/.dll binaries keep working as long as sigma_scale stays 1.0.
-if hasattr(_lib, "mcgs_set_sigma_scale"):
-    _lib.mcgs_set_sigma_scale.argtypes = [ctypes.c_void_p, ctypes.c_float]
-    _lib.mcgs_set_sigma_scale.restype  = None
+# All exports below are REQUIRED; stale binaries fail loudly here rather than
+# silently degrading - rebuild via `make dll dll-native`.
+_lib.mcgs_set_sigma_scale.argtypes = [ctypes.c_void_p, ctypes.c_float]
+_lib.mcgs_set_sigma_scale.restype  = None
 
-# 2026-07-11 target-noise fix exports: SH-winner action + completion shrinkage.
-# Required - the temp-0 play path depends on them; rebuild via `make dll dll-native`.
 _lib.mcgs_get_best_action.argtypes = [ctypes.c_void_p]
 _lib.mcgs_get_best_action.restype  = ctypes.c_int
 
 _lib.mcgs_set_completion_n0.argtypes = [ctypes.c_void_p, ctypes.c_float]
 _lib.mcgs_set_completion_n0.restype  = None
 
+_lib.mcgs_set_num_simulations.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_lib.mcgs_set_num_simulations.restype  = None
+
 _lib.mcgs_destroy.argtypes = [ctypes.c_void_p]
 _lib.mcgs_destroy.restype  = None
 
 _lib.mcgs_tt_size.argtypes = [ctypes.c_void_p]
 _lib.mcgs_tt_size.restype  = ctypes.c_int
+_lib.mcgs_edge_used.argtypes = [ctypes.c_void_p]
+_lib.mcgs_edge_used.restype  = ctypes.c_int
 
 # search lifecycle
 _lib.mcgs_start_search.argtypes = [
     ctypes.c_void_p,              # MCGSInstance*
-    ctypes.POINTER(ctypes.c_bool),  # bool py_board[7][7][2]  (flat 98 bytes)
+    ctypes.c_void_p,              # bool py_board[7][7][2] (flat 98 bytes) — void* to skip cast
     ctypes.c_bool,                # bool turn
+    ctypes.c_int,                 # int clock (halfmove clock at root)
 ]
 _lib.mcgs_start_search.restype = ctypes.c_void_p  # MCGSSearchState*
+
+_lib.mcgs_set_clock_obs.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_lib.mcgs_set_clock_obs.restype  = None
 
 _lib.mcgs_search_destroy.argtypes = [ctypes.c_void_p]
 _lib.mcgs_search_destroy.restype  = None
@@ -169,15 +133,13 @@ _lib.mcgs_get_result.restype  = None
 _lib.mcgs_get_root_value.argtypes = [ctypes.c_void_p]
 _lib.mcgs_get_root_value.restype  = ctypes.c_float
 
-_lib.mcgs_apply_root_dirichlet.argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_float]
-_lib.mcgs_apply_root_dirichlet.restype  = None
-
-_lib.mcgs_get_pending_boards.argtypes = [
+# obs-assembly fold: writes perspective-flipped float32 obs straight into the
+# batch buffer, skipping the bool-board + np.concatenate + np.where CPU work.
+_lib.mcgs_get_pending_obs.argtypes = [
     ctypes.c_void_p,
-    ctypes.c_void_p,                 # bool boards_out[n * 98] — pass as void* to skip ctypes.cast
-    ctypes.c_void_p,                 # bool turns_out[n]       — skip ctypes.cast overhead
+    ctypes.c_void_p,                 # float obs_out[n * 196] — void* to skip ctypes.cast
 ]
-_lib.mcgs_get_pending_boards.restype = ctypes.c_int
+_lib.mcgs_get_pending_obs.restype = ctypes.c_int
 
 _lib.mcgs_commit_batch.argtypes = [
     ctypes.c_void_p,
@@ -187,7 +149,52 @@ _lib.mcgs_commit_batch.argtypes = [
 ]
 _lib.mcgs_commit_batch.restype = None
 
+# Multi-search batch API: the pool makes ONE ctypes call per group per phase
+# instead of one per slot (step/done/pending/obs/commit were ~4M ctypes
+# crossings per minute at pool 512 - ~10% of self-play wall clock).
+# All take a uintp array of MCGSSearchState* as void*.
+_lib.mcgs_step_many.argtypes = [
+    ctypes.c_void_p,                 # MCGSSearchState *ss_arr[n]
+    ctypes.c_int,
+    ctypes.c_void_p,                 # int32 done_out[n]
+]
+_lib.mcgs_step_many.restype = None
+
+_lib.mcgs_pending_counts.argtypes = [
+    ctypes.c_void_p,                 # MCGSSearchState *ss_arr[n]
+    ctypes.c_int,
+    ctypes.c_void_p,                 # int32 counts_out[n]
+]
+_lib.mcgs_pending_counts.restype = None
+
+_lib.mcgs_get_pending_obs_many.argtypes = [
+    ctypes.c_void_p,                 # MCGSSearchState *ss_arr[n]
+    ctypes.c_int,
+    ctypes.c_void_p,                 # float obs_out[total * 196]
+]
+_lib.mcgs_get_pending_obs_many.restype = ctypes.c_int
+
+_lib.mcgs_commit_batch_many.argtypes = [
+    ctypes.c_void_p,                 # MCGSSearchState *ss_arr[n]
+    ctypes.c_void_p,                 # int32 counts[n]
+    ctypes.c_int,
+    ctypes.c_void_p,                 # float policies_flat[total * 1225]
+    ctypes.c_void_p,                 # float values[total]
+]
+_lib.mcgs_commit_batch_many.restype = None
+
 _lib.mcgs_init()
+
+
+# Pad inference batches up to the next power-of-two bucket.  Defaults on for
+# ROCm, where MIOpen re-searches conv kernels for every distinct batch shape
+# (no immediate-mode find-db on gfx1151) - unpadded, self-play throughput
+# collapses ~17x as the pending-leaf count varies step to step.  Also required
+# (and set by train_mcts --cudagraphs) when inference is compiled with
+# mode="reduce-overhead": CUDA graphs record one graph per input shape, so the
+# shape set must stay small.  No-op cost elsewhere: padded rows are sliced off
+# after the forward.
+PAD_BATCH_POW2 = bool(torch.version.hip)
 
 
 #  Pending leaf proxy 
@@ -232,11 +239,10 @@ class MCGSSearch:
       4. Repeat until done is True, then read result.
     """
 
-    __slots__ = ['_ptr', '_root_expanded']
+    __slots__ = ['_ptr']
 
     def __init__(self, ptr: int) -> None:
         self._ptr = ptr
-        self._root_expanded = False
 
     def __del__(self) -> None:
         if self._ptr:
@@ -294,6 +300,22 @@ class MCGSSearch:
         _lib.mcgs_step(self._ptr)
 
 
+def _search_ptr_array(searches: 'list[MCGSSearch]') -> npt.NDArray[np.uintp]:
+    """Pack search-state pointers into a uintp array for the *_many C calls."""
+    return np.fromiter(((ss._ptr or 0) for ss in searches),
+                       dtype=np.uintp, count=len(searches))
+
+
+def step_searches(searches: 'list[MCGSSearch]') -> npt.NDArray[np.int32]:
+    """Step every search once (one C call) and return per-search done flags."""
+    n = len(searches)
+    done = np.empty(n, dtype=np.int32)
+    if n:
+        ptrs = _search_ptr_array(searches)
+        _lib.mcgs_step_many(ptrs.ctypes.data, n, done.ctypes.data)
+    return done
+
+
 #  MCGS - search driver 
 
 class _TTProxy:
@@ -321,33 +343,43 @@ class MCGS:
         num_simulations: int = 100,
         c_puct: float = 0.75,
         gumbel_k: int = 8,
-        dirichlet_alpha: float = 0.0,
-        dirichlet_eps: float = 0.0,
         sigma_scale: float = 1.0,
         completion_n0: float | None = None,
+        clock_obs: bool | None = None,
+        node_cap: int = 0,
+        edge_cap: int = 0,
     ) -> None:
         self.network         = network
         self.num_simulations = num_simulations
         self.c_puct          = c_puct
         self.gumbel_k        = gumbel_k
-        self.dirichlet_alpha = dirichlet_alpha
-        self.dirichlet_eps   = dirichlet_eps
         self.sigma_scale     = sigma_scale
         self.completion_n0   = completion_n0
         self.last_root_value: float = 0.0
         self.last_best_action: int = -1
         self._device         = next(network.parameters()).device
-        self._ptr            = _lib.mcgs_create(
+        self._ptr            = _lib.mcgs_create_ex(
             num_simulations, ctypes.c_float(c_puct), gumbel_k,
+            int(node_cap), int(edge_cap),
         )
+        if not self._ptr:
+            raise MemoryError(
+                f"mcgs_create_ex failed (node_cap={node_cap}, edge_cap={edge_cap}); "
+                "the arena request was probably too large"
+            )
         if sigma_scale != 1.0:
-            if not hasattr(_lib, "mcgs_set_sigma_scale"):
-                raise RuntimeError(
-                    "sigma_scale != 1.0 requires a micro_mcts build with "
-                    "mcgs_set_sigma_scale (rebuild via `make lib/micro_mcts.so`)")
             _lib.mcgs_set_sigma_scale(self._ptr, ctypes.c_float(sigma_scale))
         if completion_n0 is not None:
             _lib.mcgs_set_completion_n0(self._ptr, ctypes.c_float(completion_n0))
+        if clock_obs is None:
+            # Auto: net2 nets train with the halfmove clock in obs ch3; legacy
+            # nets trained with an all-zero plane and must keep seeing zeros.
+            # (Unwrap torch.compile's OptimizedModule before the arch check.)
+            from lib.net2 import Net2
+            clock_obs = isinstance(getattr(network, '_orig_mod', network), Net2)
+        self.clock_obs = bool(clock_obs)
+        if self.clock_obs:
+            _lib.mcgs_set_clock_obs(self._ptr, 1)
 
     def __del__(self) -> None:
         ptr = getattr(self, '_ptr', None)
@@ -369,6 +401,11 @@ class MCGS:
         pass  # no-op in C version - TT serves the same purpose
 
     @property
+    def edge_used(self) -> int:
+        """Edge-slab high-water mark - the binding arena constraint (see C side)."""
+        return _lib.mcgs_edge_used(self._ptr)
+
+    @property
     def transposition_table(self) -> _TTProxy:
         """Monitoring proxy: len() returns C TT node count."""
         return _TTProxy(self._ptr)
@@ -377,8 +414,23 @@ class MCGS:
         """Free all C nodes and reset the transposition table."""
         _lib.mcgs_clear(self._ptr)
 
+    def set_num_simulations(self, n: int) -> None:
+        """Change the per-search simulation budget (takes effect at the next
+        start_search; in-flight searches keep the N they were started with)."""
+        if not hasattr(_lib, "mcgs_set_num_simulations"):
+            raise RuntimeError(
+                "per-move simulation budgets require a micro_mcts build with "
+                "mcgs_set_num_simulations (rebuild via `make dll`)")
+        self.num_simulations = n
+        _lib.mcgs_set_num_simulations(self._ptr, n)
+
     def advance_tree(self, action: int) -> None:  # noqa: ARG002
         """No-op: the TT persists across moves so Q-values are reused automatically."""
+
+    def set_clock_obs(self, enable: bool) -> None:
+        """Expose the halfmove clock as obs channel 3 (clock/100).  Keep off
+        for legacy nets, which were trained with an all-zero channel 3."""
+        _lib.mcgs_set_clock_obs(self._ptr, 1 if enable else 0)
 
     def start_search(
         self,
@@ -386,14 +438,19 @@ class MCGS:
         turn: bool,
         hint_root: object = None,  # ignored in C version
         move_count: int | None = None,
+        clock: int = 0,
     ) -> MCGSSearch:
-        """Start a step-wise search. hint_root is accepted but not used."""
-        import warnings
+        """Start a step-wise search. hint_root is accepted but not used.
+
+        clock is the halfmove clock at the root (plies since the last clone
+        move, counting jumps and passes); search walks tick/reset it per edge
+        and value clock-expired continuations as draws."""
         board_c = np.ascontiguousarray(board, dtype=np.bool_)
         ptr = _lib.mcgs_start_search(
             self._ptr,
-            board_c.ctypes.data_as(ctypes.POINTER(ctypes.c_bool)),
+            board_c.ctypes.data,
             ctypes.c_bool(turn),
+            ctypes.c_int(clock),
         )
         if not ptr:
             tt_size = _lib.mcgs_tt_size(self._ptr)
@@ -406,8 +463,9 @@ class MCGS:
             _lib.mcgs_clear(self._ptr)
             ptr = _lib.mcgs_start_search(
                 self._ptr,
-                board_c.ctypes.data_as(ctypes.POINTER(ctypes.c_bool)),
+                board_c.ctypes.data,
                 ctypes.c_bool(turn),
+                ctypes.c_int(clock),
             )
             if not ptr:
                 warnings.warn(
@@ -417,14 +475,15 @@ class MCGS:
                 )
         return MCGSSearch(ptr)
 
-    def search(self, board: Board, turn: bool) -> npt.NDArray[np.float32]:
+    def search(self, board: Board, turn: bool,
+               clock: int = 0) -> npt.NDArray[np.float32]:
         """
         Run Gumbel MCGS from position (single-game, non-batched).
 
         Returns improved action probability distribution (1225 floats).
         After returning, self.last_root_value holds the root Q (mover's perspective).
         """
-        ss = self.start_search(board, turn)
+        ss = self.start_search(board, turn, clock=clock)
         while not ss.done:
             self._expand_batch([ss])
             ss.step()
@@ -444,50 +503,33 @@ class MCGS:
         thread returns *without* syncing, so the caller can do CPU-side
         work on a different group of searches while the GPU is busy here.
         """
-        seg_searches: list[MCGSSearch] = []
-        seg_ptrs: list[int] = []
-        seg_counts: list[int] = []
-        board_segs: list[npt.NDArray] = []
-        turn_segs:  list[npt.NDArray] = []
-
-        for ss in searches:
-            n = _lib.mcgs_pending_count(ss._ptr)
-            if n == 0:
-                continue
-            boards = np.empty((n, 7, 7, 2), dtype=np.bool_)
-            turns  = np.empty(n, dtype=np.bool_)
-            _lib.mcgs_get_pending_boards(
-                ss._ptr,
-                boards.ctypes.data,
-                turns.ctypes.data,
-            )
-            board_segs.append(boards)
-            turn_segs.append(turns)
-            seg_searches.append(ss)
-            seg_ptrs.append(ss._ptr)
-            seg_counts.append(n)
-
-        if not board_segs:
+        # Pass 1: collect pending counts per slot (one C call for the whole
+        # group). The C pending set is stable until mcgs_step/commit, so it's
+        # safe to read counts now and fetch the obs in a second pass below.
+        n_searches = len(searches)
+        if n_searches == 0:
+            return None
+        seg_ptrs = _search_ptr_array(searches)
+        seg_counts = np.empty(n_searches, dtype=np.int32)
+        _lib.mcgs_pending_counts(seg_ptrs.ctypes.data, n_searches,
+                                 seg_counts.ctypes.data)
+        N = int(seg_counts.sum())
+        if N == 0:
             return None
 
-        boards_all = np.concatenate(board_segs)   # (N, 7, 7, 2)
-        turns_all  = np.concatenate(turn_segs)    # (N,)
-        N = len(turns_all)
+        # Pow2 batch-shape bucketing - see PAD_BATCH_POW2 above; the padded
+        # rows are sliced off again below.
+        N_pad = (1 << (N - 1).bit_length()) if PAD_BATCH_POW2 else N
 
-        # ROCm/gfx1151: MIOpen re-searches conv kernels for every distinct
-        # batch shape (no immediate-mode find-db for this arch), which
-        # collapses self-play throughput ~17x as the pending-leaf count
-        # varies from step to step. Pad the batch up to the next power-of-two
-        # bucket so at most ~log2(max) shapes are ever compiled; the padded
-        # rows are sliced off again below. No-op on CUDA, where cuDNN/compile
-        # handle dynamic shapes without a per-shape penalty.
-        N_pad = (1 << (N - 1).bit_length()) if torch.version.hip else N
-
-        t = turns_all[:, None, None]
-        obs_batch = np.zeros((N_pad, 7, 7, 4), dtype=np.float32)
-        obs_batch[:N, :, :, 0] = np.where(t, boards_all[:, :, :, 0], boards_all[:, :, :, 1])
-        obs_batch[:N, :, :, 1] = np.where(t, boards_all[:, :, :, 1], boards_all[:, :, :, 0])
-        obs_batch[:N, :, :, 2] = 1.0
+        # C writes the perspective-flipped float32 obs for every slot straight
+        # into the batch buffer in one call (board_to_obs folded into the
+        # bitboard unpack). No bool boards, no concatenate, no np.where.
+        # Only the ROCm padding rows need explicit zeroing.
+        obs_batch = np.empty((N_pad, 7, 7, 4), dtype=np.float32)
+        if N_pad > N:
+            obs_batch[N:] = 0.0
+        _lib.mcgs_get_pending_obs_many(seg_ptrs.ctypes.data, n_searches,
+                                       obs_batch.ctypes.data)
 
         # CUDA fast path: pinned H2D + BF16 autocast forward + async D2H
         # into pinned host buffers, with a CUDA event to signal D2H done.
@@ -533,40 +575,26 @@ class MCGS:
                 values_cpu = values.float().cpu()
             event = None
 
-        return (policy_cpu, values_cpu, event, seg_searches, seg_ptrs, seg_counts)
+        return (policy_cpu, values_cpu, event, seg_ptrs, seg_counts, n_searches)
 
     def _collect_and_commit(self, handle) -> None:
         """
-        Sync the CUDA event produced by `_launch_forward`, then commit each
-        slot's (policy, value) slab back to the C side.  Safe to call with
-        `handle=None` (no-op) so pool code doesn't need to special-case
-        empty launches.
+        Sync the CUDA event produced by `_launch_forward`, then commit the
+        whole (policy, value) slab back to the C side in one call.  Safe to
+        call with `handle=None` (no-op) so pool code doesn't need to
+        special-case empty launches.
         """
         if handle is None:
             return
-        policy_cpu, values_cpu, event, seg_searches, seg_ptrs, seg_counts = handle
+        policy_cpu, values_cpu, event, seg_ptrs, seg_counts, n_searches = handle
         if event is not None:
             event.synchronize()
-        policy_probs = policy_cpu.numpy()
-        values_np    = values_cpu.numpy().flatten()
-
-        offset = 0
-        for ss, ptr, n in zip(seg_searches, seg_ptrs, seg_counts):
-            _lib.mcgs_commit_batch(
-                ptr,
-                policy_probs[offset:offset + n].ctypes.data,
-                values_np[offset:offset + n].ctypes.data,
-                ctypes.c_int(n),
-            )
-            if not ss._root_expanded:
-                if self.dirichlet_alpha > 0.0:
-                    _lib.mcgs_apply_root_dirichlet(
-                        ptr,
-                        ctypes.c_float(self.dirichlet_alpha),
-                        ctypes.c_float(self.dirichlet_eps),
-                    )
-                ss._root_expanded = True
-            offset += n
+        policy_probs = np.ascontiguousarray(policy_cpu.numpy())
+        values_np    = np.ascontiguousarray(values_cpu.numpy()).reshape(-1)
+        _lib.mcgs_commit_batch_many(
+            seg_ptrs.ctypes.data, seg_counts.ctypes.data, n_searches,
+            policy_probs.ctypes.data, values_np.ctypes.data,
+        )
 
     def _expand_batch(self, searches: 'list[MCGSSearch]') -> None:
         """
@@ -596,7 +624,10 @@ class MCGS:
             if best_action is not None and best_action >= 0:
                 return int(best_action)
             return int(np.argmax(action_probs))
-        probs = action_probs ** (1.0 / temperature)
+        if temperature == 1.0:
+            probs = action_probs.copy()   # x**1.0 == x bit-exactly; skip the pow
+        else:
+            probs = action_probs ** (1.0 / temperature)
         total = probs.sum()
         if total > 0:
             probs /= total

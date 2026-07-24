@@ -195,7 +195,7 @@ def test_reset_slot_clears_mcts_state(network):
     )
     assert slot.move_count == 0
     assert slot.examples == []
-    assert slot.board_history == {}
+    assert slot.clock == 0
 
 
 #  Policy invariants 
@@ -280,14 +280,15 @@ def test_value_targets_are_current_player_relative():
     slot = _GameSlot(MCGS(net, num_simulations=16))
 
     # Manually craft one example: Blue's turn, Blue wins (+1 from Blue's perspective).
-    # Internal example format: (obs, policy, turn, board, root_q, move_idx).
+    # Internal example format: (obs, policy, turn, board, root_q, move_idx, full_move).
     board = new_board()
     obs = board_to_obs(board, turn=True)
-    slot.examples = [(obs, np.ones(1225) / 1225, True, board.copy(), 0.0, 0)]
+    slot.examples = [(obs, np.ones(1225) / 1225, True, board.copy(), 0.0, 0, True)]
 
     # winner=+1.0 means Blue won.
     examples, _, _, _, _, _ = _slot_result(slot, winner=1.0)
-    obs_out, policy_out, value_out, margin_out, own_out, _, _, root_q_out, qw_out = examples[0]
+    (obs_out, policy_out, value_out, margin_out, own_out,
+     _, _, root_q_out, qw_out, st_out) = examples[0]
 
     # Default blend_alpha=1.0: blending off, q_weight must be exactly 0.
     assert qw_out == 0.0
@@ -304,9 +305,15 @@ def test_value_targets_are_current_player_relative():
 
     # Same board, Green's turn, Blue still wins (winner=+1 from Blue).
     slot.examples = [(board_to_obs(board, turn=False), np.ones(1225) / 1225,
-                      False, board.copy(), 0.0, 0)]
+                      False, board.copy(), 0.0, 0, True)]
     examples, _, _, _, _, _ = _slot_result(slot, winner=1.0)
-    _, _, value_out_green, margin_out_green, own_out_green, _, _, _, _ = examples[0]
+    (_, _, value_out_green, margin_out_green, own_out_green,
+     _, _, _, _, st_out_green) = examples[0]
+
+    # Short-term value targets are side-to-move relative too: with root_q=0
+    # everywhere, s_i = lambda^(n-i) * z from each side's perspective.
+    assert (st_out > 0).all() and (st_out_green < 0).all()
+    assert np.allclose(st_out, -st_out_green)
 
     # Green-turn ownership must be the perspective swap of Blue-turn's map.
     swap = own_out_green.copy()
@@ -320,3 +327,51 @@ def test_value_targets_are_current_player_relative():
         "Green-turn example with Blue winning must have value_target=-1.0 "
         "(Green is losing - current-player-relative)"
     )
+
+#  Halfmove clock (libataxx 50-move rule)
+
+def _jump_only_board():
+    """Blue at (3,3) fully ringed by Green: Blue's only moves are jumps."""
+    ring = [(3 + dx, 3 + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+            if dx or dy]
+    return make_board([(3, 3)], ring)
+
+
+def test_tick_clock_semantics():
+    from lib.t7g import tick_clock, move_to_action, PASS_ACTION
+    clone = move_to_action(3, 3, 2 + 1, 2 + 0)   # dx=+1 -> mv coords (3,2)
+    jump = move_to_action(3, 3, 2 + 2, 2 + 0)    # dx=+2
+    assert tick_clock(7, clone) == 0, "clone must reset the clock"
+    assert tick_clock(7, jump) == 8, "jump must tick the clock"
+    assert tick_clock(7, PASS_ACTION) == 8, "pass must tick the clock"
+
+
+def test_board_to_obs_clock_channel():
+    from lib.t7g import CLOCK_LIMIT
+    board = new_board()
+    obs0 = board_to_obs(board, True)
+    assert np.all(obs0[:, :, 3] == 0.0), "default obs keeps channel 3 zero"
+    obs50 = board_to_obs(board, True, clock=50)
+    assert np.allclose(obs50[:, :, 3], 50.0 / CLOCK_LIMIT)
+    assert np.array_equal(obs0[:, :, :3], obs50[:, :, :3]), \
+        "clock must only touch channel 3"
+
+
+def test_search_clock_draw(mcts):
+    """At clock 99 every move in a jump-only position expires the clock:
+    the search must value the root as a draw (Q = 0) despite Blue being
+    down 1 piece to 8."""
+    board = _jump_only_board()
+    mcts.search(board, True, clock=99)
+    assert abs(mcts.last_root_value) < 1e-6
+    mcts.clear()
+    mcts.search(board, True, clock=0)
+    # sanity: same position searched normally is not a forced draw
+    assert len(mcts.transposition_table) > 0
+
+
+def test_search_clock_expired_root_done(mcts):
+    """clock >= 100 at the root is game over: zero result, like a terminal."""
+    probs = mcts.search(_jump_only_board(), True, clock=100)
+    assert not np.any(probs)
+    assert mcts.last_best_action == -1

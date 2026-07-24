@@ -161,41 +161,6 @@ _hmcts_lib   = _LazyLib("micro_mcts_heuristic", _setup_hmcts)
 _compy3_lib  = _LazyLib("compy3",               _setup_compy3)
 
 
-def soft_policy_from_mm(
-    board: Board, depth: int, as_blue: bool, temperature: float = 0.02,
-    engine: str = 'micro3',
-) -> npt.NDArray[numpy.float32]:
-    """
-    Soft policy derived from minimax-N scores over all legal moves.
-
-    Scores all legal moves at *depth* via score_root_moves, then applies softmax
-    at *temperature* to produce a probability distribution.  Lower temperature
-    concentrates mass on the best move; temperature=0.02 keeps a small amount of
-    exploration while essentially following the best move.
-
-    Returns a 1225-length float32 array (zero on illegal moves).
-    Falls back to a zero array if score_root_moves is unavailable.
-    """
-    lib = _micro3_lib if engine == 'micro3' else _minimax_lib
-    out = numpy.full(1225, -2.0, dtype=numpy.float32)
-    board_c = numpy.ascontiguousarray(board, dtype=numpy.bool_)
-    lib.score_root_moves(
-        board_c.ctypes.data_as(ctypes.POINTER(ctypes.c_bool)),
-        ctypes.c_int(depth),
-        ctypes.c_bool(as_blue),
-        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-    )
-    legal_mask = out > -1.5
-    policy = numpy.zeros(1225, dtype=numpy.float32)
-    if numpy.any(legal_mask):
-        scores = out[legal_mask].astype(numpy.float64) / temperature
-        scores -= scores.max()
-        probs = numpy.exp(scores)
-        probs /= probs.sum()
-        policy[legal_mask] = probs.astype(numpy.float32)
-    return policy
-
-
 def count_cells(board: Board) -> tuple[int, int]:
     return int(numpy.count_nonzero(board[:, :, 1])), int(numpy.count_nonzero(board[:, :, 0]))
 
@@ -222,6 +187,24 @@ def str_board(board: Board) -> str:
 
 def flip_board(board: Board) -> Board:
     return numpy.rot90(board[:, :, ::-1])
+
+
+# libataxx halfmove clock (kz04px community rules, adopted 2026-07-18): the
+# game is drawn after CLOCK_LIMIT plies without a clone move.  Clones reset
+# the clock; jumps and passes tick it.  Replaces threefold repetition, whose
+# path-dependence made it invisible to the search and mislabelled 98% of
+# "draws" (241/245 repetition games had unequal material, up to 17 pieces).
+CLOCK_LIMIT = 100
+PASS_ACTION = 1225
+
+
+def tick_clock(clock: int, action: int) -> int:
+    """Advance the halfmove clock for one applied action (or pass)."""
+    if action == PASS_ACTION:
+        return clock + 1
+    mv = action % 25
+    is_jump = abs((mv % 5) - 2) == 2 or abs((mv // 5) - 2) == 2
+    return clock + 1 if is_jump else 0
 
 
 def action_to_move(action: int) -> tuple[int, int, int, int, bool]:
@@ -388,21 +371,21 @@ def apply_move(board: Board, action: int, as_blue: bool) -> Board:
         new_board: 7x7x2 numpy bool array (copy of input with move applied)
     """
     board = board.copy()
-    player_cell = BLUE if as_blue else GREEN
-    opponent_cell = GREEN if as_blue else BLUE
+    pc = 1 if as_blue else 0   # player channel  (BLUE=[0,1] -> ch1, GREEN=[1,0] -> ch0)
+    oc = 1 - pc                # opponent channel
 
     from_x, from_y, to_x, to_y, jump = action_to_move(action)
 
     if jump:
-        board[from_y, from_x] = CLEAR
-    board[to_y, to_x] = player_cell
+        board[from_y, from_x] = False
+    board[to_y, to_x, pc] = True
+    board[to_y, to_x, oc] = False
 
-    for dx in range(-1, 2):
-        for dy in range(-1, 2):
-            nx, ny = to_x + dx, to_y + dy
-            if 0 <= nx < 7 and 0 <= ny < 7:
-                if numpy.array_equal(board[ny, nx], opponent_cell):
-                    board[ny, nx] = player_cell
+    # Capture: flip opponent pieces in the 3x3 neighbourhood of the destination
+    # (cells are channel-exclusive, so "opponent present" == opponent channel).
+    hood = board[max(0, to_y - 1):to_y + 2, max(0, to_x - 1):to_x + 2]
+    hood[:, :, pc] |= hood[:, :, oc]
+    hood[:, :, oc] = False
 
     return board
 
@@ -563,7 +546,7 @@ def new_board() -> Board:
     return board
 
 
-def board_to_obs(board: Board, turn: bool) -> Obs:
+def board_to_obs(board: Board, turn: bool, clock: int = 0) -> Obs:
     """
     Convert a 7x7x2 board + turn flag to a 7x7x4 float32 observation.
 
@@ -571,7 +554,8 @@ def board_to_obs(board: Board, turn: bool) -> Obs:
       channel 0 = opponent pieces
       channel 1 = my pieces (current player)
       channel 2 = 1.0 (constant; kept for architecture compatibility)
-      channel 3 = 0.0 (unused)
+      channel 3 = halfmove clock / CLOCK_LIMIT (0 for legacy nets, which
+                  were trained with this plane all-zero)
 
     This prevents the value head from shortcutting on the turn indicator
     and forces it to learn from actual piece positions.
@@ -584,6 +568,8 @@ def board_to_obs(board: Board, turn: bool) -> Obs:
         obs[:, :, 0] = board[:, :, 1].astype(numpy.float32)
         obs[:, :, 1] = board[:, :, 0].astype(numpy.float32)
     obs[:, :, 2] = 1.0
+    if clock:
+        obs[:, :, 3] = float(clock) / float(CLOCK_LIMIT)
     return obs
 
 
