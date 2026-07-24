@@ -1,0 +1,62 @@
+name: Deploy webapp to GitHub Pages
+
+# Builds the self-contained SPA and publishes it to GitHub Pages.  The wasm
+# search engine is compiled here (emscripten) rather than committed; net2.onnx
+# and the page sources are already in the repo, and onnxruntime-web loads from
+# a CDN at runtime (see webapp/spa/app.mjs).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'webapp/spa/**'
+      - 'src/micro_mcts.c'
+      - 'src/bb_core.h'
+      - 'Makefile'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let a newer push cancel an in-flight run.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.4
+
+      - name: Build the wasm search engine
+        run: make wasm
+
+      - name: Assemble public/
+        run: |
+          mkdir -p public/models
+          cp webapp/spa/index.html webapp/spa/app.mjs webapp/spa/engine.mjs public/
+          cp webapp/spa/models/net2.onnx public/models/
+          cp build/wasm/micro_mcts.mjs build/wasm/micro_mcts.wasm public/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
