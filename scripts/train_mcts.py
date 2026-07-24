@@ -19,7 +19,15 @@ import multiprocessing
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+
+# Cap CPU math-lib threads to 1 BEFORE numpy/torch import.  This project's hot
+# path is a single-threaded batched game pool + GPU; left at the default (all
+# 32 cores on framework) the OMP/BLAS pools only spin-wait between tiny per-step
+# ops -- ~20 cores burned + clocks throttled for zero throughput.  setdefault so
+# an explicit launch-env override still wins.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 from datetime import datetime
 
 import numpy as np
@@ -29,23 +37,20 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lib.bc import (                                                  # noqa: E402
-    generate_bc_warmup_data,
-    BC_WARMUP_DEPTH, BC_WARMUP_TEMP, BC_RANDOM_OPENS, BC_BLUNDER_RATE,
-)
-from lib.device_utils import load_compiled_network                   # noqa: E402
+from lib.device_utils import get_gpu_stats                          # noqa: E402
 from lib.dual_network import DualHeadNetwork                         # noqa: E402
+from lib.net2 import Net2                                            # noqa: E402
 from lib.evaluation import (                                         # noqa: E402
-    evaluate_vs_noisy_minimax, rate_vs_pool, _calibrate_ladder,
+    evaluate_vs_noisy_minimax, rate_vs_pool, h2h_gate, _calibrate_ladder,
 )
 from lib.mcgs import MCGS                                            # noqa: E402
-from lib.t7g import (                                                # noqa: E402
-    soft_policy_from_mm, new_board, apply_move, check_terminal,
-    board_to_obs, action_masks, count_cells,
-)
-from lib.train_workers import (                                      # noqa: E402
-    self_play_game_pool, generate_mm_mix_data,
-)
+from lib.t7g import action_to_move                                   # noqa: E402
+
+# Boolean mask over the 1225-action space: True where the move is a jump
+# (source vacated) rather than a clone (source retained).  Ataxx strategy
+# hinges on preferring clones; the search's jump-mass is its style fingerprint.
+JUMP_MASK = np.array([action_to_move(a)[4] for a in range(1225)], dtype=bool)
+from lib.train_workers import self_play_game_pool                    # noqa: E402
 from lib.training import train_network, _IterBuffer                  # noqa: E402
 
 
@@ -53,85 +58,112 @@ from lib.training import train_network, _IterBuffer                  # noqa: E40
 # Configuration
 # ============================================================
 
+def _env_int(name: str, default: int) -> int:
+    """Platform-tuning override from the environment (T7G_*).
+
+    Machine-dependent performance knobs (pool size, workers, batch size,
+    sim budgets) read their default from the environment so each box can
+    bank its own sweep results (e.g. `export T7G_POOL_SIZE=256` on the
+    desktop vs 512 on the framework) without editing this file.  Science
+    hyperparameters stay static here on purpose - they are experiment
+    state, not machine state.  Precedence: cmdline > T7G_* env > default.
+    """
+    v = os.environ.get(name)
+    return int(v) if v else default
+
+
 # Base
 NUM_ITERATIONS       = 500
-GAMES_PER_ITERATION  = 250
-MCTS_SIMULATIONS     = 500
-EVAL_SIMULATIONS     = 500
-BATCH_SIZE           = 256
-EPOCHS_PER_ITERATION = 1        # 1 pass/iter; with an 8-iter buffer each example
-                                # still gets ~8 gradient passes over its lifetime
-                                # (5 epochs = ~40 passes -> value-head memorization)
-REPLAY_BUFFER_ITERS  = 8        # keep this many iterations of self-play data
-TARGET_EXAMPLES_ITER = 54_000   # adaptive games/iter targets this example count
-                                # (35k policy from full games + ~19k value-only
-                                # from fast games at FAST_PLAY_FRACTION=0.35)
-POOL_SIZE            = 64       # concurrent games per worker
+GAMES_PER_ITERATION  = 1200     # iter-1 seed for the adaptive games/iter loop
+                                # (PCR steady state is ~1250/iter)
+MCTS_SIMULATIONS     = _env_int("T7G_SIMULATIONS", 500)
+EVAL_SIMULATIONS     = _env_int("T7G_EVAL_SIMULATIONS", 500)
+BATCH_SIZE           = _env_int("T7G_BATCH_SIZE", 256)
+EPOCHS_PER_ITERATION = 1        # 1 pass/iter; over a 3-iter buffer each example
+                                # gets ~3 gradient passes (more limits value-head
+                                # memorization)
+REPLAY_BUFFER_ITERS  = 3        # iterations of self-play data to keep - a
+                                # ~4.2k-game window at PCR game rates, ~3 gradient
+                                # passes per example over its lifetime
+TARGET_EXAMPLES_ITER = 120_000  # adaptive games/iter targets this example count;
+                                # ~1250 games/iter for the diversity the value
+                                # head needs.  ~25% of rows carry policy targets
+POOL_SIZE            = _env_int("T7G_POOL_SIZE", 512)
+                                # concurrent self-play games; each half of the
+                                # double-buffered pool is one inference batch, so
+                                # this IS the self-play batch-size knob.  Powers
+                                # of two only (ROCm pads batches to pow2).  Tune
+                                # per machine via T7G_POOL_SIZE (512≈14 GB slabs).
 
 # Model parameters
-VALUE_BLEND_ALPHA    = 1.0      # α=1 → pure terminal target (blending off).
+NET_ARCH             = "net2"   # "net2" = t7g-net2 (lib/net2.py, KataGo-family);
+                                # "old" = legacy DualHeadNetwork
+SOFT_POLICY_COEF     = 0.0      # net2 aux soft policy head: OFF - ablation
+                                # showed KataGo's nominal 8.0 bought zero policy
+                                # CE (the attention head owns the win) at ~0.01
+                                # holdout value CE.  No-op for the old arch.
+ST_VALUE_COEF        = 0.25     # net2 short-term value heads: MSE toward
+                                # lambda-averaged future root Q (horizons
+                                # ~6/16/40 plies) - the search-derived value
+                                # signal, distinct from the --blend-alpha path.
+VALUE_BLEND_ALPHA    = 0.25     # α=1 → pure terminal target (blending off).
                                 # α<1 mixes gated root-Q into the value target
                                 # AT THE LOSS as soft WDL class probabilities
                                 # (1-w)*onehot(z) + w*[(1+q)/2, 0, (1-q)/2] -
                                 # pre-blending the scalar would be quantized
                                 # away by the hard ±0.33 class thresholds.
-                                # Disabled 2026-04 when the value head was
-                                # broken (memory/project_value_head_broken.md);
-                                # that predates the WDL head + search fixes.
+                                # α=0.25 (max Q weight 0.75) is where the
+                                # measured target SNR peaks while split-half
+                                # fidelity to the true outcome is still rising;
+                                # it collapses at α=0 (pure self-distillation).
 VALUE_COEF           = 1.0      # value-loss weight; bumped to rebalance against
                                 # policy CE's 1225-class gradient magnitude
 MARGIN_COEF          = 0.4      # auxiliary margin-head loss weight (final
                                 # material margin / 49) - dense KataGo-style
                                 # signal that trains the trunk from every game
-WDL_VALUE            = True     # 3-way W/D/L cross-entropy value head (fixes
-                                # the tanh+MSE saturation pathology: 2026-07-10
-                                # audit found 10% of positions confidently wrong
-                                # with ~zero gradient to unlearn them)
+WDL_VALUE            = True     # 3-way W/D/L cross-entropy value head - avoids
+                                # the tanh+MSE saturation pathology (confidently
+                                # wrong positions with ~zero gradient to unlearn)
 OWNERSHIP_AUX        = True     # per-cell final-ownership aux head (KataGo);
 OWNERSHIP_COEF       = 0.15     # 49 dense spatial targets/position teach the
                                 # trunk to count material.  Aux TRAINING signal
                                 # only - never enters search utility or move
-                                # selection (margin-maximizing play is a known
-                                # failure state)
-DIRICHLET_ALPHA      = 0.0      # OFF: Gumbel top-K sampling already explores;
-DIRICHLET_EPS        = 0.0      # root noise leaked into the completed-Q policy
-                                # targets and permanently corrupted TT priors
+                                # selection.
 GAMES_MIN            = 50
-GAMES_MAX            = 650
-LEARNING_RATE        = 1.0e-4  # was 1.5e-4 for the ladder climb; lowered 2026-07-09
-                               # for the post-peak refinement regime (run-1 declined
-                               # monotonically after iter 50 - churn, not signal)
+GAMES_MAX            = 2000     # playout-cap randomization targets ~1250
+                                # games/iter (120k examples / ~96 per game)
+LEARNING_RATE        = 1.0e-4
 WEIGHT_DECAY         = 1e-4
 C_PUCT               = 1.3
 GUMBEL_K             = 16
 SIGMA_SCALE          = 1.0      # multiplier on the Gumbel sigma(q) transform;
-                                # <1 makes completed-Q targets stickier to the
-                                # prior (probe knob for value-noise amplification)
+                                # <1 makes completed-Q targets stickier to the prior
 COMPLETION_N0        = 50.0     # visit-shrinkage prior strength in the completed-Q
                                 # target: q~(a)=(n_a*q_a+n0*v_root)/(n_a+n0).  Caps
                                 # low-visit Q noise before sigma amplifies it into
-                                # target logits (2026-07-11 target-noise fix; the
-                                # temp-0 played move is the SH winner, also part of
-                                # that fix)
-SELF_PLAY_TEMP_MOVES = 16       # was 30 (~half a 73-move game adding value noise);
-                                # sigma-scaled Gumbel targets need less forcing
+                                # target logits.  The temp-0 played move is the SH
+                                # winner.
+SELF_PLAY_TEMP_MOVES = 16       # sigma-scaled Gumbel targets need less temperature
+                                # forcing than a longer temp window would add
 ENTROPY_COEFF        = 0.00
-FAST_PLAY_FRACTION   = 0.35  # fraction of games run fast (value-only); 0=disabled
-FAST_PLAY_SIMS       = 100   # simulations for fast games
 
-# MM Mix
-MM_MIX_GAMES         = 100
-MM_MIX_DEPTH         = 5
-MM_MIX_POOL_SIZE     = 32
-MM_MIX_WORKERS       = 16
-MM_MIX_RETIRE_LEVEL  = 0        # set > 0 to enable MM-mix up to that ladder level
+# Playout-cap randomization (KataGo): per MOVE, with prob PCR_P_FULL run the
+# full --simulations budget and keep the policy target; otherwise run a cheap
+# PCR_FAST_SIMS search whose example trains value/margin/ownership only
+# (policy target zeroed -> masked out of the policy CE; root-Q blend weight
+# dropped too - a 100-sim root is too noisy to teach).  Decouples the two data
+# appetites: policy needs deep searches, value needs MANY GAMES.  At p=0.25
+# a game costs ~0.4x the sims, so the example budget above buys ~2.5x the
+# distinct games/outcomes per iteration.  PCR_P_FULL = 1.0 disables.
+PCR_P_FULL           = 0.25
+PCR_FAST_SIMS        = 100
 
 # Eval
 EVAL_INTERVAL        = 5
 EVAL_GAMES           = 30       # 10 games/rung made the ladder oscillate 0->100%
-EVAL_WORKERS         = 4
+EVAL_WORKERS         = _env_int("T7G_EVAL_WORKERS", 4)
 CHECKPOINT_INTERVAL  = 10
-CHECKPOINT_DIR       = "models/mcts"
+CHECKPOINT_DIR       = "models/mcts"   # override per run with --checkpoint-dir
 EVAL_LADDER = [
     (1, 0.60, "MM1-semi"),
     (1, 0.20, "MM1-noisy"),
@@ -145,11 +177,29 @@ EVAL_ADVANCE_THRESHOLD   = 0.90
 EVAL_ADVANCE_CONSECUTIVE = 2
 # Elo anchor pool (see models/elo_pool/pool.json for how anchors were rated)
 ELO_POOL_PATH          = "models/elo_pool/pool.json"
-ELO_GAMES_PER_OPPONENT = 8
-ELO_PROMOTE_MARGIN     = 35     # candidate elo must beat the best-net bar by this
-                                # much to take over self-play (24-game rating is
-                                # ~+/-70 noisy; the margin filters false promotions
-                                # while a stall just leaves data at the proven best)
+ELO_GAMES_PER_OPPONENT = 16     # an 8-game gate is too noisy - it can both miss
+                                # a real ~100-Elo climb and promote a regressed
+                                # net on one lucky 8-0-0 block
+GATE_MARGIN_ELO        = 25     # candidate must clear the incumbent by this
+                                # (as a score margin) head-to-head.  The gate is
+                                # RELATIVE - candidate vs best_network in the same
+                                # games - because an absolute bar (best-elo point
+                                # estimate + margin) gets set on upward promotion
+                                # noise and then stalls the ratchet as headroom
+                                # shrinks
+GATE_BLOCK_GAMES       = 16     # h2h games per block (colour-balanced)
+GATE_MAX_GAMES         = 96     # adaptive cap: clear results stop at one block;
+                                # only genuine close calls extend (96 games
+                                # resolves ~+/-35 Elo; promotion needs ~57% there)
+GATE_MM7_FLOOR         = 12     # catastrophe guard: never promote a net whose
+                                # gauntlet MM7 wins drop below this (out of
+                                # ELO_GAMES_PER_OPPONENT), whatever the h2h says
+ELO_ROTATE_AFTER       = 6      # evals without promotion before the current net
+                                # is injected as a rolling anchor anyway (no
+                                # generator change).  Keeps the pool near current
+                                # strength so ratings don't saturation-cap against
+                                # long-outgrown anchors (the mechanism that hid
+                                # run_fastblend's climb)
 ELO_ROLLING_WINDOW     = 2      # self-anchored rating: on each promotion the new
                                 # best is appended to the pool as an opponent, and
                                 # only the newest N such self-anchors are kept.  A
@@ -161,10 +211,6 @@ ELO_ROLLING_WINDOW     = 2      # self-anchored rating: on each promotion the ne
                                 # pin the absolute scale / flag regressions.  Can be
                                 # overridden by "rolling_window" in pool.json.
 
-# Policy distillation
-POLICY_DISTILL_DEPTH = 3
-POLICY_DISTILL_TEMP  = 0.075
-
 
 # ============================================================
 # Self-play data generation
@@ -174,7 +220,6 @@ def generate_self_play_data(
     mcts: MCGS,
     min_non_truncated: int = 50,
     mcts_pool: 'list | None' = None,
-    policy_relabel_fn=None,
     temp_moves: int = 0,
 ) -> tuple:
     """
@@ -202,7 +247,9 @@ def generate_self_play_data(
             for game_examples, winner, moves, gtime, trunc, legal_counts in (
                 self_play_game_pool(mcts, POOL_SIZE, target, mcts_pool,
                                     temp_moves=temp_moves,
-                                    blend_alpha=VALUE_BLEND_ALPHA)
+                                    blend_alpha=VALUE_BLEND_ALPHA,
+                                    pcr_p_full=PCR_P_FULL,
+                                    pcr_fast_sims=PCR_FAST_SIMS)
             ):
                 all_legal_counts.extend(legal_counts)
                 game_moves.append(moves)
@@ -225,26 +272,8 @@ def generate_self_play_data(
     finally:
         pbar.close()
 
-    if policy_relabel_fn:
-        _fn = policy_relabel_fn
-        n_workers = max(1, (os.cpu_count() or 4) // 2)
-        chunk_size = max(32, len(raw_examples) // (n_workers * 4))
-        chunks = [raw_examples[i:i + chunk_size]
-                  for i in range(0, len(raw_examples), chunk_size)]
-
-        def _relabel_chunk(chunk):
-            return [_fn(e[5], e[6]) for e in chunk]
-
-        with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            policy_chunks = list(ex.map(_relabel_chunk, chunks))
-        policies = [p for pc in policy_chunks for p in pc]
-        all_examples = [
-            (obs, pol, val, margin, own, rq, qw)
-            for (obs, _, val, margin, own, _, _, rq, qw), pol in zip(raw_examples, policies)
-        ]
-    else:
-        all_examples = [(obs, p, v, m, o, rq, qw)
-                        for obs, p, v, m, o, _, _, rq, qw in raw_examples]
+    all_examples = [(obs, p, v, m, o, rq, qw, st)
+                    for obs, p, v, m, o, _, _, rq, qw, st in raw_examples]
 
     avg_branching = float(np.mean(all_legal_counts)) if all_legal_counts else 0.0
     return (all_examples, (blue_wins, green_wins, draws),
@@ -256,12 +285,16 @@ def generate_self_play_data(
 # ============================================================
 
 def main():
-    global VALUE_BLEND_ALPHA
+    global VALUE_BLEND_ALPHA, POOL_SIZE, PCR_FAST_SIMS, TARGET_EXAMPLES_ITER
+    global CHECKPOINT_DIR
     parser = argparse.ArgumentParser(description="AlphaZero MCTS Training")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to checkpoint to resume from")
     parser.add_argument("--simulations", type=int, default=MCTS_SIMULATIONS,
                         help="MCTS simulations per move")
+    parser.add_argument("--pool", type=int, default=POOL_SIZE,
+                        help=f"concurrent self-play games / inference batch knob "
+                             f"(default: {POOL_SIZE}, from T7G_POOL_SIZE if set)")
     parser.add_argument("--games", type=int, default=GAMES_PER_ITERATION,
                         help="Self-play games per iteration")
     parser.add_argument("--iterations", type=int, default=NUM_ITERATIONS,
@@ -272,28 +305,38 @@ def main():
                              f"runs when eval plateaus")
     parser.add_argument("--logdir", type=str, default="tblog/mcts",
                         help="TensorBoard log root directory")
-    parser.add_argument("--relabel", action="store_true",
-                        help="Use MM policy distillation to relabel MCTS visit-count targets")
-    parser.add_argument("--bc-warmup", type=int, default=0, metavar="N",
-                        help="Pre-fill replay buffer with N BC games before iteration 1")
-    parser.add_argument("--bc-depth", type=int, default=BC_WARMUP_DEPTH, metavar="D",
-                        help=f"Minimax depth for BC data generation (default: {BC_WARMUP_DEPTH})")
-    parser.add_argument("--bc-epochs", type=int, default=100, metavar="N",
-                        help="Training epochs on BC data before self-play begins (default: 100)")
-    parser.add_argument("--bc-cache", type=str, default=None, metavar="PATH",
-                        help="Path to save/load BC data (.npz). Use 'auto' to derive from params.")
+    parser.add_argument("--checkpoint-dir", type=str, default=CHECKPOINT_DIR,
+                        help=f"where iter_*.pt / promoted_*.pt / final.pt go "
+                             f"(default: {CHECKPOINT_DIR}); set this per run or "
+                             f"a new run overwrites the previous run's history")
     parser.add_argument("--blend-alpha", type=float, default=VALUE_BLEND_ALPHA,
                         help=f"Value-target blend: 1.0 = pure game outcome, "
                              f"<1 mixes gated root-Q into soft WDL targets, "
                              f"max Q weight = 1-alpha (default: {VALUE_BLEND_ALPHA})")
+    parser.add_argument("--pcr-fast-sims", type=int, default=PCR_FAST_SIMS,
+                        help=f"PCR fast-move sim budget: the cheap search that "
+                             f"plays most moves and trains value/margin/ownership "
+                             f"only (default: {PCR_FAST_SIMS})")
+    parser.add_argument("--target-examples", type=int, default=TARGET_EXAMPLES_ITER,
+                        help=f"adaptive games/iter targets this many examples; "
+                             f"buffer = this x REPLAY_BUFFER_ITERS "
+                             f"(default: {TARGET_EXAMPLES_ITER})")
+    parser.add_argument("--arch", choices=["net2", "old"], default=NET_ARCH,
+                        help=f"network architecture (default: {NET_ARCH})")
+    parser.add_argument("--cudagraphs", action="store_true",
+                        help="compile inference nets with mode='reduce-overhead' "
+                             "(CUDA/hip graphs) and force pow2 batch padding. "
+                             "Cuts per-forward Python dispatch ~9x (1.4ms -> "
+                             "0.16ms measured on the 3060 Ti, 2026-07-19); "
+                             "needs a go/no-go validation on ROCm/gfx1151 "
+                             "before use there.")
     args = parser.parse_args()
 
     VALUE_BLEND_ALPHA = args.blend_alpha
-
-    policy_relabel_fn = (
-        lambda board, turn: soft_policy_from_mm(board, POLICY_DISTILL_DEPTH, turn,
-                                                POLICY_DISTILL_TEMP)
-    ) if args.relabel else None
+    CHECKPOINT_DIR    = args.checkpoint_dir
+    POOL_SIZE = args.pool
+    PCR_FAST_SIMS = args.pcr_fast_sims
+    TARGET_EXAMPLES_ITER = args.target_examples
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -301,10 +344,22 @@ def main():
     print(f"Device: {device}")
 
     num_actions = 1225
-    _net_kwargs = dict(wdl=WDL_VALUE, ownership=OWNERSHIP_AUX)
-    network   = DualHeadNetwork(num_actions=num_actions, **_net_kwargs).to(device)
+    if args.arch == "net2":
+        def _make_net():
+            return Net2(num_actions=num_actions)
+    else:
+        def _make_net():
+            return DualHeadNetwork(num_actions=num_actions,
+                                   wdl=WDL_VALUE, ownership=OWNERSHIP_AUX)
+    _compile_kwargs = {"mode": "reduce-overhead"} if args.cudagraphs else {}
+    if args.cudagraphs:
+        import lib.mcgs as _mcgs_mod
+        _mcgs_mod.PAD_BATCH_POW2 = True  # bound the CUDA-graph shape set
+
+    network   = _make_net().to(device)
     inference_network = (  # type: ignore[assignment]
-        torch.compile(network) if device.type == "cuda" else network
+        torch.compile(network, **_compile_kwargs)
+        if device.type == "cuda" else network
     )
     # Constant LR: the pipeline is run in chunks (resume via --checkpoint), so
     # a per-run schedule would sawtooth on every restart.  Lower manually with
@@ -318,8 +373,12 @@ def main():
         print(f"Loading checkpoint: {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, weights_only=False)
         _ckpt_sd = checkpoint['network']
-        if DualHeadNetwork.infer_arch(_ckpt_sd) == _net_kwargs:
+        try:
             network.load_state_dict(_ckpt_sd)
+            _same_arch = True
+        except RuntimeError:
+            _same_arch = False
+        if _same_arch:
             if 'optimizer' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer'])
                 for pg in optimizer.param_groups:
@@ -345,13 +404,21 @@ def main():
     # net only takes over data generation when its pool Elo clears the bar -
     # run 1 showed ungated self-play walks downhill from the peak (270 Elo lost
     # over iters 50-180) because nothing enforces monotonic strength.
-    best_network = DualHeadNetwork(num_actions=num_actions, **_net_kwargs).to(device)
+    best_network = _make_net().to(device)
     best_network.load_state_dict(network.state_dict())
     best_network.eval()
     best_inference_network = (  # type: ignore[assignment]
-        torch.compile(best_network) if device.type == "cuda" else best_network
+        torch.compile(best_network, **_compile_kwargs)
+        if device.type == "cuda" else best_network
     )
-    best_elo: 'float | None' = None   # promotion bar; set at the first pool rating
+    best_elo: 'float | None' = None   # telemetry: pool elo at the last promotion
+    incumbent_name: 'str | None' = None  # the incumbent's pool entry (pinned:
+                                      # never evicted by rolling trims) - its 16
+                                      # gauntlet games double as the gate's free
+                                      # first block, so a clear gate costs zero
+                                      # fresh games
+    retained_streak = 0               # consecutive "retained" evals; triggers a
+                                      # scheduled anchor rotation at ELO_ROTATE_AFTER
 
     # Elo pool: a fixed part (engine + seed-net anchors that pin the absolute
     # scale) plus a rolling part of recent promoted selves appended below, so the
@@ -390,11 +457,8 @@ def main():
         },
         "Eval": {
             "Ladder Progress": ["Multiline", ["eval/ladder_progress"]],
-            "Win Rate by Colour": ["Multiline", [
-                "eval/win_rate_as_blue",
-                "eval/win_rate_as_green",
-            ]],
-            "Elo": ["Multiline", ["eval/elo", "eval/best_elo"]],
+            "Elo (95% CI)": ["Margin", ["eval/elo", "eval/elo_lo", "eval/elo_hi"]],
+            "Best Elo": ["Multiline", ["eval/best_elo"]],
         },
         "Training": {
             "Iteration Loss": ["Multiline", [
@@ -414,6 +478,8 @@ def main():
     print(f"Games/iteration:  {args.games}")
     print(f"Sims/move:        {args.simulations}")
     print(f"Replay buffer:    last {REPLAY_BUFFER_ITERS} iterations")
+    print(f"Pool size:        {POOL_SIZE}"
+          + ("  (T7G_POOL_SIZE)" if os.environ.get("T7G_POOL_SIZE") else ""))
     print(f"Batch size:       {BATCH_SIZE}")
     print(f"Epochs/iteration: {EPOCHS_PER_ITERATION}")
     print(f"Value blend:      alpha={VALUE_BLEND_ALPHA}"
@@ -424,8 +490,7 @@ def main():
 
     _mcts_kwargs = dict(num_simulations=args.simulations, c_puct=C_PUCT, gumbel_k=GUMBEL_K,
                         sigma_scale=SIGMA_SCALE, completion_n0=COMPLETION_N0)
-    _sp_kwargs   = dict(**_mcts_kwargs,
-                        dirichlet_alpha=DIRICHLET_ALPHA, dirichlet_eps=DIRICHLET_EPS)
+    _sp_kwargs   = _mcts_kwargs
     # AlphaGo-Zero-style ratchet: self-play uses the BEST net, not the current
     # one.  The search targets are still one improvement step ahead of the data
     # generator, so the training net can (and must) surpass it to get promoted;
@@ -436,9 +501,9 @@ def main():
         for _ in range(POOL_SIZE)
     ]
     try:
-        term_width, term_height = os.get_terminal_size()
+        term_width = os.get_terminal_size().columns
     except OSError:  # no tty (piped/headless run)
-        term_width, term_height = 80, 24
+        term_width = 80
 
     if device.type == "cuda":
         print("Warming up torch.compile ...", end=" ", flush=True)
@@ -449,30 +514,6 @@ def main():
             best_inference_network(_w)  # type: ignore[operator]
         network.train()
         print("done")
-
-    if args.bc_warmup > 0:
-        print(f"\nBC warmup: generating {args.bc_warmup} MM{args.bc_depth} games...")
-        bc_cache = args.bc_cache
-        if bc_cache == "auto":
-            bc_cache = (
-                f"{CHECKPOINT_DIR}/bc_N{args.bc_warmup}"
-                f"_D{args.bc_depth}_T{BC_WARMUP_TEMP}"
-                f"_O{BC_RANDOM_OPENS}_B{BC_BLUNDER_RATE}.npz"
-            )
-        bc_examples = generate_bc_warmup_data(args.bc_warmup, depth=args.bc_depth,
-                                              cache_path=bc_cache)
-        replay_buffer.append_batch(bc_examples)
-        print(f"  Replay buffer: {len(replay_buffer)} examples")
-        print(f"  Pre-training on BC data ({args.bc_epochs} epochs)...")
-        network.train()
-        bc_losses = train_network(
-            network, replay_buffer, optimizer,
-            batch_size=BATCH_SIZE, epochs=args.bc_epochs, device=device,
-            desc=f"BC pre-train (MM{args.bc_depth})",
-            value_coef=VALUE_COEF,
-        )
-        print(f"  BC pre-train: policy={bc_losses['policy_loss']:.4f}"
-              f"  value={bc_losses['value_loss']:.4f}")
 
     if args.checkpoint:
         eval_level, _ = _calibrate_ladder(
@@ -498,36 +539,19 @@ def main():
         gen_start = time.time()
         network.eval()
 
-        full_games = (max(1, round(games_this_iter * (1 - FAST_PLAY_FRACTION)))
-                      if FAST_PLAY_FRACTION > 0 else games_this_iter)
-        fast_games = games_this_iter - full_games
-
         examples, (bw, gw, dr), game_moves, game_times, truncations, avg_branching = (
             generate_self_play_data(
                 self_play_mcts,
-                min_non_truncated=full_games,
+                min_non_truncated=games_this_iter,
                 mcts_pool=mcts_pool,
-                policy_relabel_fn=policy_relabel_fn,
                 temp_moves=SELF_PLAY_TEMP_MOVES,
             )
         )
 
-        if fast_games > 0:
-            fast_mcts = MCGS(inference_network,
-                             num_simulations=FAST_PLAY_SIMS, c_puct=C_PUCT, gumbel_k=GUMBEL_K,
-                             dirichlet_alpha=DIRICHLET_ALPHA, dirichlet_eps=DIRICHLET_EPS,
-                             completion_n0=COMPLETION_N0)
-            fast_raw, (fbw, fgw, fdr), fmoves, ftimes, ftrunc, _ = generate_self_play_data(
-                fast_mcts,
-                min_non_truncated=fast_games,
-                temp_moves=999,
-            )
-            # Zero policy targets — these examples are value-only
-            fast_examples = [(obs, np.zeros_like(pol), val, m, o, rq, qw)
-                             for obs, pol, val, m, o, rq, qw in fast_raw]
-            bw += fbw; gw += fgw; dr += fdr
-            game_moves += fmoves; game_times += ftimes; truncations += ftrunc
-            examples += fast_examples
+        # Playout-cap split: PCR fast rows carry a zeroed policy target.
+        pcr_fast_rows = (sum(1 for e in examples if not np.any(e[1]))
+                         if PCR_P_FULL < 1.0 else 0)
+        pcr_full_rows = len(examples) - pcr_fast_rows
 
         network.train()
         gen_time = time.time() - gen_start
@@ -537,13 +561,25 @@ def main():
         std_moves = float(moves_arr.std())
         avg_gtime = gen_time / len(game_times)
         trunc_pct = 100.0 * truncations / len(game_moves)
-        total_sims = int(moves_arr.sum()) * args.simulations
+        # Bill each move class at its own rate -- a single-rate formula
+        # inflated run_fastblend's sim/s ~35% (109k logged, ~78k true).  With
+        # PCR, example rows are billed exactly by their recorded cap; the few
+        # non-example moves (truncated games, spurious-zero recoveries) at the
+        # expected mixed cost.
+        _avg_move_sims = (PCR_P_FULL * args.simulations
+                          + (1.0 - PCR_P_FULL) * PCR_FAST_SIMS)
+        _non_example_moves = max(0, int(moves_arr.sum())
+                                 - pcr_full_rows - pcr_fast_rows)
+        total_sims = int(pcr_full_rows * args.simulations
+                         + pcr_fast_rows * PCR_FAST_SIMS
+                         + _non_example_moves * _avg_move_sims)
         sims_per_sec = total_sims / gen_time if gen_time > 0 else 0.0
 
         print(" " * term_width + "\r", end='')  # Clear the tqdm bar
-        fast_tag = f" ({fast_games} fast)" if fast_games > 0 else ""
+        pcr_tag = (f"  pol-rows {pcr_full_rows} ({pcr_full_rows / max(1, len(examples)):.0%})"
+                   if PCR_P_FULL < 1.0 else "")
         print(f"  Self-play  {len(examples):>6} ex  {gen_time:.0f}s  {sims_per_sec:.0f} sim/s"
-              f"  B:{bw} G:{gw} D:{dr}{fast_tag}")
+              f"  B:{bw} G:{gw} D:{dr}{pcr_tag}")
         print(f"  Games      avg {avg_moves:.1f}  med {med_moves:.1f}  std {std_moves:.1f}"
               f"  [{int(moves_arr.min())}-{int(moves_arr.max())}]"
               f"  trunc {trunc_pct:.1f}%  branch {avg_branching:.1f}")
@@ -556,20 +592,28 @@ def main():
         writer.add_scalar("self_play/examples_per_game",    _epg,                  step)
         writer.add_scalar("self_play/games_this_iter",      games_this_iter,       step)
         writer.add_scalar("self_play/examples_generated",   len(examples),         step)
+        writer.add_scalar("self_play/policy_rows",          pcr_full_rows,         step)
         writer.add_scalar("self_play/avg_game_moves",        avg_moves,             step)
         writer.add_histogram("self_play/game_moves_dist",   moves_arr,             step)
         writer.add_scalar("self_play/truncation_pct",       trunc_pct,             step)
         writer.add_scalar("self_play/avg_branching_factor", avg_branching,         step)
 
         entropies = []
+        jump_masses = []
         for _, policy_target, *_ in examples:
-            p = policy_target[policy_target > 0]
-            if p.size > 0:
-                entropies.append(float(-np.sum(p * np.log(p))))
+            nz = policy_target[policy_target > 0]
+            if nz.size > 0:
+                entropies.append(float(-np.sum(nz * np.log(nz))))
+                # Fraction of search visits placed on jump (vs clone) moves --
+                # the strategy fingerprint; a shift here is play-style drift even
+                # while the net keeps sweeping the minimax ladder.
+                jump_masses.append(float(policy_target[JUMP_MASK].sum()))
         avg_policy_entropy = float(np.mean(entropies)) if entropies else 0.0
-        print(f"  Policy     entropy {avg_policy_entropy:.3f}"
+        avg_jump_frac = float(np.mean(jump_masses)) if jump_masses else 0.0
+        print(f"  Policy     entropy {avg_policy_entropy:.3f}  jump {avg_jump_frac:.1%}"
               f"  epg {_epg:.1f} (ema {_epg_ema:.1f})  -> {games_this_iter} next")
         writer.add_scalar("self_play/avg_policy_entropy", avg_policy_entropy, step)
+        writer.add_scalar("self_play/jump_move_frac",     avg_jump_frac,      step)
         if entropies:
             writer.add_histogram("self_play/policy_entropy_dist", np.array(entropies), step)
 
@@ -579,33 +623,17 @@ def main():
 
         is_eval_iter = (step % EVAL_INTERVAL == 0)
 
-        #  MM-mix 
-        if eval_level < MM_MIX_RETIRE_LEVEL:
-            network.eval()
-            mm_mix_examples = generate_mm_mix_data(
-                self_play_mcts, MM_MIX_GAMES,
-                mm_depth=MM_MIX_DEPTH, pool_size=MM_MIX_POOL_SIZE, n_workers=MM_MIX_WORKERS,
-            )
-            network.train()
-        else:
-            mm_mix_examples = []
-        writer.add_scalar("self_play/mm_mix_examples", len(mm_mix_examples), step)
-
-        replay_buffer.append_batch(examples + mm_mix_examples)
+        replay_buffer.append_batch(examples)
         writer.add_scalar("self_play/buffer_size", len(replay_buffer), step)
 
-        _iter_hashes  = {e[0].tobytes() for e in examples}
-        _buf_hashes   = {e[0].tobytes() for e in replay_buffer}
-        _uniq_iter    = len(_iter_hashes)
-        _uniq_buf     = len(_buf_hashes)
+        # Per-iteration uniqueness only.  The buffer-level variant was a rolling
+        # window of this same signal (it just lags by REPLAY_BUFFER_ITERS) and
+        # cost an O(buffer) rehash every iteration for no extra information.
+        _uniq_iter     = len({e[0].tobytes() for e in examples})
         _uniq_iter_pct = _uniq_iter / max(1, len(examples))
-        _uniq_buf_pct  = _uniq_buf  / max(1, len(replay_buffer))
-        print(f"  Buffer     {len(replay_buffer):>6} ex"
-              f"  uniq {_uniq_iter_pct:.0%} iter / {_uniq_buf_pct:.0%} buf")
-        writer.add_scalar("self_play/unique_positions_iter",   _uniq_iter,     step)
-        writer.add_scalar("self_play/unique_positions_buffer", _uniq_buf,      step)
-        writer.add_scalar("self_play/unique_pct_iter",         _uniq_iter_pct, step)
-        writer.add_scalar("self_play/unique_pct_buffer",       _uniq_buf_pct,  step)
+        print(f"  Buffer     {len(replay_buffer):>6} ex  uniq {_uniq_iter_pct:.0%} iter")
+        writer.add_scalar("self_play/unique_positions_iter", _uniq_iter,     step)
+        writer.add_scalar("self_play/unique_pct_iter",       _uniq_iter_pct, step)
 
         #  Train 
         train_start = time.time()
@@ -616,13 +644,18 @@ def main():
             value_coef=VALUE_COEF,
             margin_coef=MARGIN_COEF,
             ownership_coef=OWNERSHIP_COEF,
+            soft_policy_coef=SOFT_POLICY_COEF,
+            st_value_coef=ST_VALUE_COEF,
         )
         train_time = time.time() - train_start
         current_lr = optimizer.param_groups[0]['lr']
         print(f"  Train      pol {losses['policy_loss']:.4f}  val {losses['value_loss']:.4f}"
               f"  marg {losses['margin_loss']:.4f}  own {losses['ownership_loss']:.4f}"
+              f"  soft {losses['soft_policy_loss']:.4f}  st {losses['st_value_loss']:.4f}"
               f"  tot {losses['total_loss']:.4f}"
-              f"  sign {losses['sign_acc']:.1%}  {train_time:.0f}s")
+              f"  sign {losses['sign_acc']:.1%}  draw {losses['draw_frac']:.1%}"
+              f"  vdec {losses['value_ce_decisive']:.4f}"
+              f"  vdrw {losses['value_ce_draw']:.4f}  {train_time:.0f}s")
 
         if scheduler is not None:
             scheduler.step()
@@ -631,8 +664,13 @@ def main():
         writer.add_scalar("train/value_loss",     losses['value_loss'],  step)
         writer.add_scalar("train/margin_loss",    losses['margin_loss'], step)
         writer.add_scalar("train/ownership_loss", losses['ownership_loss'], step)
+        writer.add_scalar("train/soft_policy_loss", losses['soft_policy_loss'], step)
+        writer.add_scalar("train/st_value_loss",  losses['st_value_loss'], step)
         writer.add_scalar("train/total_loss",     losses['total_loss'],  step)
         writer.add_scalar("train/value_sign_acc", losses['sign_acc'],    step)
+        writer.add_scalar("train/draw_frac",      losses['draw_frac'],   step)
+        writer.add_scalar("train/value_ce_decisive", losses['value_ce_decisive'], step)
+        writer.add_scalar("train/value_ce_draw",  losses['value_ce_draw'], step)
         writer.add_scalar("train/lr",             current_lr,            step)
         writer.add_scalar("timing/train_seconds", train_time,            step)
 
@@ -664,49 +702,86 @@ def main():
                 print(f"  Eval       {eval_cur_label}  {wr_cur:.0%}"
                       f"  W:{res_cur['wins']} L:{res_cur['losses']} D:{res_cur['draws']}"
                       f"  B:{res_cur['wr_as_blue']:.0%} G:{res_cur['wr_as_green']:.0%}"
-                      f"  t:{res_cur['n_terminal']} r:{res_cur['n_repetition']}"
+                      f"  t:{res_cur['n_terminal']} c:{res_cur['n_clock']}"
                       f" x:{res_cur['n_truncated']}")
-                writer.add_scalar("eval/win_rate_as_blue",  res_cur['wr_as_blue'],    step)
-                writer.add_scalar("eval/win_rate_as_green", res_cur['wr_as_green'],   step)
                 writer.add_scalar("eval/ladder_progress",   eval_level + wr_cur,      step)
-                writer.add_scalar("eval/n_terminal",        res_cur['n_terminal'],    step)
-                writer.add_scalar("eval/n_repetition",      res_cur['n_repetition'],  step)
-                writer.add_scalar("eval/n_truncated",       res_cur['n_truncated'],   step)
 
             # Elo vs the fixed anchor pool - the primary progress metric once
             # the MM ladder saturates (every net past ~1100 beats MM5 ~100%).
             if elo_pool:
-                elo, elo_res = rate_vs_pool(
+                elo, elo_ci95, elo_res, elo_shape = rate_vs_pool(
                     network, elo_pool,
                     games_per_opponent=ELO_GAMES_PER_OPPONENT,
                     num_actions=num_actions,
                     mcts_kwargs=dict(_mcts_kwargs, num_simulations=EVAL_SIMULATIONS),
                     num_workers=EVAL_WORKERS,
                 )
-                writer.add_scalar("eval/elo", elo, step)
+                writer.add_scalar("eval/elo",    elo,               step)
+                writer.add_scalar("eval/elo_lo", elo - elo_ci95,    step)
+                writer.add_scalar("eval/elo_hi", elo + elo_ci95,    step)
                 detail = "  ".join(f"{n}:{w}-{d}-{ls}"
                                    for n, (w, d, ls) in elo_res.items())
-                print(f"  Elo        {elo:.0f}  ({detail})")
+                print(f"  Elo        {elo:.0f} +/- {elo_ci95:.0f}  ({detail})")
+                # How the rating was earned: win margin (pieces) + game length
+                # separate a dominant sweep from a marginal one at the same Elo.
+                print(f"  Gauntlet   win+{elo_shape['win_margin_med']:.0f} /"
+                      f" loss{elo_shape['loss_margin_med']:.0f} pcs (med)"
+                      f"  len {elo_shape['moves_med']:.0f}"
+                      f"  W/D/L {elo_shape['n_win']}/{elo_shape['n_draw']}/{elo_shape['n_loss']}")
+                writer.add_scalar("eval/gauntlet_win_margin",  elo_shape['win_margin_med'],     step)
+                writer.add_scalar("eval/gauntlet_loss_margin", elo_shape['loss_margin_med'],    step)
+                writer.add_scalar("eval/gauntlet_moves_med",   elo_shape['moves_med'],          step)
+                writer.add_scalar("eval/gauntlet_draw_margin", elo_shape['draw_margin_absmed'], step)
 
                 # Ratchet: promote the training net to data generator only when
-                # it provably outrates the incumbent best.
+                # it beats the incumbent head-to-head, measured fresh in the
+                # same games (relative gate - immune to the winner's-curse /
+                # stale-bar stall of the old absolute-Elo gate) and extended
+                # adaptively when the record is too close to call.
                 if best_elo is None:
-                    best_elo = elo
-                    print(f"  Ratchet    bar set at {elo:.0f}")
-                elif elo >= best_elo + ELO_PROMOTE_MARGIN:
+                    best_elo = elo          # telemetry baseline only
+                s_margin = 1.0 / (1.0 + 10.0 ** (-GATE_MARGIN_ELO / 400.0))
+                # The pinned incumbent's gauntlet games seed the gate for free.
+                seed = (tuple(elo_res[incumbent_name])
+                        if incumbent_name in elo_res else None)
+                gate, (gw, gd, gl), gscore = h2h_gate(
+                    network, best_network, s_margin=s_margin, seed_record=seed,
+                    block_games=GATE_BLOCK_GAMES, max_games=GATE_MAX_GAMES,
+                    num_actions=num_actions,
+                    mcts_kwargs=dict(_mcts_kwargs,
+                                     num_simulations=EVAL_SIMULATIONS),
+                    num_workers=EVAL_WORKERS,
+                )
+                mm7_rec = elo_res.get("MM7")
+                mm7_ok = mm7_rec is None or mm7_rec[0] >= GATE_MM7_FLOOR
+                gate_n = gw + gd + gl
+                fresh_n = gate_n - (sum(seed) if seed else 0)
+                print(f"  Gate       vs-best {gw}-{gd}-{gl} ({gate_n} games,"
+                      f" {fresh_n} fresh)  s={gscore:.3f}"
+                      + ("" if mm7_ok else
+                         f"  MM7 FLOOR VETO ({mm7_rec[0]}/{ELO_GAMES_PER_OPPONENT}"
+                         f" < {GATE_MM7_FLOOR})"))
+                writer.add_scalar("eval/gate_score", gscore, step)
+                writer.add_scalar("eval/gate_games", gate_n, step)
+                if gate == "promote" and mm7_ok:
                     best_network.load_state_dict(network.state_dict())
                     best_network.eval()
                     best_elo = elo
+                    retained_streak = 0
                     # Self-anchor: the just-promoted net joins the pool as a rolling
                     # opponent so future ratings are measured against current-strength
                     # play (never saturates).  Keep only the newest ELO_ROLLING_WINDOW.
+                    incumbent_name = f"self_iter{step:04d}"
                     elo_pool.append({
-                        "name": f"self_iter{step:04d}", "kind": "net",
+                        "name": incumbent_name, "kind": "net",
                         "payload": {k: v.detach().cpu()
                                     for k, v in network.state_dict().items()},
                         "elo": elo, "fixed": False})
                     _rolling = [m for m in elo_pool if not m["fixed"]]
-                    for _old in _rolling[:-rolling_window]:
+                    _evictable = [m for m in _rolling
+                                  if m["name"] != incumbent_name]
+                    _excess = max(0, len(_rolling) - rolling_window)
+                    for _old in _evictable[:_excess]:
                         elo_pool.remove(_old)
                     # Persist the promoted net so it can be rated offline
                     # (scripts/eval_db.py).  The in-memory self-anchor above is
@@ -719,7 +794,30 @@ def main():
                           f"(pool: {', '.join(m['name'] for m in elo_pool)}) "
                           f"-> {promoted_path}")
                 else:
-                    print(f"  Ratchet    retained (needs {best_elo + ELO_PROMOTE_MARGIN:.0f})")
+                    retained_streak += 1
+                    print("  Ratchet    retained")
+                    if retained_streak >= ELO_ROTATE_AFTER:
+                        # Scheduled anchor rotation: the pool must track current
+                        # strength even when nothing promotes, or ratings
+                        # saturation-cap against outgrown anchors and the gate
+                        # goes blind (run_fastblend hid a ~100-Elo climb this
+                        # way).  The training net joins as a ROLLING ANCHOR
+                        # ONLY: the generator (best_network) is untouched.
+                        retained_streak = 0
+                        elo_pool.append({
+                            "name": f"anchor_iter{step:04d}", "kind": "net",
+                            "payload": {k: v.detach().cpu()
+                                        for k, v in network.state_dict().items()},
+                            "elo": elo, "fixed": False})
+                        _rolling = [m for m in elo_pool if not m["fixed"]]
+                        _evictable = [m for m in _rolling
+                                      if m["name"] != incumbent_name]
+                        _excess = max(0, len(_rolling) - rolling_window)
+                        for _old in _evictable[:_excess]:
+                            elo_pool.remove(_old)
+                        print(f"  Ratchet    anchor rotation ({ELO_ROTATE_AFTER} evals "
+                              f"without promotion) - pool: "
+                              f"{', '.join(m['name'] for m in elo_pool)}")
                 writer.add_scalar("eval/best_elo", best_elo, step)
 
             # Ladder advancement
@@ -767,6 +865,11 @@ def main():
             writer.add_scalar("system/rss_mb", rss, step)
         except Exception:
             pass
+        gpu_stats = get_gpu_stats()
+        if "util_pct" in gpu_stats:
+            writer.add_scalar("system/gpu_util_pct", gpu_stats["util_pct"], step)
+        if "temp_c" in gpu_stats:
+            writer.add_scalar("system/gpu_temp_c", gpu_stats["temp_c"], step)
 
         if step % CHECKPOINT_INTERVAL == 0:
             ckpt_path = os.path.join(CHECKPOINT_DIR, f"iter_{step:04d}.pt")

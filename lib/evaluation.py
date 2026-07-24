@@ -4,6 +4,7 @@ Evaluation workers and functions for AlphaZero MCTS training.
 Contains the multiprocessing worker globals, initializers, and evaluation
 routines for playing vs minimax and vs the best network.
 """
+import math
 import multiprocessing
 
 import numpy as np
@@ -64,7 +65,7 @@ def _worker_eval_game(args):
         num_simulations=num_simulations,
         **{k: v for k, v in _worker_mcts_kwargs.items() if k != 'num_simulations'},
     )
-    result, end_reason = play_eval_game(
+    result, end_reason, _margin, _moves = play_eval_game(
         mcts, minimax_depth, noise, engine, vary_depth, mcts_is_blue,
     )
     return result, mcts_is_blue, end_reason
@@ -100,10 +101,14 @@ def evaluate_vs_noisy_minimax(
         (num_simulations, minimax_depth, noise, engine, vary_depth, game_idx % 2 == 0)
         for game_idx in range(num_games)
     ]
-    engine_label = "Stauf" if engine == 'stauf' else f"MM-{minimax_depth}"
+    engine_label = (
+        "Stauf" if engine == 'stauf' else
+        engine if engine in ("autaxx", "autaxx-ab", "tiktaxx", "scarlettxx") else
+        f"MM-{minimax_depth}"
+    )
     wins = losses = draws = 0
     wins_b = losses_b = wins_g = losses_g = 0
-    n_terminal = n_repetition = n_truncated = 0
+    n_terminal = n_clock = n_truncated = 0
     pbar = tqdm(total=num_games, desc=f"Eval vs {engine_label} (noise={noise:.0%})",
                 unit="game", leave=False)
     try:
@@ -127,8 +132,8 @@ def evaluate_vs_noisy_minimax(
                         losses_g += 1
                 else:
                     draws += 1
-                if end_reason == "repetition":
-                    n_repetition += 1
+                if end_reason == "clock":
+                    n_clock += 1
                 elif end_reason == "truncated":
                     n_truncated += 1
                 else:
@@ -143,9 +148,9 @@ def evaluate_vs_noisy_minimax(
         "wins": wins, "losses": losses, "draws": draws,
         "wr_as_blue":   wins_b / games_b if games_b else 0.0,
         "wr_as_green":  wins_g / games_g if games_g else 0.0,
-        "n_terminal":   n_terminal,
-        "n_repetition": n_repetition,
-        "n_truncated":  n_truncated,
+        "n_terminal":  n_terminal,
+        "n_clock":     n_clock,
+        "n_truncated": n_truncated,
     }
 
 
@@ -189,12 +194,13 @@ def _worker_pool_game(args):
     # Fresh MCGS per game so transposition tables never leak between games.
     mcts_cur = _worker_mcts_cls(_local_network, **_worker_mcts_kwargs)  # type: ignore[call-arg]
     if kind == "mm":
-        result, _ = play_eval_game(mcts_cur, payload, 0.0, "micro3", False, cur_is_blue)
+        result, _, margin, moves = play_eval_game(
+            mcts_cur, payload, 0.0, "micro3", False, cur_is_blue)
     else:
         payload.eval()
         mcts_opp = _worker_mcts_cls(payload, **_worker_mcts_kwargs)  # type: ignore[call-arg]
-        result = play_net_vs_net_game(mcts_cur, mcts_opp, cur_is_blue)
-    return opp_idx, result
+        result, margin, moves = play_net_vs_net_game(mcts_cur, mcts_opp, cur_is_blue)
+    return opp_idx, result, margin, moves
 
 
 def rate_vs_pool(
@@ -219,13 +225,24 @@ def rate_vs_pool(
 
     pool: [{"name": str, "kind": "net"|"mm", "payload": state_dict|depth,
             "elo": float}, ...]
-    Returns (elo, {name: [wins, draws, losses]}).
+    Returns (elo, ci95, {name: [wins, draws, losses]}), where ci95 is the
+    95% CI half-width (1.96 / sqrt(observed information)), same convention
+    as lib/eval_db.whr_ci95 - treats each anchor's Elo as fixed/known, so
+    this understates uncertainty (no anchor-rating error propagated), but
+    it's directly comparable across iterations of the same pool.
     """
     cur_state = {k: v.cpu() for k, v in network.state_dict().items()}
     specs = [(m["kind"], m["payload"]) for m in pool]
     task_args = [(i, g % 2 == 0)
                  for i in range(len(pool)) for g in range(games_per_opponent)]
     results: dict[str, list] = {m["name"]: [0, 0, 0] for m in pool}
+    # Game-shape aggregates: how the rating was earned, not just the score.
+    # A dominant sweep (big margins, short decisive games) and a marginal one
+    # (razor-thin wins) can land the same Elo -- these tell them apart.
+    win_margins: list = []
+    loss_margins: list = []
+    draw_margins: list = []
+    all_moves: list = []
     pbar = tqdm(total=len(task_args), desc="Elo vs pool", unit="game", leave=False)
     try:
         # Explicit spawn context: the default on Python <=3.13 is fork, which
@@ -236,9 +253,13 @@ def rate_vs_pool(
             initializer=_worker_pool_init,
             initargs=(cur_state, specs, num_actions, mcts_kwargs or {}),
         ) as mp_pool:
-            for opp_idx, result in mp_pool.imap_unordered(_worker_pool_game, task_args):
+            for opp_idx, result, margin, moves in mp_pool.imap_unordered(
+                    _worker_pool_game, task_args):
                 slot = 0 if result > 0 else (2 if result < 0 else 1)
                 results[pool[opp_idx]["name"]][slot] += 1
+                (win_margins if result > 0 else
+                 loss_margins if result < 0 else draw_margins).append(margin)
+                all_moves.append(moves)
                 pbar.update(1)
     finally:
         pbar.close()
@@ -262,7 +283,143 @@ def rate_vs_pool(
             lo = mid
         else:
             hi = mid
-    return (lo + hi) / 2.0, results
+    elo = (lo + hi) / 2.0
+
+    # Observed information at the MLE - same Bradley-Terry Fisher-info form
+    # as lib/eval_db.whr_ci95, specialised to a single unknown rating.
+    c = math.log(10.0) / 400.0
+    n_per = games_per_opponent + virtual_draws
+    hess = 0.0
+    for e in elos:
+        p = 1.0 / (1.0 + 10.0 ** ((e - elo) / 400.0))
+        hess += n_per * c * c * p * (1.0 - p)
+    ci95 = 1.96 / math.sqrt(hess) if hess > 0 else float("inf")
+
+    _med = lambda xs: float(np.median(xs)) if xs else 0.0
+    shape = {
+        "moves_med":          _med(all_moves),
+        "win_margin_med":     _med(win_margins),
+        "loss_margin_med":    _med(loss_margins),
+        "draw_margin_absmed": _med([abs(m) for m in draw_margins]),
+        "n_win":  len(win_margins),
+        "n_loss": len(loss_margins),
+        "n_draw": len(draw_margins),
+    }
+    return elo, ci95, results, shape
+
+
+# ---------------------------------------------------------------------------
+# Promotion gate: adaptive head-to-head vs the incumbent generator
+# ---------------------------------------------------------------------------
+
+def _wilson_bounds(s: float, n: int, z: float) -> tuple[float, float]:
+    """Wilson score interval for a mean score s over n games (draws = 0.5)."""
+    z2 = z * z
+    center = (s + z2 / (2.0 * n)) / (1.0 + z2 / n)
+    half = z * math.sqrt(s * (1.0 - s) / n + z2 / (4.0 * n * n)) / (1.0 + z2 / n)
+    return center - half, center + half
+
+
+def gate_decision(
+    w: int, d: int, l: int, *,
+    s_margin: float,
+    z_promote: float = 1.282,
+    z_retain: float = 0.842,
+    equal_cut_games: int = 32,
+) -> str:
+    """
+    Decide the ratchet gate from a head-to-head record vs the incumbent.
+
+    Promote only when the candidate is confidently (one-sided z_promote)
+    better than equal AND its point score clears s_margin; retain early when
+    even an optimistic bound (z_retain) can't reach the margin, or when the
+    score is still <= 50% after equal_cut_games (a true improvement should
+    not look like a coin flip for that long).  Anything else is a genuine
+    close call: "extend" asks for another block of games.
+    """
+    n = w + d + l
+    s = (w + 0.5 * d) / n
+    lo, _ = _wilson_bounds(s, n, z_promote)
+    _, hi = _wilson_bounds(s, n, z_retain)
+    if lo > 0.5 and s >= s_margin:
+        return "promote"
+    if hi < s_margin:
+        return "retain"
+    if n >= equal_cut_games and s <= 0.5:
+        return "retain"
+    return "extend"
+
+
+def h2h_gate(
+    candidate,
+    incumbent,
+    *,
+    s_margin: float,
+    seed_record: 'tuple[int, int, int] | None' = None,
+    block_games: int = 16,
+    max_games: int = 96,
+    z_promote: float = 1.282,
+    z_retain: float = 0.842,
+    equal_cut_games: int = 32,
+    num_actions: int = 1225,
+    mcts_kwargs: dict | None = None,
+    num_workers: int = 4,
+) -> tuple[str, tuple[int, int, int], float]:
+    """
+    Gate the candidate against the incumbent by direct head-to-head play,
+    extending in blocks of block_games (colour-balanced) only while the
+    record is too close to call, up to max_games total.  Budget exhaustion
+    retains (conservative - the candidate is re-gated a few iterations
+    later anyway).
+
+    seed_record: (w, d, l) vs the incumbent already played under identical
+    conditions this eval (the gauntlet's games when the incumbent is pinned
+    in the pool).  A clear seed decides the gate with ZERO fresh games; the
+    worker pool is only spawned for genuine close calls.
+
+    Returns (decision, (w, d, l), score) from the candidate's perspective,
+    seed games included.
+    """
+    w, d, l = seed_record if seed_record is not None else (0, 0, 0)
+    played = w + d + l
+    decision = ("extend" if played == 0 else
+                gate_decision(w, d, l, s_margin=s_margin, z_promote=z_promote,
+                              z_retain=z_retain, equal_cut_games=equal_cut_games))
+    if decision == "extend" and played < max_games:
+        cur_state = {k: v.cpu() for k, v in candidate.state_dict().items()}
+        inc_state = {k: v.cpu() for k, v in incumbent.state_dict().items()}
+        pbar = tqdm(total=max_games - played, desc="Gate vs best",
+                    unit="game", leave=False)
+        try:
+            with multiprocessing.get_context("spawn").Pool(
+                processes=min(num_workers, block_games),
+                initializer=_worker_pool_init,
+                initargs=(cur_state, [("net", inc_state)], num_actions,
+                          mcts_kwargs or {}),
+            ) as mp_pool:
+                while decision == "extend" and played < max_games:
+                    block = min(block_games, max_games - played)
+                    task_args = [(0, (played + g) % 2 == 0)
+                                 for g in range(block)]
+                    for _idx, result, _margin, _moves in mp_pool.imap_unordered(
+                            _worker_pool_game, task_args):
+                        if result > 0:
+                            w += 1
+                        elif result < 0:
+                            l += 1
+                        else:
+                            d += 1
+                        pbar.update(1)
+                    played += block
+                    decision = gate_decision(
+                        w, d, l, s_margin=s_margin, z_promote=z_promote,
+                        z_retain=z_retain, equal_cut_games=equal_cut_games)
+        finally:
+            pbar.close()
+    if decision == "extend":
+        decision = "retain"
+    score = (w + 0.5 * d) / played
+    return decision, (w, d, l), score
 
 
 # ---------------------------------------------------------------------------
