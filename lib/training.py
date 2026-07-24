@@ -11,7 +11,45 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 
-from lib.t7g import apply_obs_symmetry, SYMMETRY_INV_PERMS, SYMMETRY_INV_PERMS_49
+from lib.t7g import (apply_obs_symmetry, SYMMETRY_INV_PERMS, SYMMETRY_INV_PERMS_49,
+                     _DEST_Y, _DEST_X, _IN_BOUNDS)
+
+
+# Flat gather tables for the 1225-action space, derived from t7g's canonical
+# index arrays so the encoding can never drift: action a = src*25 + move.
+_ACT_SRC = np.repeat(np.arange(49), 25)                                 # (1225,)
+_ACT_DST = np.broadcast_to(_DEST_Y * 7 + _DEST_X, (7, 7, 5, 5)).reshape(-1)
+_ACT_INB = np.broadcast_to(_IN_BOUNDS, (7, 7, 5, 5)).reshape(-1)
+
+# Pre-softmax fill for illegal/out-of-bounds policy logits.  Must stay finite
+# in fp16 (max +-65504): the net forward runs under fp16 autocast on ROCm, and
+# -1e9 overflows to -inf there.  -1e4 still underflows to exactly-zero softmax
+# probability in every dtype.  Do NOT "fix" this back to -1e9.
+POLICY_MASK_VALUE = -1e4
+
+# Short-term value heads (t7g-net2, KataGo's aux value targets): each head
+# predicts the exponentially lambda-averaged future MCTS root value at a mean
+# horizon of ~h plies (lambda = 1 - 1/h).  Owned here because the loss and the
+# self-play target computation both key off it; lib/net2.py sizes its head
+# from it.
+ST_HORIZONS = (6, 16, 40)
+ST_LAMBDAS = tuple(1.0 - 1.0 / h for h in ST_HORIZONS)
+
+
+def illegal_action_mask(obs: np.ndarray) -> np.ndarray:
+    """(N,7,7,4) side-to-move obs batch -> (N,1225) bool, True = LEGAL action.
+
+    Same result as t7g.action_masks but batched and driven from the obs
+    planes (ch1 = my pieces, ch0 = opponent) instead of a Board, so it can be
+    applied to D4-augmented batches directly - the mask is derived from the
+    already-rotated planes, keeping it consistent with the permuted policy
+    targets.  Two flat gathers per batch (legal = mine[src] & empty[dst]),
+    not the (N,7,7,5,5) broadcast t7g uses for a single board.
+    """
+    flat = obs.reshape(len(obs), 49, -1)
+    mine = flat[..., 1] > 0.5                              # (N,49)
+    empty = (flat[..., 0] < 0.5) & ~mine                   # (N,49)
+    return mine[:, _ACT_SRC] & empty[:, _ACT_DST] & _ACT_INB
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +92,9 @@ def train_network(
     value_coef: float = 1.0,
     margin_coef: float = 0.0,
     ownership_coef: float = 0.0,
+    soft_policy_coef: float = 0.0,
+    st_value_coef: float = 0.0,
+    mask_illegal: bool = False,
 ) -> dict:
     """
     Train *network* on a random sample from *replay_buffer*.
@@ -78,16 +119,28 @@ def train_network(
     with q_weight > 0 (VALUE_BLEND_ALPHA < 1 at generation) train toward the
     soft mix (1-w)*onehot(z) + w*[(1+q)/2, 0, (1-q)/2]; scalar heads blend
     (1-w)*z + w*q instead.  ``sign_acc`` always scores against the pure
-    terminal outcome z so the metric stays comparable across configs.
+    terminal outcome z so the metric stays comparable across configs, and only
+    over decisive examples (z != 0): a draw target can never match the sign of
+    the continuous value output, so including draws would just re-measure the
+    draw rate.  ``draw_frac`` reports the draw share of examples directly, and
+    ``value_ce_decisive`` / ``value_ce_draw`` split the WDL CE (vs the hard
+    outcome class) by target type to separate "targets got harder" from "head
+    got worse".
+
+    When soft_policy_coef > 0 and the network's forward_full exposes
+    ``soft_policy_logits`` (t7g-net2), the aux soft policy head trains on the
+    main policy target ^(1/4) renormalized (KataGo's soft policy target).
 
     Returns
     -------
     dict with keys ``policy_loss``, ``value_loss``, ``margin_loss``,
-    ``ownership_loss``, ``total_loss``, ``sign_acc`` (averages across all
-    batches and epochs).
+    ``ownership_loss``, ``soft_policy_loss``, ``total_loss``, ``sign_acc``
+    (averages across all batches and epochs).
     """
     _zero = {"policy_loss": 0.0, "value_loss": 0.0, "margin_loss": 0.0,
-             "ownership_loss": 0.0, "total_loss": 0.0, "sign_acc": 0.0}
+             "ownership_loss": 0.0, "soft_policy_loss": 0.0,
+             "st_value_loss": 0.0, "total_loss": 0.0, "sign_acc": 0.0,
+             "draw_frac": 0.0, "value_ce_decisive": 0.0, "value_ce_draw": 0.0}
     if len(replay_buffer) < batch_size:
         return dict(_zero)
 
@@ -106,8 +159,16 @@ def train_network(
         ep_value    = 0.0
         ep_margin   = 0.0
         ep_own      = 0.0
-        ep_sign_acc = 0.0
+        ep_soft     = 0.0
+        ep_st       = 0.0
         ep_batches  = 0
+        # Example-weighted counts for the decisive/draw metric split: per-batch
+        # means would be skewed by batches that happen to contain no draws.
+        ep_dec_correct = 0
+        ep_n_dec    = 0
+        ep_n_drw    = 0
+        ep_ce_dec   = 0.0
+        ep_ce_drw   = 0.0
 
         indices = np.random.permutation(n)
         for start in range(0, n - batch_size + 1, batch_size):
@@ -138,6 +199,16 @@ def train_network(
             base_qw     = np.array(
                 [buffer_list[i][6] if len(buffer_list[i]) > 6 else 0.0
                  for i in replay_idx], dtype=np.float32)
+            if st_value_coef > 0:
+                # Short-term value targets (element 7, (len(ST_LAMBDAS),)
+                # per example); tuples without them are masked out.
+                _st_zero    = np.zeros(len(ST_LAMBDAS), dtype=np.float32)
+                base_st     = np.array(
+                    [buffer_list[i][7] if len(buffer_list[i]) > 7 else _st_zero
+                     for i in replay_idx], dtype=np.float32)
+                base_has_st = np.array(
+                    [1.0 if len(buffer_list[i]) > 7 else 0.0 for i in replay_idx],
+                    dtype=np.float32)
 
             # Expand to all 8 D4 symmetries: each example appears in the
             # batch under every rotation/reflection.  Policy actions are
@@ -168,6 +239,9 @@ def train_network(
             t_qw     = torch.from_numpy(batch_qw).to(device)
             t_own     = torch.from_numpy(batch_own).to(device).long()
             t_has_own = torch.from_numpy(batch_has_own).to(device)
+            if st_value_coef > 0:
+                t_st     = torch.from_numpy(np.tile(base_st, (8, 1))).to(device)
+                t_has_st = torch.from_numpy(np.tile(base_has_st, 8)).to(device)
 
             optimizer.zero_grad()
             if use_full:
@@ -177,16 +251,43 @@ def train_network(
                 pred_margin = out["margin"]
                 v_logits    = out["value_logits"]
                 own_logits  = out["ownership_logits"]
+                soft_logits = out.get("soft_policy_logits")
             else:
                 pred_logits, pred_value, pred_margin = network(t_obs)
-                v_logits = own_logits = None
+                v_logits = own_logits = soft_logits = None
 
+            if mask_illegal and pred_logits.shape[-1] == 1225:
+                # Illegal logits get -inf pre-softmax: zero gradient on them,
+                # and the softmax normalizes over legal moves only.  Inference
+                # already renormalizes priors over legal moves (micro_mcts.c),
+                # so unmasked training spends capacity on logits search never
+                # sees.  Mask comes from the augmented obs planes, matching
+                # the permuted policy targets.
+                legal = torch.from_numpy(illegal_action_mask(batch_obs)).to(device)
+                pred_logits = pred_logits.masked_fill(~legal, POLICY_MASK_VALUE)
+                if soft_logits is not None:
+                    soft_logits = soft_logits.masked_fill(~legal, POLICY_MASK_VALUE)
             log_probs   = F.log_softmax(pred_logits, dim=-1)
             has_policy  = t_policy.sum(dim=-1) > 1e-6
             if has_policy.any():
                 policy_loss = -torch.sum(t_policy[has_policy] * log_probs[has_policy], dim=-1).mean()
             else:
                 policy_loss = t_policy.sum() * 0.0  # zero with correct device/grad_fn
+
+            if soft_logits is not None and soft_policy_coef > 0:
+                # Aux soft policy head (KataGoMethods.md): target is the main
+                # policy target ^(1/T), T=4, renormalized — teaches relative
+                # quality of non-best moves the sharp target washes out.
+                soft_t = t_policy.clamp(min=0.0) ** 0.25
+                soft_t = soft_t / soft_t.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                soft_lp = F.log_softmax(soft_logits, dim=-1)
+                if has_policy.any():
+                    soft_policy_loss = -torch.sum(
+                        soft_t[has_policy] * soft_lp[has_policy], dim=-1).mean()
+                else:
+                    soft_policy_loss = t_policy.sum() * 0.0
+            else:
+                soft_policy_loss = pred_margin.sum() * 0.0
 
             if v_logits is not None:
                 # W/D/L cross-entropy: classes from the scalar target
@@ -229,22 +330,48 @@ def train_network(
             else:
                 ownership_loss = pred_margin.sum() * 0.0
 
+            st_preds = out.get("st_values") if use_full else None
+            if st_preds is not None and st_value_coef > 0:
+                # Masked MSE over the short-term value heads, mean across
+                # horizons so the coef weighs the group, not each head.
+                st_sq = ((st_preds - t_st) ** 2).mean(dim=-1) * t_has_st
+                st_value_loss = st_sq.sum() / t_has_st.sum().clamp(min=1.0)
+            else:
+                st_value_loss = pred_margin.sum() * 0.0
+
             entropy     = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1).mean()
 
             (policy_loss + value_coef * value_loss + margin_coef * margin_loss
              + ownership_coef * ownership_loss
+             + soft_policy_coef * soft_policy_loss
+             + st_value_coef * st_value_loss
              - entropy_coeff * entropy).backward()
             torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
             optimizer.step()
 
             with torch.no_grad():
-                sign_acc = (pred_value.sign() == t_value.sign()).float().mean().item()
+                # sign_acc over decisive targets only: draws (z == 0) can never
+                # match the sign of the continuous value output, so including
+                # them just re-measures the draw rate, not head quality.
+                z        = t_value.squeeze(-1)
+                decisive = z.abs() > 1e-6
+                ep_dec_correct += int(
+                    ((pred_value.squeeze(-1).sign() == z.sign()) & decisive).sum())
+                ep_n_dec += int(decisive.sum())
+                ep_n_drw += int((~decisive).sum())
+                if v_logits is not None:
+                    # CE split vs the hard outcome class: separates "targets got
+                    # harder" (draw share rising) from "head got worse".
+                    ce = F.cross_entropy(v_logits, t_cls, reduction="none")
+                    ep_ce_dec += float(ce[decisive].sum())
+                    ep_ce_drw += float(ce[~decisive].sum())
 
             ep_policy   += policy_loss.item()
             ep_value    += value_loss.item()
             ep_margin   += margin_loss.item()
             ep_own      += ownership_loss.item()
-            ep_sign_acc += sign_acc
+            ep_soft     += soft_policy_loss.item()
+            ep_st       += st_value_loss.item()
             ep_batches  += 1
 
         if ep_batches > 0:
@@ -253,7 +380,12 @@ def train_network(
                 "value_loss":  ep_value    / ep_batches,
                 "margin_loss": ep_margin   / ep_batches,
                 "ownership_loss": ep_own   / ep_batches,
-                "sign_acc":    ep_sign_acc / ep_batches,
+                "soft_policy_loss": ep_soft / ep_batches,
+                "st_value_loss": ep_st     / ep_batches,
+                "sign_acc":    ep_dec_correct / max(ep_n_dec, 1),
+                "draw_frac":   ep_n_drw / max(ep_n_dec + ep_n_drw, 1),
+                "value_ce_decisive": ep_ce_dec / max(ep_n_dec, 1),
+                "value_ce_draw":     ep_ce_drw / max(ep_n_drw, 1),
             })
 
     if not epoch_losses:
@@ -263,12 +395,22 @@ def train_network(
     avg_val  = float(np.mean([e["value_loss"]  for e in epoch_losses]))
     avg_marg = float(np.mean([e["margin_loss"] for e in epoch_losses]))
     avg_own  = float(np.mean([e["ownership_loss"] for e in epoch_losses]))
+    avg_soft = float(np.mean([e["soft_policy_loss"] for e in epoch_losses]))
+    avg_st   = float(np.mean([e["st_value_loss"] for e in epoch_losses]))
     avg_sign = float(np.mean([e["sign_acc"]    for e in epoch_losses]))
+    avg_drawf = float(np.mean([e["draw_frac"]  for e in epoch_losses]))
+    avg_cedec = float(np.mean([e["value_ce_decisive"] for e in epoch_losses]))
+    avg_cedrw = float(np.mean([e["value_ce_draw"] for e in epoch_losses]))
     return {
         "policy_loss":  avg_pol,
         "value_loss":   avg_val,
         "margin_loss":  avg_marg,
         "ownership_loss": avg_own,
+        "soft_policy_loss": avg_soft,
+        "st_value_loss": avg_st,
         "total_loss":   avg_pol + avg_val,
         "sign_acc":     avg_sign,
+        "draw_frac":    avg_drawf,
+        "value_ce_decisive": avg_cedec,
+        "value_ce_draw":     avg_cedrw,
     }

@@ -39,6 +39,32 @@ class ResidualBlock(nn.Module):
         return F.relu(x + residual)
 
 
+class FixupResidualBlock(nn.Module):
+    """
+    BN-free residual block, KataGo fixed-variance style (simplified).
+
+    conv(3×3) -> ReLU -> conv(3×3) -> skip -> ×1/√2 -> ReLU.  He-init convs;
+    the 1/√2 after the add resets activation variance to ~1 each block so the
+    trunk's scale stays controlled without per-conv normalization.  A single
+    BatchNorm at the trunk end (see DualHeadNetwork norm="fixup") absorbs any
+    residual drift before the heads.  Fresh-training only - not checkpoint
+    compatible with the BN blocks.
+    """
+
+    _INV_SQRT2 = 0.7071067811865476
+
+    def __init__(self, num_filters: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(num_filters, num_filters, kernel_size=3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(num_filters, num_filters, kernel_size=3, padding=1, bias=False)
+        nn.init.kaiming_normal_(self.conv1.weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.conv2.weight, nonlinearity='relu')
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        branch = self.conv2(F.relu(self.conv1(x)))
+        return F.relu((x + branch) * self._INV_SQRT2)
+
+
 class DualHeadNetwork(nn.Module):
     """
     Residual CNN with policy + value heads for MCTS guidance.
@@ -67,24 +93,35 @@ class DualHeadNetwork(nn.Module):
     """
 
     def __init__(self, num_actions: int = 1225, num_filters: int = 128, num_blocks: int = 6,
-                 wdl: bool = False, ownership: bool = False) -> None:
+                 wdl: bool = False, ownership: bool = False, norm: str = "bn") -> None:
         super().__init__()
         self.wdl = wdl
         self.ownership = ownership
+        self.norm = norm
 
         # Input projection: 4 channels -> num_filters
         self.input_conv = nn.Conv2d(4, num_filters, kernel_size=3, padding=1, bias=False)
-        self.input_bn = nn.BatchNorm2d(num_filters)
+        if norm == "fixup":
+            # BN-free trunk (KataGo fixed-variance style, simplified): He-init
+            # everywhere, variance reset in each block, one BN at trunk end.
+            nn.init.kaiming_normal_(self.input_conv.weight, nonlinearity='relu')
+            self.input_bn = nn.Identity()
+            block_cls = FixupResidualBlock
+            self.trunk_bn = nn.BatchNorm2d(num_filters)
+        else:
+            self.input_bn = nn.BatchNorm2d(num_filters)
+            block_cls = ResidualBlock
+            self.trunk_bn = nn.Identity()
 
         # Residual tower
         self.residual_blocks = nn.Sequential(
-            *[ResidualBlock(num_filters) for _ in range(num_blocks)]
+            *[block_cls(num_filters) for _ in range(num_blocks)]
         )
 
         # Policy head: 2-filter conv -> flatten -> FC
         # 2 * 7 * 7 = 98 -> num_actions  (~120k params vs 1.92M before)
         self.policy_conv = nn.Conv2d(num_filters, 2, kernel_size=1, bias=False)
-        self.policy_bn = nn.BatchNorm2d(2)
+        self.policy_bn = nn.Identity() if norm == "fixup" else nn.BatchNorm2d(2)
         self.policy_fc = nn.Linear(2 * 7 * 7, num_actions)
 
         # Value head: 4-filter conv (spatial features) concatenated with
@@ -94,7 +131,7 @@ class DualHeadNetwork(nn.Module):
         # KataGo's global-pooling trick, which matters a lot for a
         # material-driven game like this one.
         self.value_conv = nn.Conv2d(num_filters, 4, kernel_size=1, bias=False)
-        self.value_bn = nn.BatchNorm2d(4)
+        self.value_bn = nn.Identity() if norm == "fixup" else nn.BatchNorm2d(4)
         self.value_fc1 = nn.Linear(4 * 7 * 7 + 2 * num_filters, 256)
         # wdl: 3 logits (win/draw/loss, side-to-move); legacy: tanh scalar
         self.value_fc2 = nn.Linear(256, 3 if wdl else 1)
@@ -110,11 +147,12 @@ class DualHeadNetwork(nn.Module):
 
     @staticmethod
     def infer_arch(state_dict: dict) -> dict:
-        """Infer constructor kwargs (wdl/ownership) from a checkpoint's shapes."""
+        """Infer constructor kwargs (wdl/ownership/norm) from a checkpoint's shapes."""
         v_out = state_dict["value_fc2.weight"].shape[0]
         return {
             "wdl": v_out == 3,
             "ownership": any(k.startswith("own_conv.") for k in state_dict),
+            "norm": "fixup" if "trunk_bn.weight" in state_dict else "bn",
         }
 
     def forward(self, obs: torch.Tensor, full: bool = False):
@@ -147,6 +185,7 @@ class DualHeadNetwork(nn.Module):
         # Backbone
         x = F.relu(self.input_bn(self.input_conv(x)))
         x = self.residual_blocks(x)
+        x = self.trunk_bn(x)
 
         # Policy head
         p = F.relu(self.policy_bn(self.policy_conv(x)))

@@ -3,10 +3,11 @@ Shared helpers for device detection and network instantiation.
 
 Used by both training workers (train_mcts.py) and the inference server.
 """
+import shutil
+import subprocess
+
 import torch
 import torch.nn as nn
-
-from lib.dual_network import DualHeadNetwork
 
 
 # Allow TF32 on Ampere+ Tensor Cores for conv/matmul. ~2-3x speedup on
@@ -32,25 +33,24 @@ def load_compiled_network(
     device: torch.device,
     num_actions: int = 1225,
     compile_net: bool = True,
-) -> tuple[nn.Module, DualHeadNetwork]:
+) -> tuple[nn.Module, nn.Module]:
     """
-    Instantiate a DualHeadNetwork from *state_dict*, move it to *device*, and
-    optionally wrap it with ``torch.compile``.
+    Instantiate the right network class from *state_dict*, move it to
+    *device*, and optionally wrap it with ``torch.compile``.
 
     Returns
     -------
     compiled_net : nn.Module
         The (possibly compiled) network used for inference.
-    base_net : DualHeadNetwork
+    base_net : nn.Module
         The uncompiled network - required for in-place ``load_state_dict``
         updates that preserve CUDA-graph tensor addresses.
     """
-    # Infer head configuration from the checkpoint so legacy (tanh value) and
-    # wdl/ownership checkpoints both load - the Elo anchor pool keeps old nets
+    # Dispatch by checkpoint shape so legacy (tanh value), wdl/ownership and
+    # t7g-net2 checkpoints all load - the Elo anchor pool keeps old nets
     # playable alongside new-architecture training nets.
-    net = DualHeadNetwork(num_actions=num_actions,
-                          **DualHeadNetwork.infer_arch(state_dict))
-    net.load_state_dict(state_dict)
+    from lib.net2 import build_from_state_dict
+    net = build_from_state_dict(state_dict, num_actions=num_actions)
     net.to(device)
     net.eval()
     # channels_last memory format: cuDNN + Tensor Cores operate in NHWC
@@ -69,3 +69,39 @@ def load_compiled_network(
         except Exception:
             pass
     return net, base_net
+
+
+def get_gpu_stats() -> dict[str, float]:
+    """
+    Return {"util_pct": ..., "temp_c": ...} for the first GPU, via
+    nvidia-smi (CUDA) or rocm-smi (ROCm). Empty dict if neither is
+    available or the query fails - callers should treat this as
+    best-effort telemetry, not a hard dependency.
+    """
+    if torch.version.hip is not None and shutil.which("rocm-smi"):
+        try:
+            out = subprocess.check_output(
+                ["rocm-smi", "--showuse", "--showtemp", "--json"],
+                stderr=subprocess.DEVNULL, timeout=5,
+            ).decode()
+            import json as _json
+            data = _json.loads(out)
+            card = next(iter(data.values()))
+            return {
+                "util_pct": float(card.get("GPU use (%)", card.get("GPU Utilization (%)", "nan"))),
+                "temp_c": float(card.get("Temperature (Sensor edge) (C)", card.get("Temperature (Sensor junction) (C)", "nan"))),
+            }
+        except Exception:
+            return {}
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu",
+                 "--format=csv,noheader,nounits"],
+                stderr=subprocess.DEVNULL, timeout=5,
+            ).decode().strip().splitlines()[0]
+            util, temp = out.split(",")
+            return {"util_pct": float(util), "temp_c": float(temp)}
+        except Exception:
+            return {}
+    return {}
