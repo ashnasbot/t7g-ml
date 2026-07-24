@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Microscope — play net2 in your browser</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --line: #262b37; --ink: #e6e9ef; --muted: #8b93a7;
+    --blue: #1f6bff; --green: #06c47e; --cell: #1d2130; --cell2: #222739;
+    --sel: #ffd24a; --dest: #4f8cff66;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; padding: 24px;
+  }
+  h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: .2px; }
+  h1 small { color: var(--muted); font-weight: 400; font-size: 13px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  #board {
+    display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px;
+    width: min(86vw, 460px); aspect-ratio: 1;
+  }
+  .cell {
+    background: var(--cell); border-radius: 9px; display: grid; place-items: center;
+    cursor: default; position: relative; transition: background .12s, transform .08s;
+  }
+  .cell:nth-child(odd) { background: var(--cell2); }
+  .cell.has::after {
+    content: ""; width: 66%; height: 66%; border-radius: 50%;
+    box-shadow: inset 0 -3px 6px #0006, 0 2px 5px #0007;
+  }
+  .cell.blue::after  { background: radial-gradient(circle at 35% 30%, #5b93ff, var(--blue)); }
+  .cell.green::after { background: radial-gradient(circle at 35% 30%, #2fdc9c, var(--green)); }
+  .cell.selectable { cursor: pointer; outline: 2px solid #ffffff14; }
+  .cell.selectable:hover { background: #2a3046; }
+  .cell.selected { outline: 2px solid var(--sel); }
+  .cell.dest { cursor: pointer; }
+  .cell.dest::before {
+    content: ""; position: absolute; width: 34%; height: 34%; border-radius: 50%;
+    background: var(--dest); outline: 2px solid var(--blue);
+  }
+  .cell.dest.jump::before { border-radius: 5px; }   /* square marker = jump (source vacated) */
+  .bar { display: flex; align-items: center; gap: 16px; width: min(86vw, 460px); justify-content: space-between; }
+  #score { font-variant-numeric: tabular-nums; font-weight: 600; display: flex; align-items: center; }
+  .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin: 0 6px 0 2px; vertical-align: -1px; }
+  .dot.blue { background: var(--blue); } .dot.green { background: var(--green); }
+  #status { color: var(--muted); min-height: 1.5em; text-align: center; width: min(86vw, 460px); }
+  button {
+    background: var(--blue); color: #fff; border: 0; border-radius: 9px; padding: 8px 14px;
+    font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  .meta { color: var(--muted); font-size: 12px; }
+  .meta b { color: var(--ink); font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>Microscope <small>· you (Blue) vs AshnasBot</small></h1>
+  <div class="bar">
+    <div id="score"></div>
+    <button id="new-game">New game</button>
+  </div>
+  <div class="panel"><div id="board"></div></div>
+  <div id="status">Loading…</div>
+  <div class="meta">AshnasBot · net2 · 500-sim MCGS</div>
+  <script type="module" src="./app.mjs"></script>
+</body>
+</html>

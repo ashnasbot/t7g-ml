@@ -19,10 +19,20 @@ __pycache__/
 *.gcda
 *.gcno
 build/
+# `make pages` output (GitHub Pages build artifact)
+public/
+# dev-only ORT copy for the node parity harness (`make dev-vendor`)
+webapp/spa/vendor/
+# server webapp's runtime rating DB (auto-seeded on first run)
+webapp/eval_db/
 
 # Training outputs
 checkpoints/
 models/
+export/
+# ...but the SPA ships its exported net2.onnx (re-include despite models/ above)
+!webapp/spa/models/
+!webapp/spa/models/net2.onnx
 eval_logs/
 tblog/
 rollouts/
