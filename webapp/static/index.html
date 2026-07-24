@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Microscope</title>
+<style>
+  :root {
+    --bg: #161616; --panel: #1e1e1e; --empty: #3e342a;
+    --blue: #3778d7; --green: #32af46; --sel: #e6b91e;
+    --clone: #649bff; --jump: #c35aff; --grid: #0c0c0c;
+    --text: #c8c8c8; --muted: #8a8a8a; --hud: #ebcd5a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.4 -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 16px; gap: 12px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 4px 0; letter-spacing: .5px; }
+  .hud {
+    color: var(--hud); font-size: 12px; min-height: 16px; text-align: center;
+    max-width: 560px;
+  }
+  .board-wrap { position: relative; }
+  .board {
+    display: grid; grid-template-columns: repeat(7, 56px);
+    grid-template-rows: repeat(7, 56px);
+    gap: 2px; background: var(--grid); padding: 2px; border-radius: 4px;
+  }
+  .cell {
+    background: var(--empty); border-radius: 3px; cursor: default;
+    position: relative; transition: filter .08s;
+  }
+  .cell.blue  { background: var(--blue); }
+  .cell.green { background: var(--green); }
+  .cell.clickable { cursor: pointer; }
+  .cell.clickable:hover { filter: brightness(1.15); }
+  .cell.selected { outline: 3px solid var(--sel); outline-offset: -3px; }
+  .cell .dest {
+    position: absolute; inset: 34%; border-radius: 50%; opacity: .9;
+  }
+  .cell .dest.clone { background: var(--clone); }
+  .cell .dest.jump  { background: var(--jump); }
+  .spinner {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(0,0,0,.45); border-radius: 4px; font-size: 13px;
+    color: #eee;
+  }
+  .spinner.on { display: flex; }
+  .spinner::before {
+    content: ""; width: 20px; height: 20px; margin-right: 10px;
+    border: 3px solid #555; border-top-color: var(--hud); border-radius: 50%;
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .status {
+    background: var(--panel); border-radius: 4px; padding: 8px 14px;
+    min-width: 320px; text-align: center; font-size: 13px;
+  }
+  .score { font-variant-numeric: tabular-nums; }
+  .score .b { color: var(--blue); } .score .g { color: var(--green); }
+  button {
+    background: #2a2a2a; color: var(--text); border: 1px solid #444;
+    border-radius: 4px; padding: 7px 16px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: #333; }
+  button:disabled { opacity: .5; cursor: default; }
+  input {
+    background: #111; color: var(--text); border: 1px solid #444;
+    border-radius: 4px; padding: 7px 10px; font-size: 13px;
+  }
+  #start { display: flex; gap: 8px; align-items: center; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .hidden { display: none !important; }
+  .legend { color: var(--muted); font-size: 11px; }
+  .legend .dot { display: inline-block; width: 10px; height: 10px;
+    border-radius: 50%; vertical-align: -1px; margin: 0 3px 0 10px; }
+</style>
+</head>
+<body>
+  <h1>MICROSCOPE</h1>
+
+  <div id="start">
+    <input id="name" placeholder="your name" maxlength="24" autocomplete="off">
+    <button id="startBtn">Start rated session</button>
+  </div>
+
+  <div id="game" class="hidden" style="display:flex; flex-direction:column; align-items:center; gap:12px;">
+    <div class="hud" id="hud"></div>
+    <div class="board-wrap">
+      <div class="board" id="board"></div>
+      <div class="spinner" id="spinner">thinking…</div>
+    </div>
+    <div class="status" id="status">—</div>
+    <div class="score" id="score"></div>
+    <div class="row">
+      <button id="resetBtn">New game</button>
+      <span class="legend">
+        <span class="dot" style="background:var(--clone)"></span>clone
+        <span class="dot" style="background:var(--jump)"></span>jump
+      </span>
+    </div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let SID = null;      // session id
+let ST = null;       // last state from server
+let SEL = null;      // selected "col,row" key
+let BUSY = false;    // request in flight (AI or move)
+
+async function api(path, body) {
+  const opt = { method: "POST", headers: { "Content-Type": "application/json" } };
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  return r.json();
+}
+
+// Build the 7x7 grid of cells once.
+function buildBoard() {
+  const b = $("board");
+  b.innerHTML = "";
+  for (let row = 0; row < 7; row++) {
+    for (let col = 0; col < 7; col++) {
+      const c = document.createElement("div");
+      c.className = "cell";
+      c.dataset.col = col;
+      c.dataset.row = row;
+      c.addEventListener("click", () => onCellClick(col, row));
+      b.appendChild(c);
+    }
+  }
+}
+
+function cellAt(col, row) {
+  return $("board").children[row * 7 + col];
+}
+
+function render() {
+  const s = ST;
+  // pieces
+  for (let row = 0; row < 7; row++) {
+    for (let col = 0; col < 7; col++) {
+      const c = cellAt(col, row);
+      const v = s.board[row][col];
+      c.className = "cell" + (v === 1 ? " blue" : v === 2 ? " green" : "");
+      c.replaceChildren();
+    }
+  }
+  // clickable sources + selection + destinations
+  const legal = s.legal || {};
+  if (s.human_turn && !BUSY) {
+    for (const key of Object.keys(legal)) {
+      const [col, row] = key.split(",").map(Number);
+      cellAt(col, row).classList.add("clickable");
+    }
+    if (SEL && legal[SEL]) {
+      const [sc, sr] = SEL.split(",").map(Number);
+      cellAt(sc, sr).classList.add("selected");
+      for (const m of legal[SEL]) {
+        const [tc, tr] = m.to;
+        const cell = cellAt(tc, tr);
+        cell.classList.add("clickable");
+        const dot = document.createElement("div");
+        dot.className = "dest " + (m.jump ? "jump" : "clone");
+        cell.appendChild(dot);
+      }
+    }
+  }
+  // status + score + hud
+  $("status").textContent = s.status;
+  $("score").innerHTML =
+    `<span class="b">Blue ${s.score.blue}</span> — ` +
+    `<span class="g">Green ${s.score.green}</span>` +
+    `&nbsp;&nbsp;you play <b>${s.your_color}</b>`;
+  const r = s.rating;
+  // rating: "unrated" until the first game, then "Elo N ±CI" (CI once finite)
+  const ratingStr = !r.rated ? "unrated"
+    : `Elo ${r.elo}${r.ci == null ? "" : ` ±${r.ci}`}`;
+  // career games behind the rating (what the fit is based on)
+  const career = r.games
+    ? `  ·  ${r.games} game${r.games > 1 ? "s" : ""}` : "";
+  // this session's own tally, shown separately so it can't be read as the total
+  const sessN = r.sw + r.sd + r.sl;
+  const session = sessN ? `  ·  session ${r.sw}-${r.sd}-${r.sl}` : "";
+  // "vs" while a game is in progress; "next" once it's over (opponent rotates)
+  const oppLabel = s.game_over ? "next" : "vs";
+  $("hud").textContent =
+    `${r.name} — ${ratingStr}${career}${session}` +
+    `  ·  ${oppLabel} ${r.opponent} (${r.opponent_elo})`;
+  $("spinner").classList.toggle("on", BUSY && !s.human_turn && !s.game_over);
+}
+
+function onCellClick(col, row) {
+  if (BUSY || !ST.human_turn) return;
+  const key = `${col},${row}`;
+  const legal = ST.legal || {};
+  if (SEL) {
+    if (key === SEL) { SEL = null; render(); return; }            // deselect
+    const move = (legal[SEL] || []).find(m => m.to[0] === col && m.to[1] === row);
+    if (move) { doMove(move.action); return; }                    // play dest
+    if (legal[key]) { SEL = key; render(); return; }              // reselect
+    return;
+  }
+  if (legal[key]) { SEL = key; render(); }                        // select source
+}
+
+async function doMove(action) {
+  BUSY = true; SEL = null; render();
+  ST = await api(`/api/${SID}/move`, { action });
+  await afterState();
+}
+
+// After any state update: if it's the AI's turn, keep asking it to move
+// (blocking on the server) until it's the human's turn or the game ends.
+async function afterState() {
+  while (!ST.game_over && !ST.human_turn) {
+    BUSY = true; render();
+    ST = await api(`/api/${SID}/ai-move`);
+  }
+  BUSY = false; SEL = null; render();
+}
+
+async function start() {
+  const name = $("name").value.trim() || "guest";
+  $("startBtn").disabled = true;
+  const res = await api("/api/new", { name });
+  if (res.error) { alert(res.error); $("startBtn").disabled = false; return; }
+  SID = res.session_id;
+  ST = res;
+  $("start").classList.add("hidden");
+  $("game").classList.remove("hidden");
+  buildBoard();
+  await afterState();
+}
+
+async function resetGame() {
+  ST = await api(`/api/${SID}/reset`);
+  SEL = null; BUSY = false;
+  await afterState();
+}
+
+$("startBtn").addEventListener("click", start);
+$("name").addEventListener("keydown", (e) => { if (e.key === "Enter") start(); });
+$("resetBtn").addEventListener("click", resetGame);
+</script>
+</body>
+</html>

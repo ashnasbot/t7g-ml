@@ -36,13 +36,40 @@ from typing import Iterable
 
 import numpy as np
 
+from lib import paths as _paths
+
 # ---------------------------------------------------------------------------
 # Paths / canonical config
 # ---------------------------------------------------------------------------
 
-DB_DIR = "debug/eval_db"
-MATCHES_PATH = os.path.join(DB_DIR, "matches.jsonl")
-PLAYERS_PATH = os.path.join(DB_DIR, "players.json")
+# The DB location is resolved *lazily* (per call) from the invocation dir / env
+# / --data-dir override (see lib/paths.py), so a shipped tool finds a DB bundle
+# placed next to where it runs -- even when the override is set after import.
+# In the dev tree this lands on repo/debug/eval_db, unchanged.  Every function
+# still accepts an explicit ``path=`` (tests pass their own tmp paths); the
+# module-level names ``DB_DIR`` / ``MATCHES_PATH`` / ``PLAYERS_PATH`` remain
+# readable (dynamically) via the module ``__getattr__`` below.
+
+def _db_dir() -> str:
+    return str(_paths.eval_db_dir())
+
+
+def matches_path() -> str:
+    return os.path.join(_db_dir(), "matches.jsonl")
+
+
+def players_path() -> str:
+    return os.path.join(_db_dir(), "players.json")
+
+
+def __getattr__(name: str):
+    if name == "DB_DIR":
+        return _db_dir()
+    if name == "MATCHES_PATH":
+        return matches_path()
+    if name == "PLAYERS_PATH":
+        return players_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # The live-gauntlet search config (scripts/train_mcts.py).  This is the one that
 # reproduces the 2026-07-13 rating scale; `add`/`fit` default to it so numbers
@@ -125,8 +152,10 @@ def config_hash(config: dict) -> str:
 # Player registry
 # ---------------------------------------------------------------------------
 
-def load_players(path: str = PLAYERS_PATH) -> dict:
+def load_players(path: str | None = None) -> dict:
     """Return the ``{player_id: meta}`` registry (empty dict if none yet)."""
+    if path is None:
+        path = players_path()
     if not os.path.exists(path):
         return {}
     with open(path) as f:
@@ -141,21 +170,25 @@ def _write_players(reg: dict, path: str) -> None:
     os.replace(tmp, path)
 
 
-def register_player(player_id: str, meta: dict, path: str = PLAYERS_PATH) -> dict:
+def register_player(player_id: str, meta: dict, path: str | None = None) -> dict:
     """Insert/refresh one player's metadata (merge); returns the full registry.
 
     ``meta`` keys: ``kind`` ("net"|"mm"|"stauf"), ``path`` or ``depth``, ``run``,
     ``iteration``, ``arch``, and ``fixed_elo`` for pinned anchors.
     """
+    if path is None:
+        path = players_path()
     reg = load_players(path)
     reg[player_id] = {**reg.get(player_id, {}), **meta}
     _write_players(reg, path)
     return reg
 
 
-def set_fixed_elo(player_id: str, elo: float | None, path: str = PLAYERS_PATH) -> dict:
+def set_fixed_elo(player_id: str, elo: float | None, path: str | None = None) -> dict:
     """Pin ``player_id`` at ``elo`` (freeze a derived deterministic anchor), or
     unpin it when ``elo`` is None.  Returns the full registry."""
+    if path is None:
+        path = players_path()
     reg = load_players(path)
     entry = reg.setdefault(player_id, {})
     if elo is None:
@@ -170,13 +203,15 @@ def set_fixed_elo(player_id: str, elo: float | None, path: str = PLAYERS_PATH) -
 # Match store (append-only jsonl)
 # ---------------------------------------------------------------------------
 
-def append_matches(rows: Iterable[dict], path: str = MATCHES_PATH) -> int:
+def append_matches(rows: Iterable[dict], path: str | None = None) -> int:
     """Append match rows; returns the number written.
 
     Each row: ``{"a", "b", "a_is_blue", "result", "config_hash", "ts"}`` with
     ``result`` in {+1, 0, -1} from a's perspective.  ``ts`` is filled if
     absent.
     """
+    if path is None:
+        path = matches_path()
     rows = list(rows)
     if not rows:
         return 0
@@ -191,8 +226,10 @@ def append_matches(rows: Iterable[dict], path: str = MATCHES_PATH) -> int:
 
 
 def load_matches(config_hash_filter: str | None = None,
-                 path: str = MATCHES_PATH) -> list[dict]:
+                 path: str | None = None) -> list[dict]:
     """Load raw match rows, optionally filtered to a single ``config_hash``."""
+    if path is None:
+        path = matches_path()
     if not os.path.exists(path):
         return []
     out = []
@@ -208,7 +245,7 @@ def load_matches(config_hash_filter: str | None = None,
 
 
 def load_counts(config_hash_filter: str,
-                path: str = MATCHES_PATH) -> tuple[list[str], dict]:
+                path: str | None = None) -> tuple[list[str], dict]:
     """Aggregate stored matches for one config into pairwise W/D/L counts.
 
     Returns ``(names, counts)`` where ``names`` is the sorted list of player
@@ -232,7 +269,7 @@ def load_counts(config_hash_filter: str,
 
 
 def pair_game_count(config_hash_filter: str, a: str, b: str,
-                    path: str = MATCHES_PATH) -> int:
+                    path: str | None = None) -> int:
     """How many games between players ``a`` and ``b`` already exist at a config.
 
     Used by ``add`` to skip pairs already at their target game count

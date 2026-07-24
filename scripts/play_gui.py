@@ -19,8 +19,8 @@ Usage:
     python scripts/play_gui.py --player minimax --player-depth 3 --opponent micro3 --depth 3 --ai-delay 1.0
 """
 import argparse
-import os
 import pathlib
+import random
 import sys
 import threading
 
@@ -31,11 +31,12 @@ import pyglet
 import pyglet.shapes as shapes
 
 import torch
-from lib.dual_network import DualHeadNetwork
+from lib import eval_db as edb
+from lib import paths
 from lib.mcgs import MCGS
 from lib.t7g import new_board, apply_move, check_terminal
 from lib.t7g import find_best_move, count_cells, action_masks, action_to_move
-from lib.t7g import BLUE, GREEN
+from lib.t7g import BLUE, GREEN, tick_clock, CLOCK_LIMIT
 
 
 #  Layout
@@ -102,6 +103,91 @@ def coords_to_action(fc, fr, tc, tr):
     return piece * 25 + move
 
 
+#  Rating mode (eval-DB integration)
+#
+#  A human is just another player node in the offline eval DB (lib/eval_db.py):
+#  every finished game is appended as a match row against whatever rated
+#  opponent they faced, tagged with the canonical net-rating config_hash so it
+#  fits alongside the whole ladder.  Opponents are chosen adaptively (nearest
+#  rated Elo to the running estimate) so a tight rating falls out of few games.
+
+_NET_CACHE: dict = {}          # path -> MCGS agent (avoid reloading on revisit)
+
+
+def _load_network(checkpoint, device):
+    """Load a checkpoint into the right architecture, auto-detected from the
+    state dict (t7g-net2 or the legacy DualHeadNetwork) -- so the bundled
+    ``best.pt`` and any historical net both load.  CPU inference: no compile."""
+    from lib.device_utils import load_compiled_network
+    blob = torch.load(checkpoint, map_location=device, weights_only=False)
+    state = blob["network"] if isinstance(blob, dict) and "network" in blob else blob
+    net, _ = load_compiled_network(state, device, num_actions=1225, compile_net=False)
+    return net
+
+
+def _rate_config_hash():
+    """The canonical net-rating config the whole ladder is fitted under."""
+    return edb.config_hash({})
+
+
+def _load_rate_agent(path, device):
+    """MCGS opponent built at the canonical eval-DB config (so games are
+    config-comparable with `eval_db add`).  Cached per checkpoint path."""
+    if path in _NET_CACHE:
+        return _NET_CACHE[path]
+    cfg = edb.DEFAULT_CONFIG
+    network = _load_network(path, device)
+    agent = MCGS(network,
+                 num_simulations=cfg["sims"], c_puct=cfg["c_puct"],
+                 gumbel_k=cfg["gumbel_k"], sigma_scale=cfg["sigma_scale"],
+                 completion_n0=cfg["completion_n0"])
+    _NET_CACHE[path] = agent
+    return agent
+
+
+def _fit_anchors(names, reg):
+    """Anchor the fit on every pinned (fixed_elo) player, else just stauf.
+
+    In the full DB only stauf is pinned (unchanged behaviour); an exported
+    reference bundle pins every opponent at its full-DB Elo so the human is
+    rated on the true scale from just a handful of games/models."""
+    a = {n: reg[n]["fixed_elo"] for n in names
+         if reg.get(n, {}).get("fixed_elo") is not None}
+    return a or {edb.STAUF_PLAYER_ID: edb.STAUF_ANCHOR_ELO}
+
+
+def build_rating_pool(chash):
+    """Rated opponents available to play interactively, sorted by Elo.
+
+    Each entry is ``(player_id, kind, payload, elo)`` where kind is
+    ``'net'`` (payload=checkpoint path), ``'stauf'`` (payload=depth), or
+    ``'mm'`` (payload=minimax depth).  Only players that are (a) rated at the
+    canonical config and (b) actually runnable (checkpoint on disk / a
+    deterministic engine) qualify -- so the human is always bracketed by
+    opponents whose Elo is already known.
+    """
+    names, counts = edb.load_counts(chash)
+    if not names:
+        return []
+    reg = edb.load_players()
+    elo, _ = edb.fit_whr(names, counts, anchors=_fit_anchors(names, reg))
+    pool = []
+    for k, pid in enumerate(names):
+        meta = reg.get(pid, {})
+        kind = meta.get("kind")
+        e = float(elo[k])
+        if pid == edb.STAUF_PLAYER_ID:
+            pool.append((pid, "stauf", meta.get("depth", edb.STAUF_DEPTH), e))
+        elif kind == "mm":
+            pool.append((pid, "mm", meta["depth"], e))
+        elif kind == "net":
+            path = paths.find_checkpoint(pid)     # search the data bundle
+            if path is not None:
+                pool.append((pid, "net", str(path), e))
+    pool.sort(key=lambda c: c[3])
+    return pool
+
+
 #  Main window
 
 class MicroscopeApp(pyglet.window.Window):
@@ -109,7 +195,8 @@ class MicroscopeApp(pyglet.window.Window):
     def __init__(self, mcts_agent=None, opponent="mcts", minimax_depth=2,
                  human_color="blue", engine="minimax",
                  player_mcts=None, player_engine="human", player_depth=2,
-                 ai_delay=0.5):
+                 ai_delay=0.5, rate_id=None, rate_pool=None,
+                 rate_first_stauf=True, device=None):
         super().__init__(WIN_W, WIN_H, caption="Microscope", resizable=False)
         # Opponent (Green) config
         self.mcts_agent   = mcts_agent
@@ -123,6 +210,24 @@ class MicroscopeApp(pyglet.window.Window):
         self.player_depth  = player_depth
         self.ai_delay      = ai_delay
         self._last_pass    = None           # set by _apply_move on forced pass
+        # Rating mode
+        self.rate_id       = rate_id        # None => rating disabled
+        self.rate_pool     = rate_pool or []
+        self.device        = device or torch.device("cpu")
+        self.rate_chash    = _rate_config_hash()
+        self.rate_name     = (rate_id or "").split("/")[-1]
+        self.rate_n = self.rate_w = self.rate_d = self.rate_l = 0
+        self.cur_opp_id    = None
+        self.cur_opp_elo   = 0.0
+        if self.rate_id:
+            elos = [c[3] for c in self.rate_pool]
+            self.rate_est = float(np.median(elos)) if elos else 1000.0
+            self.rate_ci  = float("inf")
+            edb.register_player(self.rate_id, {"kind": "human", "name": self.rate_name})
+            first = None
+            if rate_first_stauf:
+                first = next((c for c in self.rate_pool if c[1] == "stauf"), None)
+            self._rate_apply_opponent(first or self._rate_pick_next())
         self._reset()
 
     @property
@@ -136,8 +241,11 @@ class MicroscopeApp(pyglet.window.Window):
         self.turn        = True          # Blue always goes first
         self.selected    = None          # (col, row) of selected piece
         self.valid_dests = {}            # (col, row) -> action
-        self.board_hist  = {}
+        self.clock       = 0             # halfmove clock (plies since a clone)
         self._last_pass  = None
+        self._blue_result = None         # +1/0/-1 (Blue's perspective) at game end
+        self._dirty       = False        # touched by edit mode => not recorded
+        self._recorded    = False        # guard against double-recording
         if self.mcts_agent:
             self.mcts_agent.root = None  # discard old search tree
         if self.player_mcts and self.player_mcts is not self.mcts_agent:
@@ -260,6 +368,7 @@ class MicroscopeApp(pyglet.window.Window):
         self.selected    = None
         self.valid_dests = {}
         self.state       = S_EDIT
+        self._dirty      = True   # hand-edited position: don't record this game
         self._edit_status()
 
     def _edit_status(self):
@@ -284,7 +393,7 @@ class MicroscopeApp(pyglet.window.Window):
             self.mcts_agent.root = None
         if self.player_mcts and self.player_mcts is not self.mcts_agent:
             self.player_mcts.root = None
-        self.board_hist  = {}
+        self.clock       = 0
         self.selected    = None
         self.valid_dests = {}
         self._last_pass  = None
@@ -348,6 +457,7 @@ class MicroscopeApp(pyglet.window.Window):
             # Forced pass: AI has no legal moves but game is not over
             passer = "Blue" if self.turn else "Green"
             self.turn = not self.turn
+            self.clock += 1
             msg = f"{passer} passes (no moves)  [{self._fmt_score()}]"
             if self._is_human_turn():
                 self.state  = S_SELECT
@@ -382,7 +492,7 @@ class MicroscopeApp(pyglet.window.Window):
                 self._start_ai_move()
 
     def _apply_move(self, action):
-        """Apply action, flip turn, check repetition + terminal + forced pass."""
+        """Apply action, flip turn, check clock + terminal + forced pass."""
         self.board = apply_move(self.board, action, self.turn)
         if self.mcts_agent:
             self.mcts_agent.advance_tree(action)
@@ -393,19 +503,19 @@ class MicroscopeApp(pyglet.window.Window):
         self._last_pass  = None
         self.turn        = not self.turn
 
-        # 3-fold repetition
-        key = self.board.tobytes() + bytes([self.turn])
-        self.board_hist[key] = self.board_hist.get(key, 0) + 1
-        if self.board_hist[key] >= 3:
-            b, g = count_cells(self.board)
-            winner = "Blue" if b > g else ("Green" if g > b else "nobody (draw)")
-            self._end_game(f"3-fold repetition - {winner} wins by cell count")
+        # Halfmove clock (libataxx rule): drawn after CLOCK_LIMIT plies
+        # without a clone move.
+        self.clock = tick_clock(self.clock, action)
+        if self.clock >= CLOCK_LIMIT:
+            self._blue_result = 0
+            self._end_game(f"{CLOCK_LIMIT} plies without a clone - draw")
             return
 
         # Terminal state
         is_terminal, terminal_value = check_terminal(self.board, self.turn)
         if is_terminal:
             blue_val = terminal_value if self.turn else -terminal_value
+            self._blue_result = 1 if blue_val > 0 else (-1 if blue_val < 0 else 0)
             if blue_val > 0:
                 self._end_game("Blue wins!")
             elif blue_val < 0:
@@ -419,23 +529,104 @@ class MicroscopeApp(pyglet.window.Window):
         if not np.any(action_masks(self.board, self.turn)):
             self._last_pass = "Blue" if self.turn else "Green"
             self.turn = not self.turn
+            self.clock += 1
 
     def _end_game(self, msg):
         self.state  = S_OVER
         self.status = f"GAME OVER - {msg}  ({self._fmt_score()})  |  [R] to restart"
+        if (self.rate_id and not self._dirty and not self._recorded
+                and self._blue_result is not None):
+            self._recorded = True
+            self._rate_record()
+
+    #  Rating orchestration
+
+    def _rate_apply_opponent(self, opp):
+        """Switch the Green opponent to ``opp`` (player_id, kind, payload, elo)."""
+        oid, kind, payload, elo = opp
+        self.cur_opp_id  = oid
+        self.cur_opp_elo = elo
+        if kind == "net":
+            self.mcts_agent = _load_rate_agent(payload, self.device)
+            self.opponent = self.engine = "mcts"
+        elif kind == "stauf":
+            self.mcts_agent = None
+            self.opponent = self.engine = "stauf"
+            self.mm_depth = payload
+        else:                                   # deterministic minimax (MMd)
+            self.mcts_agent = None
+            self.opponent = self.engine = "micro3"
+            self.mm_depth = payload
+
+    def _rate_pick_next(self):
+        """Adaptive matchmaking: a rated opponent near the current estimate,
+        avoiding an immediate rematch, with a little jitter for game variety."""
+        cands = sorted(self.rate_pool, key=lambda c: abs(c[3] - self.rate_est))
+        near = cands[:3] or cands
+        choices = [c for c in near if c[0] != self.cur_opp_id] or near
+        return random.choice(choices)
+
+    def _rate_refit(self):
+        """Re-fit the whole DB (cheap, pure-numpy) to update the live estimate."""
+        names, counts = edb.load_counts(self.rate_chash)
+        if self.rate_id not in names:
+            return
+        reg = edb.load_players()
+        elo, hess = edb.fit_whr(names, counts, anchors=_fit_anchors(names, reg))
+        i = names.index(self.rate_id)
+        self.rate_est = float(elo[i])
+        self.rate_ci  = float(edb.whr_ci95(hess)[i])
+
+    def _rate_record(self):
+        """Append the finished game, refit, alternate colour, pick next foe."""
+        hr = self._blue_result if self.human_blue else -self._blue_result
+        edb.append_matches([{
+            "a": self.rate_id, "b": self.cur_opp_id,
+            "a_is_blue": self.human_blue, "result": int(hr),
+            "config_hash": self.rate_chash,
+        }])
+        self.rate_n += 1
+        self.rate_w += hr > 0
+        self.rate_l += hr < 0
+        self.rate_d += hr == 0
+        self._rate_refit()
+        ci = "inf" if not np.isfinite(self.rate_ci) else f"{self.rate_ci:.0f}"
+        print(f"game {self.rate_n}: {'W' if hr>0 else 'L' if hr<0 else 'D'} "
+              f"vs {self.cur_opp_id} ({self.cur_opp_elo:.0f})  ->  "
+              f"est {self.rate_est:.0f} +/-{ci}  ({self.rate_w}-{self.rate_d}-{self.rate_l})",
+              flush=True)
+        self.human_blue = not self.human_blue      # cancel first-move bias
+        self._rate_apply_opponent(self._rate_pick_next())
+
+    def _rate_hud(self):
+        ci = "?" if not np.isfinite(self.rate_ci) else f"{self.rate_ci:.0f}"
+        you = "Blue" if self.human_blue else "Green"
+        return (f"RATE {self.rate_name}:  Elo {self.rate_est:.0f} +/-{ci}   "
+                f"n={self.rate_n}  W{self.rate_w} D{self.rate_d} L{self.rate_l}   "
+                f"next: {self.cur_opp_id} ({self.cur_opp_elo:.0f})  you={you}")
+
+    def on_close(self):
+        if self.rate_id and self.rate_n:
+            ci = "inf" if not np.isfinite(self.rate_ci) else f"{self.rate_ci:.0f}"
+            print(f"\n=== {self.rate_id}: {self.rate_est:.0f} +/-{ci} Elo over "
+                  f"{self.rate_n} games ({self.rate_w}-{self.rate_d}-{self.rate_l}) ===")
+            print(f"Refit anytime with: python scripts/eval_db.py fit --anchor "
+                  f"{edb.STAUF_PLAYER_ID}={edb.STAUF_ANCHOR_ELO:.0f}")
+        super().on_close()
 
     #  AI background thread
 
     def _start_ai_move(self):
         board_snap = self.board.copy()
         turn_snap  = self.turn
+        clock_snap = self.clock
         cur_mcts, cur_engine, cur_depth = self._get_current_ai()
         result = [None]
         done   = [False]
 
         def compute():
             if cur_engine == "mcts" and cur_mcts:
-                probs  = cur_mcts.search(board_snap, turn_snap)
+                probs  = cur_mcts.search(board_snap, turn_snap, clock=clock_snap)
                 action = cur_mcts.select_action(probs, temperature=0,
                                                 best_action=cur_mcts.last_best_action)
             else:
@@ -548,18 +739,25 @@ class MicroscopeApp(pyglet.window.Window):
         if self.state != S_OVER:
             shapes.Circle(WIN_W - 18, INFO_H // 2, 7, color=dot_color).draw()
 
+        # Rating HUD (top strip)
+        if self.rate_id:
+            pyglet.text.Label(
+                self._rate_hud(),
+                font_name="Arial", font_size=10,
+                x=10, y=WIN_H - 12,
+                anchor_x="left", anchor_y="center",
+                color=(235, 205, 90, 255),
+                width=WIN_W - 20, multiline=False,
+            ).draw()
+
 
 #  Entry point
 
 def _build_mcts(checkpoint, simulations, device=None):
     if device is None:
-        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         device = torch.device("cpu")
     print(f"Loading {checkpoint}  (device: {device})")
-    network = DualHeadNetwork(num_actions=1225).to(device)
-    ckpt    = torch.load(checkpoint, weights_only=False)
-    network.load_state_dict(ckpt["network"])
-    network.eval()
+    network = _load_network(checkpoint, device)
     agent = MCGS(network, num_simulations=simulations)
     print(f"MCTS agent ready  ({simulations} sims/move)")
     return agent
@@ -589,10 +787,44 @@ def main():
                         help="Blue player search depth (default: 2)")
     parser.add_argument("--ai-delay", type=float, default=0.5,
                         help="Seconds to pause between AI moves in AI vs AI mode (default: 0.5)")
+    # Rating mode
+    parser.add_argument("--rate", type=str, default=None, metavar="NAME",
+                        help="Rate a human player: record games to the eval DB as "
+                             "player 'human/NAME' and show a live Elo estimate")
+    parser.add_argument("--rate-first-stauf", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Play game 1 vs the stauf gauge for a direct anchor pin "
+                             "(default on)")
+    parser.add_argument("--data-dir", type=str, default=None, metavar="DIR",
+                        help="Root of the models+eval-DB bundle shipped separately "
+                             "from the wheel (else searched via T7G_DATA_DIR / cwd)")
     args = parser.parse_args()
 
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.data_dir:
+        paths.set_data_root(args.data_dir)
+
     device = torch.device("cpu")
+
+    # --- Rating mode: adaptive matchmaking over the rated eval-DB ladder ---
+    if args.rate:
+        chash = _rate_config_hash()
+        pool = build_rating_pool(chash)
+        if not pool:
+            print(f"Error: no rated opponents at config {chash}. "
+                  f"Run `python scripts/eval_db.py add ...` first.")
+            return 1
+        rate_id = f"human/{args.rate}"
+        print(f"Data: {paths.describe()}")
+        print(f"Rating {rate_id}: {len(pool)} rated opponents, "
+              f"{pool[0][3]:.0f}..{pool[-1][3]:.0f} Elo  (config {chash})")
+        print("Play a handful of games; opponents adapt toward your level. "
+              "Esc when done.")
+        MicroscopeApp(
+            human_color="blue", rate_id=rate_id, rate_pool=pool,
+            rate_first_stauf=args.rate_first_stauf, device=device,
+        )
+        pyglet.app.run()
+        return 0
 
     # --- Build opponent (Green) ---
     mcts_agent = None
@@ -650,7 +882,7 @@ def main():
         if args.opponent == "mcts":
             green_label = f"MCTS ({args.simulations} sims)"
         elif args.opponent == "micro4t":
-            green_label = f"Micro4t-1000ms"
+            green_label = "Micro4t-1000ms"
         else:
             green_label = f"{args.opponent}-{args.depth}"
         print(f"AI vs AI:  Blue={blue_label}  Green={green_label}  delay={args.ai_delay}s")

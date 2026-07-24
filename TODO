@@ -1,0 +1,9 @@
+# TODO items
+## little fixes
+- Sims sweep with decent model
+- Port the C engines (Stauf, minimax) to the browser webapp as opponents
+
+## UAI / Future goals
+- [ ] support UAI protocol
+- [ ] validate our variant is 'legal'
+- [ ] test vs kz04px's engines on GitHub

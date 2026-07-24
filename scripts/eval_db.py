@@ -101,13 +101,13 @@ def _worker_game(args):
     kind_a, pa = _players[ia]
     kind_b, pb = _players[ib]
     if kind_a == "net" and kind_b == "net":
-        result = play_net_vs_net_game(_fresh_mcts(pa), _fresh_mcts(pb), a_is_blue)
+        result, _, _ = play_net_vs_net_game(_fresh_mcts(pa), _fresh_mcts(pb), a_is_blue)
     elif kind_a == "net":                     # net vs deterministic anchor
-        result, _ = play_eval_game(_fresh_mcts(pa), pb, 0.0,       # pb = depth (stauf=6)
-                                   _anchor_engine(kind_b), False, a_is_blue)
+        result, _, _, _ = play_eval_game(_fresh_mcts(pa), pb, 0.0,  # pb = depth (stauf=6)
+                                         _anchor_engine(kind_b), False, a_is_blue)
     elif kind_b == "net":                     # anchor vs net: flip perspective
-        result, _ = play_eval_game(_fresh_mcts(pb), pa, 0.0,
-                                   _anchor_engine(kind_a), False, not a_is_blue)
+        result, _, _, _ = play_eval_game(_fresh_mcts(pb), pa, 0.0,
+                                         _anchor_engine(kind_a), False, not a_is_blue)
         result = -result
     else:                                     # anchor vs anchor: not scheduled
         return ia, ib, 0, a_is_blue
@@ -281,7 +281,8 @@ def cmd_add(args):
     print(f"config {chash}: {n_pairs} pairs need games, {total_new} to play, "
           f"{args.sims} sims/move, {args.workers} workers")
 
-    rows, t0 = [], time.time()
+    rows, t0, done = [], time.time(), 0
+    tqdm_disabled = bool(os.environ.get("TQDM_DISABLE"))
     with multiprocessing.get_context("spawn").Pool(
         processes=min(args.workers, len(tasks)),
         initializer=_worker_init,
@@ -295,9 +296,14 @@ def cmd_add(args):
                 "a_is_blue": bool(a_is_blue), "result": int(disc),
                 "config_hash": chash,
             })
-            if len(rows) >= 200:                     # periodic flush (crash-safe)
-                edb.append_matches(rows)
-                rows = []
+            done += 1
+            if len(rows) >= 20:                      # periodic flush (crash-safe;
+                edb.append_matches(rows)             # engine games can be ~1 min
+                rows = []                            # each, keep the loss window small)
+            if tqdm_disabled and done % 25 == 0:     # heartbeat for redirected logs
+                dt = time.time() - t0
+                print(f"  {done}/{len(tasks)} games  {dt/done:.1f}s/game  "
+                      f"eta {(len(tasks)-done)*dt/done/60:.0f}m", flush=True)
     edb.append_matches(rows)
     print(f"Played {total_new} games in {time.time() - t0:.0f}s -> {edb.MATCHES_PATH}")
 
@@ -364,7 +370,8 @@ def cmd_fit(args):
         print(f"{names[k]:<26}{elo[k]:>7.0f}  {'+/-' + format(ci[k], '.0f'):>8}  "
               f"{w_:>5} {d_:>4} {l_:>5}{pin}")
 
-    out = args.out or f"debug/eval_db/ratings_{chash}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    out = args.out or os.path.join(
+        edb.DB_DIR, f"ratings_{chash}_{time.strftime('%Y%m%d_%H%M%S')}.json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     import json
     curves = _run_curves(names, elo, reg)
