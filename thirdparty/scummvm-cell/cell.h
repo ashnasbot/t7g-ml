@@ -25,6 +25,15 @@
  *
  */
 
+/*
+ * MODIFIED for t7g-ml, notice added 2026-07-25.
+ *
+ * Modified from the ScummVM original - adding setMoveCount(), marked below
+ *
+ * Base version: scummvm/scummvm b91b8a0d08e07b07991e9fa16cba16301c415d1a.
+ * See README.md in this directory.
+ */
+
 #ifndef GROOVIE_LOGIC_CELL_H
 #define GROOVIE_LOGIC_CELL_H
 
@@ -48,6 +57,7 @@ public:
 	byte getEndX();
 	byte getEndY();
 
+	// ---- ADDED for t7g-ml (not in the ScummVM original) ----
 	// Seed the move counter so calcMove picks a varied entry from the depths[]
 	// lookup table (index = 3*(depth-2) + _moveCount%3).  A fresh instance
 	// always has _moveCount==0, which after the internal ++_moveCount gives

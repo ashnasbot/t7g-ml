@@ -1,39 +1,48 @@
 # ScummVM `CellGame` — the original 7th Guest Stauf AI
 
-`cell.cpp` and `cell.h` are vendored unmodified from
+`cell.cpp` and `cell.h` are vendored from
 [ScummVM](https://github.com/scummvm/scummvm) `engines/groovie/logic/`. They
 implement `Groovie::CellGame`, the AI Stauf plays in the microscope puzzle.
 
-Used here as the fixed anchor of the rating ladder (`lib/eval_db.py`) and, via
-`src/stauf_wasm.cpp`, as a selectable opponent in the browser SPA.
+Used via `src/stauf_wasm.cpp`, as a selectable opponent in the browser SPA.
 
-> **Provenance:** the upstream commit was not recorded when these were first
-> copied into the untracked `3rd_party/cell/`. The files are unmodified. Diff
-> against upstream and pin the hash here before relying on this for compliance.
+## Provenance
+
+**Base version: `b91b8a0d08e07b07991e9fa16cba16301c415d1a`** (2024-01-08,
+*"GROOVIE: ScummVM was upgraded to GPLv3. Sync the secondary license with it"*).
+
+Differences from upstream:
+
+| File | Difference |
+|---|---|
+| `cell.cpp` | none (content identical) |
+| `cell.h` | **modified** - adds `CellGame::setMoveCount()`, 7 lines |
+
+Both files also have CRLF line endings and no trailing newline, from the
+original copy.
+
+### The `cell.h` modification
+
+`setMoveCount()` exposes the private `_moveCount` field so it can be seeded from
+outside the class. `calcMove()` picks its real search depth with
+`depths[3*(depth-2) + _moveCount%3]`, and a fresh `CellGame` always starts at 0
+— so without this, every call would use the same depth slot. Seeding it with a
+per-side cumulative move index is what reproduces the original game's
+move-to-move depth variation.
 
 ## Licence — GPLv3-or-later
 
 Full text in `LICENSE`. Note this is stricter than ScummVM overall (GPLv2+);
 these two files carry a v3+ header.
 
-They also carry a notice that **MojoTouch** was *exclusively* licensed this code
-for closed-source products on 2021-11-10. That grant confers nothing on us, and
-is why asking for a permissive relicence would likely fail: granting e.g. MIT
-would permit closed-source use by anyone, cutting across that exclusivity. Treat
-these files as GPLv3-only here.
-
 ### Effect on the rest of the repo
 
-The project is MIT. Vendoring GPL code here relicenses none of it — MIT files
-stay MIT and are reusable as such, including out of the published SPA.
+The project is MIT. with this vendored GPL code here only.
 
-What is affected is any **artefact that links this code in**: `make stauf-wasm`,
-and so the `public/` bundle from `make pages`, is conveyed under GPLv3. That
-target emits `LICENSE.GPLv3` and `README-licensing.md` (the source offer);
-`public/` is gitignored, so those must be generated, not committed.
-
-Corresponding Source is defined by function, not licence — MIT source satisfies
-it, being GPL-compatible and more permissive. No relicensing needed.
+Any **artefact that links this code in** such as `make stauf-wasm` is also
+GPL, and so the `public/` bundle from `make pages`, is conveyed under GPLv3.
+That target emits `LICENSE.GPLv3` and `README-licensing.md` (the source offer);
+nothing commited, by design.
 
 ## Keeping the GPL surface to two files
 
@@ -58,9 +67,3 @@ they produce is GPLv3, because it contains `CellGame`.
 source 3rd_party/emsdk/emsdk_env.sh
 make stauf-wasm          # -> build/wasm/stauf.{mjs,wasm}
 ```
-
-`tests/test_stauf_wasm.py` asserts this build plays identically to the native
-`cell_dll.so` that anchors the ladder.
-
-The native build still comes from the untracked `3rd_party/cell/` working copy
-(`cell_dll.cpp` + CMake) and is not distributed.
