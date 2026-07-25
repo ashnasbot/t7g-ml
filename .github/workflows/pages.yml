@@ -3,15 +3,18 @@ name: Deploy webapp to GitHub Pages
 # Builds the self-contained SPA and publishes it to GitHub Pages.  The wasm
 # search engine is compiled here (emscripten) rather than committed; net2.onnx
 # and the page sources are already in the repo, and onnxruntime-web loads from
-# a CDN at runtime (see webapp/spa/app.mjs).
+# a CDN at runtime (see webapp/app.mjs).
 
 on:
   push:
     branches: [main]
     paths:
-      - 'webapp/spa/**'
+      - 'webapp/**'
       - 'src/micro_mcts.c'
       - 'src/bb_core.h'
+      - 'src/stauf_wasm.cpp'
+      - 'thirdparty/scummvm-cell/**'
+      - 'LICENSE'
       - 'Makefile'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
@@ -37,15 +40,12 @@ jobs:
         with:
           version: 6.0.4
 
-      - name: Build the wasm search engine
-        run: make wasm
-
-      - name: Assemble public/
-        run: |
-          mkdir -p public/models
-          cp webapp/spa/index.html webapp/spa/app.mjs webapp/spa/engine.mjs public/
-          cp webapp/spa/models/net2.onnx public/models/
-          cp build/wasm/micro_mcts.mjs build/wasm/micro_mcts.wasm public/
+      # Delegated to `make pages` rather than repeated here: the bundle now
+      # includes the GPLv3 Stauf module, and the licence + written offer it
+      # requires are emitted by that target.  A second hand-maintained copy list
+      # would silently ship the wasm without them.
+      - name: Build the wasm engines and assemble public/
+        run: make pages
 
       - uses: actions/upload-pages-artifact@v3
         with:

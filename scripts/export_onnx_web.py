@@ -6,7 +6,7 @@ sidecar) so the browser fetches exactly one model file.
 
 Usage:
     python scripts/export_onnx_web.py \
-        export/models/run_net2b/promoted_iter0085.pt webapp/spa/models/net2.onnx
+        export/models/run_net2b/promoted_iter0085.pt webapp/models/net2.onnx
 """
 import argparse
 import pathlib
@@ -22,6 +22,13 @@ sys.path.insert(0, str(REPO))
 
 from lib.net2 import build_from_state_dict  # noqa: E402
 from lib.t7g import board_to_obs, new_board  # noqa: E402
+
+
+# ONNX opset for the exported model.  18 is what torch's current (dynamo)
+# exporter actually produces -- it has an opset-18 floor and quietly ignores a
+# lower request -- and is comfortably within what the onnxruntime-web build
+# pinned in webapp/app.mjs supports.  Verified after export below.
+OPSET = 18
 
 
 class _Wrapper(torch.nn.Module):
@@ -63,11 +70,26 @@ def main():
             dynamic_axes={"obs": {0: "batch"},
                           "policy_logits": {0: "batch"},
                           "value": {0: "batch"}},
-            opset_version=17, do_constant_folding=True,
+            opset_version=OPSET, do_constant_folding=True,
         )
         # Collapse any external-data sidecar into a single self-contained file.
         model = onnx.load(str(tmp), load_external_data=True)
         onnx.save_model(model, str(args.out), save_as_external_data=False)
+
+    # torch.onnx.export treats opset_version as a request, not a guarantee, and
+    # silently emits a higher one rather than failing (this asked for 17 for a
+    # long time and shipped 18).  The browser pins one onnxruntime-web build, so
+    # a silent bump is a compatibility change nobody would notice until the page
+    # broke.  Assert what actually came out.
+    emitted = {i.domain or "ai.onnx": i.version for i in onnx.load(str(args.out)).opset_import}
+    got = emitted.get("ai.onnx")
+    if got != OPSET:
+        raise SystemExit(
+            f"exported opset {got}, expected {OPSET} (all: {emitted}).\n"
+            f"torch {torch.__version__}'s exporter cannot honour {OPSET}; either raise OPSET "
+            f"and confirm onnxruntime-web still supports it, or pass dynamo=False to "
+            f"torch.onnx.export (the legacy exporter honours lower opsets, but is deprecated)."
+        )
 
     # Parity check: onnxruntime CPU vs torch on a few boards.
     import onnxruntime as ort

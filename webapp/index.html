@@ -53,19 +53,58 @@
     font: inherit; font-weight: 600; cursor: pointer;
   }
   button:hover { filter: brightness(1.08); }
-  .meta { color: var(--muted); font-size: 12px; }
+  .meta { color: var(--muted); font-size: 12px; text-align: center; width: min(86vw, 460px); }
   .meta b { color: var(--ink); font-weight: 600; }
+  .meta a { color: var(--muted); }
+  select {
+    background: var(--cell2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 9px; padding: 8px 10px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  select:hover { border-color: #3a4260; }
+  .controls { display: flex; gap: 10px; align-items: center; }
+  .legal { color: var(--muted); font-size: 11px; text-align: center; width: min(86vw, 560px); line-height: 1.6; }
+  .legal a { color: #7fa6ff; }
 </style>
 </head>
 <body>
-  <h1>Microscope <small>· you (Blue) vs AshnasBot</small></h1>
+  <h1>Microscope <small>· you play Blue</small></h1>
   <div class="bar">
     <div id="score"></div>
-    <button id="new-game">New game</button>
+    <div class="controls">
+      <select id="opponent" aria-label="Opponent">
+        <option value="net" selected>AshnasBot</option>
+        <option value="stauf">Stauf</option>
+      </select>
+      <button id="new-game">New game</button>
+    </div>
   </div>
   <div class="panel"><div id="board"></div></div>
   <div id="status">Loading…</div>
-  <div class="meta">AshnasBot · net2 · 500-sim MCGS</div>
+  <div id="meta" class="meta">AshnasBot · net2 · 500-sim MCGS</div>
+  <p class="legal">
+    Stauf is <a href="https://github.com/scummvm/scummvm">ScummVM</a>'s <code>CellGame</code>,
+    <a href="./LICENSE.GPLv3">GPLv3</a> — so this page is GPLv3.
+    Everything else is <a href="./LICENSE.MIT">MIT</a>.
+    <a href="./README-licensing.md">Source</a>.
+  </p>
   <script type="module" src="./app.mjs"></script>
+  <script>
+    // app.mjs is a module: if anything in its import graph 404s, it never
+    // evaluates and the page sits on "Loading…" with the reason only in the
+    // console.  The usual cause is serving webapp/ directly — micro_mcts.mjs
+    // and stauf.mjs are build outputs and only exist in public/ after
+    // `make pages`.  Report it on the page instead of hanging silently.
+    (function () {
+      var FIX = 'Failed to load. Serve the built bundle: make pages, then serve public/';
+      function report() {
+        var s = document.getElementById('status');
+        if (s && s.textContent === 'Loading…') s.textContent = FIX;
+      }
+      // A failed module graph fires 'error' on the <script> element itself, which
+      // does not bubble — hence the capture phase.
+      addEventListener('error', report, true);
+      setTimeout(report, 5000);        // backstop: import resolved but never ran
+    })();
+  </script>
 </body>
 </html>

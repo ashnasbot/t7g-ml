@@ -110,12 +110,37 @@ EMFLAGS   := -O3 -ffast-math --no-entry \
              -sALLOW_MEMORY_GROWTH=1 -sWASM_BIGINT \
              -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,getValue,setValue,HEAPF32,HEAPU8,HEAPU32,HEAP32
 
-.PHONY: wasm clean-wasm
+# Stauf (ScummVM Groovie CellGame) as a second, independent wasm module.
+#
+# LICENSING: thirdparty/scummvm-cell/{cell.cpp,cell.h} are GPLv3-or-later, so
+# stauf.wasm is a combined work conveyed under GPLv3 -- unlike micro_mcts.wasm,
+# which is wholly ours and MIT.  It is built and shipped as its own module and
+# driven from its own worker (webapp/stauf.worker.mjs) so the GPL boundary
+# is a message protocol, not a link edge: nothing of ours is linked into it.
+# `make pages` emits the licence + written offer alongside it.
+# See thirdparty/scummvm-cell/README.md.
+CELL_DIR  := thirdparty/scummvm-cell
+# -w: the vendored ScummVM source is not warning-clean and is not ours to fix.
+# No -ffast-math: CellGame's evaluation is integer and must stay bit-exact with
+# the native cell_dll build that pins the rating ladder.
+STAUF_FLAGS := -O3 --no-entry -w -std=c++17 \
+               -I$(CELL_DIR) -I$(CELL_DIR)/shim \
+               -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=web,worker,node \
+               -sALLOW_MEMORY_GROWTH=1 \
+               -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8
 
-wasm: $(WASM_OUT)/micro_mcts.mjs
+.PHONY: wasm stauf-wasm clean-wasm
+
+wasm: $(WASM_OUT)/micro_mcts.mjs $(WASM_OUT)/stauf.mjs
 
 $(WASM_OUT)/micro_mcts.mjs: $(SRC)/micro_mcts.c $(SRC)/bb_core.h | $(WASM_OUT)
 	$(EMCC) $(EMFLAGS) -sEXPORTED_FUNCTIONS=$(WASM_EXPORTS) $(SRC)/micro_mcts.c -o $@
+
+stauf-wasm: $(WASM_OUT)/stauf.mjs
+
+$(WASM_OUT)/stauf.mjs: $(SRC)/stauf_wasm.cpp $(CELL_DIR)/cell.cpp $(CELL_DIR)/cell.h | $(WASM_OUT)
+	$(EMCC) $(STAUF_FLAGS) -sEXPORTED_FUNCTIONS=_malloc,_free,_stauf_find_best_move \
+	  $(SRC)/stauf_wasm.cpp $(CELL_DIR)/cell.cpp -o $@
 
 $(WASM_OUT):
 	$(MKDIR) $(WASM_OUT)
@@ -124,12 +149,12 @@ clean-wasm:
 	$(RM_DIR) $(WASM_OUT)
 
 #  Static single-page app (GitHub-Pages ready).
-# Source lives in webapp/spa/ (index.html, app.mjs, engine.mjs, exported model).
+# Source lives in webapp/ (index.html, app.mjs, engine.mjs, exported model).
 # onnxruntime-web is loaded from the jsdelivr CDN at runtime (see app.mjs), so
 # its 21 MB wasm blob is NOT committed or published here.  `make pages` folds in
 # the wasm engine blobs and assembles public/, the directory GitHub Pages
 # publishes.  `make model` re-exports net2.onnx from a checkpoint (CKPT=...).
-SPA       := webapp/spa
+SPA       := webapp
 PUBLIC    := public
 CKPT      ?= export/models/run_net2b/promoted_iter0085.pt
 ORT_VER   ?= 1.20.1
@@ -140,13 +165,30 @@ model: $(SPA)/models/net2.onnx
 $(SPA)/models/net2.onnx: $(CKPT) scripts/export_onnx_web.py lib/net2.py
 	python scripts/export_onnx_web.py $(CKPT) $@
 
-pages: wasm $(SPA)/models/net2.onnx
+# net2.onnx is committed but the checkpoint it was exported from is not (export/
+# is gitignored), so `pages` deliberately does NOT depend on the rule above: from
+# a clean checkout (i.e. CI) make would try to re-export and die on the missing
+# .pt.  It just requires the exported model to be present.  Re-exporting stays an
+# explicit `make model CKPT=...`.
+
+# NOTE: the assembled bundle includes stauf.wasm (GPLv3), so public/ as a whole
+# is conveyed under the GPLv3 -- hence the licence + written offer copied in
+# below.  public/ is gitignored, so those files must be *generated* here; they
+# cannot be committed once and forgotten.  Our own sources stay MIT and remain
+# reusable as such; see thirdparty/scummvm-cell/README.md.
+pages: wasm
+	@test -f $(SPA)/models/net2.onnx || \
+	  { echo "missing $(SPA)/models/net2.onnx — run: make model CKPT=<checkpoint.pt>"; exit 1; }
 	-$(RM_DIR) $(PUBLIC)
 	$(MKDIR) $(PUBLIC) $(PUBLIC)/models
-	cp $(SPA)/index.html $(SPA)/app.mjs $(SPA)/engine.mjs $(PUBLIC)/
+	cp $(SPA)/index.html $(SPA)/app.mjs $(SPA)/engine.mjs $(SPA)/stauf.worker.mjs $(PUBLIC)/
 	cp $(SPA)/models/net2.onnx $(PUBLIC)/models/
 	cp $(WASM_OUT)/micro_mcts.mjs $(WASM_OUT)/micro_mcts.wasm $(PUBLIC)/
-	@echo "public/ assembled — serve it, or push to a GitHub Pages branch/dir."
+	cp $(WASM_OUT)/stauf.mjs $(WASM_OUT)/stauf.wasm $(PUBLIC)/
+	cp $(CELL_DIR)/LICENSE $(PUBLIC)/LICENSE.GPLv3
+	cp LICENSE $(PUBLIC)/LICENSE.MIT
+	cp $(SPA)/README-licensing.md $(PUBLIC)/
+	@echo "public/ assembled (GPLv3 bundle — includes Stauf) — serve it, or push to a GitHub Pages branch/dir."
 
 # Fetch onnxruntime-web into a gitignored local dir for the node parity harness
 # (tests/scratchpad import it directly; node can't import from an https URL).
