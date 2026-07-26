@@ -11,7 +11,13 @@
 import * as engine from './engine.mjs';
 import MicroMCTS from './micro_mcts.mjs';
 
-const ORT_VER = '1.20.1';
+// 1.27.0 or newer is required, not merely preferred: the WebGPU EP in 1.20.x
+// computes only the first item of a batched run and leaves the rest to whatever
+// was in the buffer.  The search dispatches gumbelK=16 at a time, so on that
+// version 15 of every 16 priors were noise and the net played like a beginner
+// wherever WebGPU was available -- silently, since nothing errors.  Measured
+// against the wasm EP: 1/16 batch items correct on 1.20.1, 16/16 on 1.27.0.
+const ORT_VER = '1.27.0';
 const ORT_CDN = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/`;
 
 const SIMS = 500;                 // canonical net2 config (eval_db DEFAULT_CONFIG)
@@ -34,6 +40,7 @@ const boardEl = $('board'), statusEl = $('status'), scoreEl = $('score');
 const metaEl = $('meta'), opponentEl = $('opponent');
 
 let ort, mod, session, netReady = null;
+let backend = null;               // 'webgpu' | 'wasm', reported in the move status
 // One MCGS instance for the page, so its transposition table survives across
 // moves the way self-play and eval keep theirs.  Cleared at the start of each
 // game rather than destroyed.
@@ -54,6 +61,37 @@ let staufWorker = null, staufPending = null;
 // game" (or switch opponent) can't land a move on the fresh board.
 let gen = 0;
 const aiName = () => OPPONENTS[opponent].label;
+
+// Does the active session compute a *batch* correctly?  onnxruntime-web 1.20.x
+// filled only the first slot of a batched WebGPU run and left the rest garbage,
+// which no exception reports: the search just gets noise for 15 of every 16
+// leaves and the net plays badly.  A broken EP is a property of the driver and
+// browser as much as of ORT, so check at boot rather than trusting a version
+// number, and drop to wasm if the answer is wrong.
+//
+// Two distinct positions, batched, each compared against itself run alone.
+async function batchIsSane() {
+  const one = () => {
+    const o = new Float32Array(196);
+    for (let c = 0; c < 49; c++) o[c * 4 + 2] = 1;   // side-to-move plane
+    return o;
+  };
+  const a = one(), b = one();
+  b[0] = 1; b[4 * 4 + 1] = 1;                        // two stones, so b differs from a
+  const pair = new Float32Array(392);
+  pair.set(a, 0); pair.set(b, 196);
+
+  // Strictly sequential: an InferenceSession is not re-entrant, and overlapping
+  // run() calls on one session wedge it.  Everything else here drives it one
+  // batch at a time (see driveSearch), so this must too.
+  const batched = await runNet(pair, 2);
+  const soloA = await runNet(a, 1);
+  const soloB = await runNet(b, 1);
+  // Tolerance is loose: this catches "wrong item entirely", not fp drift, and
+  // GPU and CPU kernels legitimately differ in the last few digits.
+  return Math.abs(batched.value[0] - soloA.value[0]) < 1e-2
+      && Math.abs(batched.value[1] - soloB.value[0]) < 1e-2;
+}
 
 async function runNet(obsF32, n) {
   const t = new ort.Tensor('float32', obsF32, [n, 7, 7, 4]);
@@ -110,10 +148,24 @@ function bootNet() {
 
     mod = await MicroMCTS();
     const bytes = new Uint8Array(await (await fetch('./models/net2.onnx')).arrayBuffer());
-    try {
-      session = await ort.InferenceSession.create(bytes, { executionProviders: ['webgpu'] });
-    } catch {
+
+    // Probe for a core adapter rather than letting session creation throw:
+    // compatibility-mode-only setups (Chromium without its Vulkan backend, so
+    // Dawn falls back to ANGLE) expose navigator.gpu but yield no core adapter.
+    const haveGPU = !!(await navigator.gpu?.requestAdapter().catch(() => null));
+    if (haveGPU) {
+      try {
+        session = await ort.InferenceSession.create(bytes, { executionProviders: ['webgpu'] });
+        if (await batchIsSane()) backend = 'webgpu';
+        else { session = null; console.warn('WebGPU EP failed the batch check — falling back to wasm'); }
+      } catch (err) {
+        session = null;
+        console.warn('WebGPU EP unavailable — falling back to wasm', err);
+      }
+    }
+    if (!session) {
       session = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] });
+      backend = 'wasm';
     }
   })().catch(err => { netReady = null; throw err; });
   return netReady;
@@ -240,7 +292,7 @@ async function maybeAiTurn() {
   if (action >= 0) { board = engine.applyMove(board, action, turn); clock = engine.tickClock(clock, action); }
   moves.push(engine.actionToUAI(action >= 0 ? action : engine.PASS_ACTION));
   busy = false;
-  setStatus(`${aiName()} moved (${dt} ms).`);
+  setStatus(`${aiName()} moved (${dt} ms${opponent === 'net' && backend ? `, ${backend}` : ''}).`);
   advance(true);
 }
 
