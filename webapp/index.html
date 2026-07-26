@@ -54,6 +54,11 @@
     font: inherit; font-weight: 600; cursor: pointer;
   }
   button:hover { filter: brightness(1.08); }
+  button.ghost {
+    background: transparent; color: var(--muted); border: 1px solid var(--line);
+    font-size: 13px; font-weight: 500; padding: 6px 12px;
+  }
+  button.ghost:hover { border-color: #3a4260; color: var(--ink); filter: none; }
   .meta { color: var(--muted); font-size: 12px; text-align: center; width: min(86vw, 460px); }
   .meta b { color: var(--ink); font-weight: 600; }
   .meta a { color: var(--muted); }
@@ -73,20 +78,21 @@
     <div id="score"></div>
     <div class="controls">
       <select id="opponent" aria-label="Opponent">
-        <option value="net" selected>AshnasBot</option>
-        <option value="stauf">Stauf</option>
+        <option value="net">AshnasBot</option>
+        <option value="stauf" selected>Stauf</option>
       </select>
       <button id="new-game">New game</button>
     </div>
   </div>
   <div class="panel"><div id="board"></div></div>
   <div id="status">Loading…</div>
-  <div id="meta" class="meta">AshnasBot · net2 · 500-sim MCGS</div>
+  <div id="meta" class="meta">Stauf · the original 7th Guest AI · ScummVM CellGame · GPLv3</div>
+  <button id="copy-game" class="ghost" title="Copy this game as a UAI move list">Copy game (UAI)</button>
   <p class="legal">
     Stauf is <a href="https://github.com/scummvm/scummvm">ScummVM</a>'s <code>CellGame</code>,
     <a href="./LICENSE.GPLv3">GPLv3</a> — so this page is GPLv3.
     Everything else is <a href="./LICENSE.MIT">MIT</a>.
-    <a href="./README-licensing.md">Source</a>.
+    <a href="https://github.com/ashnasbot/t7g-ml/blob/main/webapp/README-licensing.md">Source</a>.
   </p>
   <script type="module" src="./app.mjs"></script>
   <script>

@@ -45,7 +45,40 @@ export function tickClock(clock, action) {
   if (action === PASS_ACTION) return clock + 1;
   const mv = action % 25;
   const jump = Math.abs((mv % 5) - 2) === 2 || Math.abs(Math.floor(mv / 5) - 2) === 2;
-  return jump ? 0 : clock + 1;
+  return jump ? clock + 1 : 0;
+}
+
+// ---- UAI notation ---------------------------------------------------------
+// Mirrors lib/uai_engine.py: file is 'a'+x, rank is 7-y.  A clone names only
+// its destination (any legal clone into that square yields the same board, so
+// the source is redundant); a jump names source then destination; a pass is
+// the null move "0000".
+const sq = (x, y) => String.fromCharCode(97 + x) + (7 - y);
+
+export function actionToUAI(action) {
+  if (action === PASS_ACTION) return '0000';
+  const { fx, fy, tx, ty, jump } = actionToMove(action);
+  return jump ? sq(fx, fy) + sq(tx, ty) : sq(tx, ty);
+}
+
+// Mirrors board_to_fen in lib/uai_engine.py: blue -> 'x', green -> 'o', row
+// y=0 is FEN rank 7.  The trailing "0 1" is hardcoded there too, so it is
+// hardcoded here to keep the strings byte-identical for parity testing.
+export function boardToFEN(b, turn) {
+  const rows = [];
+  for (let y = 0; y < 7; y++) {
+    let row = '', empty = 0;
+    for (let x = 0; x < 7; x++) {
+      const blue = b[idx(x, y, 1)], green = b[idx(x, y, 0)];
+      if (blue || green) {
+        if (empty) { row += empty; empty = 0; }
+        row += blue ? 'x' : 'o';
+      } else empty++;
+    }
+    if (empty) row += empty;
+    rows.push(row);
+  }
+  return `${rows.join('/')} ${turn ? 'x' : 'o'} 0 1`;
 }
 
 // Legal action indices for `turn`.  Mirrors action_masks: own piece at source,
@@ -111,25 +144,73 @@ function softmaxRowInto(dst, src, off, n) {  // in-place softmax of src[off..off
   for (let i = 0; i < n; i++) dst[i] *= inv;
 }
 
-// Drive one MCGS search to completion; returns {action, probs, rootValue}.
-// `runNet(obsF32, n)` -> {policy: Float32Array(n*1225 logits), value: Float32Array(n)}.
-export async function searchMove(mod, runNet, board, turn, clock, cfg) {
+// A game-scoped search context.
+//
+// The MCGS transposition table persists across moves
+// -- advance_tree is a deliberate no-op.
+//
+// Create one of these per app instance, call clear() between games, 
+// oversized to fit a whole game of unlucky searches, if it overflows
+// the search degrades (clearing the table, though to uniform policy).
+export function createSearcher(mod, cfg) {
   const {
     sims = 500, cPuct = 1.3, gumbelK = 16,
     completionN0 = 50.0, sigmaScale = 1.0, clockObs = true,
     seed = (Math.random() * 2 ** 53) >>> 0,
+    nodeCap = 0, edgeCap = 0,          // 0 means "use the C default"
   } = cfg || {};
 
   mod._mcgs_init();
-  const inst = mod._mcgs_create_ex(sims, cPuct, gumbelK, 0, 0);
+  const inst = mod._mcgs_create_ex(sims, cPuct, gumbelK, nodeCap, edgeCap);
+  // A failed arena allocation returns NULL, and nothing downstream traps on
+  // it: mcgs_is_done(NULL) reports 1 and mcgs_get_result(NULL, out) is a no-op,
+  // so the caller would take an argmax over uninitialised heap and play it as
+  // a move with no error anywhere.  Fail loudly instead.
+  if (!inst) throw new Error(`MCGS arena allocation failed (${nodeCap || 'default'} nodes, ${edgeCap || 'default'} edges)`);
   mod._mcgs_set_completion_n0(inst, completionN0);
   mod._mcgs_set_sigma_scale(inst, sigmaScale);
   mod._mcgs_set_clock_obs(inst, clockObs ? 1 : 0);
   mod._mcgs_set_rng_seed(inst, BigInt(seed >>> 0));
 
+  return {
+    /** Drop the accumulated tree.  Call between games. */
+    clear() { mod._mcgs_clear(inst); },
+    destroy() { mod._mcgs_destroy(inst); },
+    /** Nodes currently in the transposition table (monitoring). */
+    treeSize() { return mod._mcgs_tt_size(inst); },
+    search: (runNet, board, turn, clock) => driveSearch(mod, inst, runNet, board, turn, clock, gumbelK),
+  };
+}
+
+// Test convenience wrapper: build a searcher, run a single search, tear it
+// down.
+export async function searchMove(mod, runNet, board, turn, clock, cfg) {
+  const searcher = createSearcher(mod, cfg);
+  try {
+    return await searcher.search(runNet, board, turn, clock);
+  } finally {
+    searcher.destroy();
+  }
+}
+
+// Drive one MCGS search to completion; returns {action, probs, rootValue}.
+// `runNet(obsF32, n)` -> {policy: Float32Array(n*1225 logits), value: Float32Array(n)}.
+async function driveSearch(mod, inst, runNet, board, turn, clock, gumbelK) {
   const boardPtr = mod._malloc(98);
   mod.HEAPU8.set(board, boardPtr);
-  const ss = mod._mcgs_start_search(inst, boardPtr, turn ? 1 : 0, clock | 0);
+
+  let ss = mod._mcgs_start_search(inst, boardPtr, turn ? 1 : 0, clock | 0);
+  if (!ss) {
+    // The node slab filled up.  lib/mcgs.py handles this the same way: drop
+    // the transposition table and retry once, losing the accumulated tree but
+    // keeping the game playable.  Only if that fails too is it fatal.
+    mod._mcgs_clear(inst);
+    ss = mod._mcgs_start_search(inst, boardPtr, turn ? 1 : 0, clock | 0);
+    if (!ss) {
+      mod._free(boardPtr);
+      throw new Error('MCGS search init failed even after clearing the tree');
+    }
+  }
 
   const MAXN = Math.max(gumbelK, 8);
   const obsPtr = mod._malloc(MAXN * 7 * 7 * 4 * 4);
@@ -163,8 +244,9 @@ export async function searchMove(mod, runNet, board, turn, clock, cfg) {
   let action = -1, best = -1;
   for (let i = 0; i < 1225; i++) if (probs[i] > best) { best = probs[i]; action = i; }
 
+  // The search state is per-move, but the instance (and its transposition
+  // table) belongs to the caller and outlives this search.
   mod._mcgs_search_destroy(ss);
-  mod._mcgs_destroy(inst);
   mod._free(boardPtr); mod._free(obsPtr); mod._free(polPtr); mod._free(valPtr);
 
   return { action: best > 0 ? action : -1, probs, rootValue };
