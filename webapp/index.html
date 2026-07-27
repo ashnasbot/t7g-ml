@@ -9,8 +9,12 @@
   :root {
     --bg: #0f1117; --panel: #171a23; --line: #262b37; --ink: #e6e9ef; --muted: #8b93a7;
     --blue: #1f6bff; --green: #06c47e; --cell: #1d2130; --cell2: #222739;
-    --sel: #ffd24a; --dest: #4f8cff66;
+    --sel: #ffd24a;
+    /* Your colour, so the move hints match the stones you are actually moving.
+       Repainted by app.mjs via body[data-side]. */
+    --me: var(--blue); --me-soft: #4f8cff66;
   }
+  body[data-side="green"] { --me: var(--green); --me-soft: #06c47e5c; }
   * { box-sizing: border-box; }
   body {
     margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
@@ -41,10 +45,13 @@
   .cell.dest { cursor: pointer; }
   .cell.dest::before {
     content: ""; position: absolute; width: 34%; height: 34%; border-radius: 50%;
-    background: var(--dest); outline: 2px solid var(--blue);
+    background: var(--me-soft); outline: 2px solid var(--me);
   }
   .cell.dest.jump::before { border-radius: 5px; }   /* square marker = jump (source vacated) */
-  .bar { display: flex; align-items: center; gap: 16px; width: min(86vw, 460px); justify-content: space-between; }
+  .bar {
+    display: flex; align-items: center; gap: 10px 16px; width: min(86vw, 460px);
+    justify-content: space-between; flex-wrap: wrap;   /* three controls don't fit one phone row */
+  }
   #score { font-variant-numeric: tabular-nums; font-weight: 600; display: flex; align-items: center; }
   .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin: 0 6px 0 2px; vertical-align: -1px; }
   .dot.blue { background: var(--blue); } .dot.green { background: var(--green); }
@@ -67,16 +74,29 @@
     border-radius: 9px; padding: 8px 10px; font: inherit; font-weight: 600; cursor: pointer;
   }
   select:hover { border-color: #3a4260; }
-  .controls { display: flex; gap: 10px; align-items: center; }
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+  /* Segmented colour switch: two states, both visible, no menu to open. */
+  .switch { display: flex; gap: 2px; padding: 2px; background: var(--cell2); border: 1px solid var(--line); border-radius: 9px; }
+  .switch button {
+    background: transparent; color: var(--muted); border-radius: 7px; padding: 6px 10px;
+    font-size: 13px; font-weight: 600; display: flex; align-items: center;
+  }
+  .switch button:hover { color: var(--ink); filter: none; }
+  .switch button[aria-pressed="true"] { background: #2a3046; color: var(--ink); }
+  .switch .dot { width: 10px; height: 10px; margin: 0 6px 0 0; }
   .legal { color: var(--muted); font-size: 11px; text-align: center; width: min(86vw, 560px); line-height: 1.6; }
   .legal a { color: #7fa6ff; }
 </style>
 </head>
 <body>
-  <h1>Microscope <small>· you play Blue</small></h1>
+  <h1>Microscope <small id="side-note">· you play Blue</small></h1>
   <div class="bar">
     <div id="score"></div>
     <div class="controls">
+      <div id="side" class="switch" role="group" aria-label="Your colour">
+        <button type="button" data-side="blue" aria-pressed="true"><span class="dot blue"></span>Blue</button>
+        <button type="button" data-side="green" aria-pressed="false"><span class="dot green"></span>Green</button>
+      </div>
       <select id="opponent" aria-label="Opponent">
         <option value="net">AshnasBot</option>
         <option value="stauf" selected>Stauf</option>

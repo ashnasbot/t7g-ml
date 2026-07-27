@@ -22,7 +22,13 @@ const ORT_CDN = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/`;
 
 const SIMS = 500;                 // canonical net2 config (eval_db DEFAULT_CONFIG)
 const CFG = { sims: SIMS, cPuct: 1.3, gumbelK: 16, completionN0: 50.0, sigmaScale: 1.0, clockObs: true };
-const HUMAN = true;               // human plays Blue and moves first; the AI plays Green
+// Which side the human plays: true = Blue (moves first), false = Green.  Blue
+// has the first-move advantage, so Green is the harder half of the choice.
+// Both opponents take the side as a parameter (micro_mcts' start_search, and
+// the worker's asBlue), so nothing below this line is colour-specific.
+let HUMAN = true;
+const SIDE_KEY = 't7g.side';      // buttons aren't restored on reload the way a <select> is
+const colour = (t) => (t ? 'Blue' : 'Green');
 
 // Selectable opponents.  Stauf is the original T7G AI (via ScummVM's Groovie
 // CellGame), and lives behind a worker because it is GPLv3 while this file
@@ -37,7 +43,7 @@ const $ = (id) => document.getElementById(id);
 // move is on screen before the synchronous search setup can block the thread.
 const nextPaint = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 const boardEl = $('board'), statusEl = $('status'), scoreEl = $('score');
-const metaEl = $('meta'), opponentEl = $('opponent');
+const metaEl = $('meta'), opponentEl = $('opponent'), sideEl = $('side'), sideNoteEl = $('side-note');
 
 let ort, mod, session, netReady = null;
 let backend = null;               // 'webgpu' | 'wasm', reported in the move status
@@ -175,7 +181,19 @@ function boot() {
   // Read the control rather than assuming the default: browsers restore a
   // <select>'s value across a reload, so this must follow the restored UI.
   opponent = opponentEl.value in OPPONENTS ? opponentEl.value : 'stauf';
+  try { HUMAN = localStorage.getItem(SIDE_KEY) !== 'green'; } catch { /* private mode */ }
+  syncSideUI();
   newGame();
+}
+
+// Push HUMAN into the parts of the page that name a colour: the switch's
+// pressed state, the subtitle, and --me, which tints the move markers so the
+// hints are in your colour rather than always blue.
+function syncSideUI() {
+  document.body.dataset.side = HUMAN ? 'blue' : 'green';
+  sideNoteEl.textContent = `· you play ${colour(HUMAN)}`;
+  for (const b of sideEl.querySelectorAll('button'))
+    b.setAttribute('aria-pressed', String((b.dataset.side === 'blue') === HUMAN));
 }
 
 function newGame() {
@@ -186,7 +204,8 @@ function newGame() {
   treeStale = true;          // drop the previous game's tree at the next search
   metaEl.textContent = `${aiName()} · ${OPPONENTS[opponent].meta}`;
   render();
-  setStatus('Your move (Blue).');
+  // Blue always moves first, so as Green you are waiting on the AI, not on you.
+  setStatus(HUMAN ? `Your move (${colour(HUMAN)}).` : `${aiName()} moves first.`);
   maybeAiTurn();
 }
 
@@ -313,15 +332,17 @@ function afterMove(fromAi = false) {
     turn = !turn; render();
     return maybeAiTurn();
   }
-  if (turn === HUMAN) { if (!fromAi) return; setStatus('Your move (Blue).'); }
+  if (turn === HUMAN) { if (!fromAi) return; setStatus(`Your move (${colour(HUMAN)}).`); }
   else maybeAiTurn();
 }
 
 function finish(term) {
   gameOver = true; busy = false; selected = null; render();
   const { blue, green } = engine.countCells(board);
-  const humanWon = blue > green, draw = blue === green;
-  setStatus(draw ? `Draw — ${blue}–${green}.` : humanWon ? `You win ${blue}–${green}! 🎉` : `${aiName()} wins ${green}–${blue}.`);
+  const mine = HUMAN ? blue : green, theirs = HUMAN ? green : blue;
+  setStatus(mine === theirs ? `Draw — ${mine}–${theirs}.`
+    : mine > theirs ? `You win ${mine}–${theirs}! 🎉`
+    : `${aiName()} wins ${theirs}–${mine}.`);
 }
 
 // ---- game export ----------------------------------------------------------
@@ -329,13 +350,14 @@ function finish(term) {
 // Helpful to diagnose a browser-side game after the fact.
 function gameText() {
   const { blue, green } = engine.countCells(board);
+  const who = (t) => (t === HUMAN ? 'human' : aiName());
   const result = !gameOver ? `in progress, ${blue}-${green}`
     : blue === green ? `draw ${blue}-${green}`
-    : blue > green ? `Blue (human) wins ${blue}-${green}`
-    : `Green (${aiName()}) wins ${green}-${blue}`;
+    : blue > green ? `Blue (${who(true)}) wins ${blue}-${green}`
+    : `Green (${who(false)}) wins ${green}-${blue}`;
   return [
     `# t7g-ml webapp · ${new Date().toISOString().replace(/\.\d+Z$/, 'Z')}`,
-    `# Blue: human · Green: ${aiName()} (${OPPONENTS[opponent].meta})`,
+    `# Blue: ${who(true)} · Green: ${who(false)} (${aiName()}: ${OPPONENTS[opponent].meta})`,
     `# result: ${result} · halfmove clock ${clock}`,
     moves.length ? `position startpos moves ${moves.join(' ')}` : 'position startpos',
     `# final fen: ${engine.boardToFEN(board, turn)}`,
@@ -369,5 +391,17 @@ $('new-game').addEventListener('click', newGame);
 opponentEl.addEventListener('change', () => {
   opponent = opponentEl.value in OPPONENTS ? opponentEl.value : 'stauf';
   newGame();          // safe mid-search: the gen guard discards the stale result
+});
+// Swapping colours restarts too — you can't hand over a game in progress
+// without also handing over its position.
+sideEl.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-side]');
+  if (!btn) return;
+  const wantBlue = btn.dataset.side === 'blue';
+  if (wantBlue === HUMAN) return;
+  HUMAN = wantBlue;
+  try { localStorage.setItem(SIDE_KEY, HUMAN ? 'blue' : 'green'); } catch { /* private mode */ }
+  syncSideUI();
+  newGame();
 });
 boot();
