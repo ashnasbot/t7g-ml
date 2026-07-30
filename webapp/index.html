@@ -23,7 +23,15 @@
   }
   h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: .2px; }
   h1 small { color: var(--muted); font-weight: 400; font-size: 13px; }
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; position: relative; }
+  /* Covers the board until an opponent is picked.  It also swallows clicks, so
+     the empty board can't be poked at before there is a game to play. */
+  #veil {
+    position: absolute; inset: 18px; border-radius: 9px; z-index: 2;
+    display: grid; place-items: center; text-align: center;
+    background: #0f1117d9; color: var(--ink); font-weight: 600; line-height: 1.45;
+  }
+  #veil[hidden] { display: none; }
   #board {
     display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px;
     width: min(86vw, 460px); aspect-ratio: 1;
@@ -143,14 +151,22 @@
         <button type="button" data-side="blue" aria-pressed="true"><span class="dot blue"></span>Blue</button>
         <button type="button" data-side="green" aria-pressed="false"><span class="dot green"></span>Green</button>
       </div>
+      <!-- No opponent is selected by default: the game waits until you pick one.
+           The placeholder is disabled so it can't be chosen again once you have. -->
       <select id="opponent" aria-label="Opponent">
+        <option value="" selected disabled>Choose opponent…</option>
         <option value="net">AshnasBot</option>
-        <option value="stauf" selected>Stauf</option>
+        <option value="stauf">Stauf</option>
       </select>
       <button id="new-game">New game</button>
     </div>
   </div>
-  <div class="panel"><div id="board"></div></div>
+  <!-- The veil is a sibling of #board, not a child: buildBoard() replaces the
+       board's contents wholesale and would take it with them. -->
+  <div class="panel">
+    <div id="board"></div>
+    <div id="veil">Select an opponent<br>from the dropdown</div>
+  </div>
   <!-- role=status so the move reports are announced.  Only worth having now
        that a line stays up long enough to be read rather than being replaced
        the instant the animation ends -- see STATUS_HOLD in app.mjs. -->

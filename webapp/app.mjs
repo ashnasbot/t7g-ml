@@ -45,6 +45,7 @@ const $ = (id) => document.getElementById(id);
 const nextPaint = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 const boardEl = $('board'), statusEl = $('status'), scoreEl = $('score');
 const metaEl = $('meta'), opponentEl = $('opponent'), sideEl = $('side'), sideNoteEl = $('side-note');
+const veilEl = $('veil');
 
 let ort, mod, session, netReady = null;
 let backend = null;               // 'webgpu' | 'wasm', reported in the move status
@@ -62,7 +63,10 @@ let displayBoard;
 // reclassified.  Rebuilding them per render (as this used to) destroys the
 // stone elements every move, leaving nothing with an identity to animate.
 const cells = [];
-let opponent = 'stauf';
+// null until the player picks one: there is no default opponent, and no game
+// runs before the choice is made.  Everything that names the AI has to tolerate
+// it (see aiName), and newGame() stops short of starting play.
+let opponent = null;
 // UAI move list for the game in progress, one entry per ply (passes included),
 // so a finished game can be copied out and replayed against the Python engine.
 let moves = [];
@@ -75,7 +79,7 @@ let staufWorker = null, staufPending = null;
 // result if it changed meanwhile, so a search still in flight when you hit "New
 // game" (or switch opponent) can't land a move on the fresh board.
 let gen = 0;
-const aiName = () => OPPONENTS[opponent].label;
+const aiName = () => OPPONENTS[opponent]?.label ?? 'Opponent';
 
 // Does the active session compute a *batch* correctly?  onnxruntime-web 1.20.x
 // filled only the first slot of a batched WebGPU run and left the rest garbage,
@@ -188,8 +192,9 @@ function bootNet() {
 
 function boot() {
   // Read the control rather than assuming the default: browsers restore a
-  // <select>'s value across a reload, so this must follow the restored UI.
-  opponent = opponentEl.value in OPPONENTS ? opponentEl.value : 'stauf';
+  // <select>'s value across a reload, so a reload mid-game keeps its opponent
+  // instead of dropping back to the placeholder.
+  opponent = opponentEl.value in OPPONENTS ? opponentEl.value : null;
   try { HUMAN = localStorage.getItem(SIDE_KEY) !== 'green'; } catch { /* private mode */ }
   syncSideUI();
   buildBoard();
@@ -214,8 +219,21 @@ function newGame() {
   staufMoves = 0;
   moves = [];
   treeStale = true;          // drop the previous game's tree at the next search
-  metaEl.textContent = `${aiName()} · ${OPPONENTS[opponent].meta}`;
   clearStatusHold();
+
+  // No opponent yet: paint the starting position behind the veil and stop.
+  // busy keeps the cells inert, so the board can't be played against nobody.
+  if (!opponent) {
+    busy = true;
+    veilEl.hidden = false;
+    metaEl.textContent = 'Pick an opponent to start a game.';
+    render();
+    setStatus('Select an opponent from the dropdown.');
+    return;
+  }
+
+  veilEl.hidden = true;
+  metaEl.textContent = `${aiName()} · ${OPPONENTS[opponent].meta}`;
   render();
   // Blue always moves first, so as Green you are waiting on the AI, not on you.
   setStatus(HUMAN ? `Your move (${colour(HUMAN)}).` : `${aiName()} moves first.`);
@@ -473,7 +491,7 @@ function gameText() {
     : `Green (${who(false)}) wins ${green}-${blue}`;
   return [
     `# t7g-ml webapp · ${new Date().toISOString().replace(/\.\d+Z$/, 'Z')}`,
-    `# Blue: ${who(true)} · Green: ${who(false)} (${aiName()}: ${OPPONENTS[opponent].meta})`,
+    `# Blue: ${who(true)} · Green: ${who(false)} (${aiName()}: ${OPPONENTS[opponent]?.meta ?? 'not selected'})`,
     `# result: ${result} · halfmove clock ${clock}`,
     moves.length ? `position startpos moves ${moves.join(' ')}` : 'position startpos',
     `# final fen: ${engine.boardToFEN(board, turn)}`,
@@ -505,7 +523,7 @@ $('new-game').addEventListener('click', newGame);
 // Switching opponent restarts: Stauf's depth cycling is keyed to its own move
 // count, so handing it a game already in progress would misrepresent it.
 opponentEl.addEventListener('change', () => {
-  opponent = opponentEl.value in OPPONENTS ? opponentEl.value : 'stauf';
+  opponent = opponentEl.value in OPPONENTS ? opponentEl.value : null;
   newGame();          // safe mid-search: the gen guard discards the stale result
 });
 // Swapping colours restarts too — you can't hand over a game in progress
