@@ -181,7 +181,7 @@ pages: wasm
 	  { echo "missing $(SPA)/models/net2.onnx — run: make model CKPT=<checkpoint.pt>"; exit 1; }
 	-$(RM_DIR) $(PUBLIC)
 	$(MKDIR) $(PUBLIC) $(PUBLIC)/models
-	cp $(SPA)/index.html $(SPA)/app.mjs $(SPA)/engine.mjs $(SPA)/stauf.worker.mjs $(SPA)/favicon.ico $(PUBLIC)/
+	cp $(SPA)/index.html $(SPA)/app.mjs $(SPA)/anim.mjs $(SPA)/engine.mjs $(SPA)/stauf.worker.mjs $(SPA)/favicon.ico $(PUBLIC)/
 	cp $(SPA)/models/net2.onnx $(PUBLIC)/models/
 	cp $(WASM_OUT)/micro_mcts.mjs $(WASM_OUT)/micro_mcts.wasm $(PUBLIC)/
 	cp $(WASM_OUT)/stauf.mjs $(WASM_OUT)/stauf.wasm $(PUBLIC)/

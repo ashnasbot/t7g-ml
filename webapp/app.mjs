@@ -9,6 +9,7 @@
 // ORT and the model, and playing net2 should not fetch the Stauf module.  That
 // also means the page should work offline.
 import * as engine from './engine.mjs';
+import * as anim from './anim.mjs';
 import MicroMCTS from './micro_mcts.mjs';
 
 // 1.27.0 or newer is required, not merely preferred: the WebGPU EP in 1.20.x
@@ -53,6 +54,14 @@ let backend = null;               // 'webgpu' | 'wasm', reported in the move sta
 // The clear is deferred to the next search because it is only safe when none is in flight.
 let searcher = null, treeStale = false;
 let board, turn, clock, selected = null, busy = true, gameOver = false;
+// What render() paints.  Equal to `board` except while a move animation is in
+// flight, when it lags behind by design -- the game state commits immediately
+// and the display catches up through anim.playMove's intermediate boards.
+let displayBoard;
+// The 49 cell elements, built once by buildBoard() and thereafter only
+// reclassified.  Rebuilding them per render (as this used to) destroys the
+// stone elements every move, leaving nothing with an identity to animate.
+const cells = [];
 let opponent = 'stauf';
 // UAI move list for the game in progress, one entry per ply (passes included),
 // so a finished game can be copied out and replayed against the Python engine.
@@ -183,6 +192,7 @@ function boot() {
   opponent = opponentEl.value in OPPONENTS ? opponentEl.value : 'stauf';
   try { HUMAN = localStorage.getItem(SIDE_KEY) !== 'green'; } catch { /* private mode */ }
   syncSideUI();
+  buildBoard();
   newGame();
 }
 
@@ -198,48 +208,117 @@ function syncSideUI() {
 
 function newGame() {
   gen++;
-  board = engine.newBoard(); turn = true; clock = 0; selected = null; gameOver = false; busy = false;
+  anim.cancelAll();          // a stone may be mid-flight; gen++ makes it give up
+  board = engine.newBoard(); displayBoard = board;
+  turn = true; clock = 0; selected = null; gameOver = false; busy = false;
   staufMoves = 0;
   moves = [];
   treeStale = true;          // drop the previous game's tree at the next search
   metaEl.textContent = `${aiName()} · ${OPPONENTS[opponent].meta}`;
+  clearStatusHold();
   render();
   // Blue always moves first, so as Green you are waiting on the AI, not on you.
   setStatus(HUMAN ? `Your move (${colour(HUMAN)}).` : `${aiName()} moves first.`);
   maybeAiTurn();
 }
 
-function setStatus(t) { statusEl.textContent = t; }
+// ---- status line ----------------------------------------------------------
+// A line set with a hold stays put for at least that long.  Without it the AI's
+// move report is wiped by the next prompt the instant the move animation ends,
+// which is far too brief to read.  A line arriving during a hold waits its turn,
+// and only the newest waiting line survives -- the status always describes the
+// latest state, never a backlog.
+const STATUS_HOLD = 1600;
+const STICKY = Infinity;      // held until something explicitly supersedes it
 
-function render() {
-  const { blue, green } = engine.countCells(board);
-  scoreEl.innerHTML = `<span class="dot blue"></span>${blue} &nbsp; <span class="dot green"></span>${green}`;
-  const bySource = (!busy && !gameOver && turn === HUMAN) ? engine.legalMovesBySource(board, turn) : new Map();
-  const dests = selected ? new Map((bySource.get(selected) || []).map(d => [`${d.tx},${d.ty}`, d])) : null;
+let holdUntil = 0, queuedStatus = null, holdTimer = null;
 
+function setStatus(text, hold = 0) {
+  const now = performance.now();
+  if (now < holdUntil) {
+    queuedStatus = { text, hold };
+    // A sticky hold has no expiry, so it gets no timer: it is released only by
+    // clearStatusHold(), which drops the queue along with it.
+    if (!holdTimer && holdUntil !== STICKY)
+      holdTimer = setTimeout(releaseStatus, holdUntil - now);
+    return;
+  }
+  statusEl.textContent = text;
+  holdUntil = hold ? now + hold : 0;
+}
+
+function releaseStatus() {
+  holdTimer = null; holdUntil = 0;
+  const q = queuedStatus; queuedStatus = null;
+  if (q) setStatus(q.text, q.hold);
+}
+
+// Drop the hold and anything waiting behind it: the caller is about to say
+// something that supersedes both.
+function clearStatusHold() {
+  holdUntil = 0; queuedStatus = null;
+  if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+}
+
+// Built once, at boot.  Listeners are bound per cell here rather than per
+// render, so the hint maps they consult live at module scope instead of being
+// captured in a closure that render() has to refresh.
+function buildBoard() {
   boardEl.innerHTML = '';
+  cells.length = 0;
   for (let y = 0; y < 7; y++) for (let x = 0; x < 7; x++) {
     const cell = document.createElement('div');
     cell.className = 'cell';
-    const blueP = board[(y * 7 + x) * 2 + 1], greenP = board[(y * 7 + x) * 2];
-    if (blueP) cell.classList.add('has', 'blue');
-    else if (greenP) cell.classList.add('has', 'green');
-
-    const key = `${x},${y}`;
-    if (bySource.has(key)) cell.classList.add('selectable');
-    if (selected === key) cell.classList.add('selected');
-    if (dests && dests.has(key)) {
-      cell.classList.add('dest');
-      cell.dataset.dest = key;
-      if (dests.get(key).jump) cell.classList.add('jump');
-    }
-    cell.dataset.xy = key;
-    cell.addEventListener('click', () => onCell(x, y, bySource, dests));
+    cell.dataset.xy = `${x},${y}`;
+    cell.appendChild(Object.assign(document.createElement('div'), { className: 'stone' }));
+    cell.addEventListener('click', () => onCell(x, y));
     boardEl.appendChild(cell);
+    cells.push(cell);
   }
 }
 
-function onCell(x, y, bySource, dests) {
+// Current move hints, recomputed by render() and read by onCell().
+let bySource = new Map(), dests = null;
+
+function render() {
+  const b = displayBoard;
+  const { blue, green } = engine.countCells(b);
+  scoreEl.innerHTML = `<span class="dot blue"></span>${blue} &nbsp; <span class="dot green"></span>${green}`;
+  bySource = (!busy && !gameOver && turn === HUMAN) ? engine.legalMovesBySource(b, turn) : new Map();
+  dests = selected ? new Map((bySource.get(selected) || []).map(d => [`${d.tx},${d.ty}`, d])) : null;
+
+  for (let y = 0; y < 7; y++) for (let x = 0; x < 7; x++) {
+    const i = y * 7 + x, cell = cells[i], key = `${x},${y}`;
+    const blueP = b[i * 2 + 1], greenP = b[i * 2];
+    cell.classList.toggle('has', !!(blueP || greenP));
+    cell.classList.toggle('blue', !!blueP);
+    cell.classList.toggle('green', !!greenP);
+    cell.classList.toggle('selectable', bySource.has(key));
+    cell.classList.toggle('selected', selected === key);
+    const isDest = !!(dests && dests.has(key));
+    cell.classList.toggle('dest', isDest);
+    cell.classList.toggle('jump', isDest && dests.get(key).jump);
+  }
+}
+
+// Paint an intermediate board mid-animation.  Handed to anim.playMove, which
+// walks the display from the pre-move position to the post-move one.
+function setDisplay(b) { displayBoard = b; render(); }
+
+// Run a move's animation, having already committed it to `board`.  Returns
+// false if the game moved on underneath us (New game, opponent switch).
+async function animateMove(prev, action, mover, myGen) {
+  await anim.playMove({ cells, boardEl, prev, next: board, action, turn: mover, setDisplay });
+  if (myGen !== gen) return false;
+  // playMove normally lands on `board` itself, so this is usually a no-op.  It
+  // is the backstop for any path that bails out without a final setDisplay:
+  // the invariant is that display == truth whenever no animation is running,
+  // and leaving displayBoard behind without repainting would strand the board.
+  if (displayBoard !== board) setDisplay(board);
+  return true;
+}
+
+function onCell(x, y) {
   if (busy || gameOver || turn !== HUMAN) return;
   const key = `${x},${y}`;
   if (dests && dests.has(key)) { humanMove(dests.get(key).action); return; }
@@ -247,11 +326,34 @@ function onCell(x, y, bySource, dests) {
   else { selected = null; render(); }
 }
 
-function humanMove(action) {
+// The original throws a taunt whenever a turn takes five or more cells; this is
+// the half of it you get to enjoy.  Counted as opponent stones that vanished,
+// which is exactly "cells taken" and needs no separate capture list.  Sticky, so
+// it rides out your own animation and the reply's thinking time, and is released
+// by the AI's move report -- i.e. it stands until the next move is played.
+const TAUNT_AT = 5;
+function taunt(prev, mover) {
+  const theirs = mover ? 'green' : 'blue';
+  const taken = engine.countCells(prev)[theirs] - engine.countCells(board)[theirs];
+  if (taken >= TAUNT_AT) setStatus('Curses!', STICKY);
+}
+
+// State commits synchronously; only the display waits.  The animation runs
+// before the AI's search rather than alongside it: the wasm search blocks the
+// main thread between net evaluations, which would visibly stutter the leap.
+async function humanMove(action) {
+  const myGen = gen, mover = turn, prev = board;
   board = engine.applyMove(board, action, turn);
   clock = engine.tickClock(clock, action);
   moves.push(engine.actionToUAI(action));
   selected = null;
+  // Your move supersedes whatever the last one said, including a prompt still
+  // queued behind the AI's move report.
+  clearStatusHold();
+  taunt(prev, mover);
+  busy = true; render();          // drops the hints; the board still shows `prev`
+  if (!await animateMove(prev, action, mover, myGen)) return;
+  busy = false;
   advance();
 }
 
@@ -260,7 +362,8 @@ async function maybeAiTurn() {
   const term = engine.checkTerminal(board, turn);
   if (term.terminal) return finish(term);
   if (engine.legalMoves(board, turn).length === 0) {   // the AI must pass
-    setStatus(`${aiName()} passes.`);
+    clearStatusHold();
+    setStatus(`${aiName()} passes.`, STATUS_HOLD);
     clock = engine.tickClock(clock, engine.PASS_ACTION);
     moves.push(engine.actionToUAI(engine.PASS_ACTION));
     turn = !turn; render(); return void afterMove();
@@ -301,6 +404,7 @@ async function maybeAiTurn() {
   } catch (err) {
     if (myGen !== gen) return;                   // abandoned game — stay quiet
     busy = false;
+    clearStatusHold();
     setStatus(`${aiName()} failed: ${err.message}`);
     console.error(err);
     return;
@@ -308,10 +412,20 @@ async function maybeAiTurn() {
 
   if (myGen !== gen) return;                     // a new game started while we searched
 
-  if (action >= 0) { board = engine.applyMove(board, action, turn); clock = engine.tickClock(clock, action); }
+  const mover = turn;
+  if (action >= 0) {
+    const prev = board;
+    board = engine.applyMove(board, action, turn);
+    clock = engine.tickClock(clock, action);
+    if (!await animateMove(prev, action, mover, myGen)) return;
+  }
+  // Reported once the board has settled, and held: this is also what releases
+  // an outstanding "Curses!", so the taunt survives until the reply lands.
+  clearStatusHold();
+  setStatus(`${aiName()} moved (${dt} ms${opponent === 'net' && backend ? `, ${backend}` : ''}).`,
+            STATUS_HOLD);
   moves.push(engine.actionToUAI(action >= 0 ? action : engine.PASS_ACTION));
   busy = false;
-  setStatus(`${aiName()} moved (${dt} ms${opponent === 'net' && backend ? `, ${backend}` : ''}).`);
   advance(true);
 }
 
@@ -326,7 +440,8 @@ function afterMove(fromAi = false) {
   const term = engine.checkTerminal(board, turn);
   if (term.terminal) return finish(term);
   if (turn === HUMAN && engine.legalMoves(board, turn).length === 0) {
-    setStatus('You have no moves — you pass.');
+    clearStatusHold();
+    setStatus('You have no moves — you pass.', STATUS_HOLD);
     clock = engine.tickClock(clock, engine.PASS_ACTION);
     moves.push(engine.actionToUAI(engine.PASS_ACTION));
     turn = !turn; render();
@@ -338,6 +453,7 @@ function afterMove(fromAi = false) {
 
 function finish(term) {
   gameOver = true; busy = false; selected = null; render();
+  clearStatusHold();          // the result outranks whatever is on screen
   const { blue, green } = engine.countCells(board);
   const mine = HUMAN ? blue : green, theirs = HUMAN ? green : blue;
   setStatus(mine === theirs ? `Draw — ${mine}–${theirs}.`
