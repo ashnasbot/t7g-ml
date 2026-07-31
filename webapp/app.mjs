@@ -5,7 +5,7 @@
 //
 // The onnxruntime-web runtime is pulled from CDN rather committed to the repo, pinned to ORT_VER.
 //
-// Both opponents load lazily, on first use: playing Stauf should not drag in
+// Both engines load lazily, on first use: playing Stauf should not drag in
 // ORT and the model, and playing net2 should not fetch the Stauf module.  That
 // also means the page should work offline.
 import * as engine from './engine.mjs';
@@ -25,7 +25,7 @@ const SIMS = 500;                 // canonical net2 config (eval_db DEFAULT_CONF
 const CFG = { sims: SIMS, cPuct: 1.3, gumbelK: 16, completionN0: 50.0, sigmaScale: 1.0, clockObs: true };
 // Which side the human plays: true = Blue (moves first), false = Green.  Blue
 // has the first-move advantage, so Green is the harder half of the choice.
-// Both opponents take the side as a parameter (micro_mcts' start_search, and
+// Both engines take the side as a parameter (micro_mcts' start_search, and
 // the worker's asBlue), so nothing below this line is colour-specific.
 let HUMAN = true;
 const SIDE_KEY = 't7g.side';      // buttons aren't restored on reload the way a <select> is
@@ -34,9 +34,13 @@ const colour = (t) => (t ? 'Blue' : 'Green');
 // Selectable opponents.  Stauf is the original T7G AI (via ScummVM's Groovie
 // CellGame), and lives behind a worker because it is GPLv3 while this file
 // is not -- see stauf.worker.mjs.
+// `depth` is CellGame's difficulty selector (2-8), not a ply count.
 const OPPONENTS = {
-  net:   { label: 'AshnasBot', meta: 'net2 · 500-sim MCGS' },
-  stauf: { label: 'Stauf',     meta: 'the original 7th Guest AI · ScummVM CellGame · GPLv3' },
+  'stauf-easy': { label: 'Stauf (Easy)', depth: 2,
+                  meta: 'the original AI at its lowest setting · 1 ply · GPLv3' },
+  stauf:        { label: 'Stauf',        depth: 6,
+                  meta: 'the original 7th Guest AI · ScummVM CellGame · GPLv3' },
+  net:          { label: 'AshnasBot',    meta: 'net2 · 500-sim MCGS' },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -150,7 +154,8 @@ function bootStauf() {
 function askStauf(asBlue) {
   return new Promise((resolve, reject) => {
     staufPending = { resolve, reject };
-    staufWorker.w.postMessage({ type: 'move', board, asBlue, moveCount: staufMoves });
+    staufWorker.w.postMessage({ type: 'move', board, asBlue, moveCount: staufMoves,
+                               depth: OPPONENTS[opponent].depth });
   });
 }
 

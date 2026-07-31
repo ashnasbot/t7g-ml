@@ -15,17 +15,21 @@
 // that search is a couple of plies and effectively instant.
 //
 // Protocol:
-//   <- {type:'init'}                              -> {type:'ready'} | {type:'error', message}
-//   <- {type:'move', board, asBlue, moveCount}    -> {type:'move', action, ms}
+//   <- {type:'init'}                                    -> {type:'ready'} | {type:'error', message}
+//   <- {type:'move', board, asBlue, moveCount, depth}   -> {type:'move', action, ms}
 // `board` is the 98-byte layout from engine.mjs; `action` is its flat action
 // index, or PASS_ACTION (1225) when Stauf has no move.
 
 import Stauf from './stauf.mjs';
 
-// CellGame difficulty selector, not a ply count: it indexes a table that yields
-// the real depth (2-3 plies here).  6 is canonical original-game Stauf and the
-// value the rating ladder is anchored on -- lib/eval_db.py, STAUF_DEPTH.
+// CellGame difficulty selector, not a ply count: it indexes depths[] in
+// cell.cpp, which yields the real depth.  6 is the original-game setting.
+// Out of range reads past that table, hence the clamp.
 const STAUF_DEPTH = 6;
+const MIN_DEPTH = 2, MAX_DEPTH = 8;
+
+const pickDepth = (d) =>
+  Number.isInteger(d) ? Math.min(MAX_DEPTH, Math.max(MIN_DEPTH, d)) : STAUF_DEPTH;
 
 let mod = null, boardPtr = 0;
 
@@ -52,7 +56,7 @@ self.onmessage = async (e) => {
       const action = mod.ccall(
         'stauf_find_best_move', 'number',
         ['number', 'number', 'number', 'number'],
-        [boardPtr, STAUF_DEPTH, msg.asBlue ? 1 : 0, msg.moveCount],
+        [boardPtr, pickDepth(msg.depth), msg.asBlue ? 1 : 0, msg.moveCount],
       );
       self.postMessage({ type: 'move', action, ms: Math.round(performance.now() - t0) });
       return;
