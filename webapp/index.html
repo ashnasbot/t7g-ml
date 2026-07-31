@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="./favicon.ico" sizes="48x48 32x32 16x16">
-<title>Play Microscope / Ataxx in your browser</title>
+<title>T7G Microscope</title>
 <style>
   :root {
     --bg: #0f1117; --panel: #171a23; --line: #262b37; --ink: #e6e9ef; --muted: #8b93a7;
@@ -21,8 +21,12 @@
     font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
     display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; padding: 24px;
   }
-  h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: .2px; }
-  h1 small { color: var(--muted); font-weight: 400; font-size: 13px; }
+  /* dvh, not vh: mobile 100vh spans the space *behind* the URL bar, which would
+     drop the bottom-pinned footer below the fold. */
+  @supports (min-height: 100dvh) { body { min-height: 100dvh; } }
+  /* These two auto margins split the leftover height between them, which keeps
+     the content where centring had it while pinning the footer to the bottom. */
+  h1 { font-size: 20px; font-weight: 650; margin: auto 0 0; letter-spacing: .2px; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; position: relative; }
   /* Covers the board until an opponent is picked.  It also swallows clicks, so
      the empty board can't be poked at before there is a game to play. */
@@ -109,6 +113,18 @@
   }
   select:hover { border-color: #3a4260; }
   .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+  /* Phone: the three controls can't share a row, and left to wrap they drop
+     "New game" onto a line of its own.  display:contents lifts them into .bar's
+     grid so the break is placed deliberately -- score + colour above, opponent
+     + New game below, with the select taking up the slack. */
+  @media (max-width: 520px) {
+    .bar { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; }
+    .controls { display: contents; }
+    #score    { grid-area: 1 / 1; }
+    #side     { grid-area: 1 / 2 / 2 / 4; justify-self: end; }
+    #opponent { grid-area: 2 / 1 / 3 / 3; }
+    #new-game { grid-area: 2 / 3; }
+  }
   /* Segmented colour switch: two states, both visible, no menu to open. */
   .switch { display: flex; gap: 2px; padding: 2px; background: var(--cell2); border: 1px solid var(--line); border-radius: 9px; }
   .switch button {
@@ -118,8 +134,11 @@
   .switch button:hover { color: var(--ink); filter: none; }
   .switch button[aria-pressed="true"] { background: #2a3046; color: var(--ink); }
   .switch .dot { width: 10px; height: 10px; margin: 0 6px 0 0; }
-  .legal { color: var(--muted); font-size: 11px; text-align: center; width: min(86vw, 560px); line-height: 1.6; }
+  /* The auto margin makes .legal the start of the footer block; .made follows it
+     on the normal gap. */
+  .legal { color: var(--muted); font-size: 11px; text-align: center; width: min(86vw, 560px); line-height: 1.6; margin: auto 0 0; }
   .legal a { color: #7fa6ff; }
+  .made { color: var(--muted); font-size: 12px; text-align: center; margin: 0; }
 </style>
 </head>
 <body>
@@ -143,7 +162,7 @@
       <feBlend in="SourceGraphic" in2="goo"/>
     </filter>
   </svg>
-  <h1>Microscope <small id="side-note">· you play Blue</small></h1>
+  <h1>T7G Microscope</h1>
   <div class="bar">
     <div id="score"></div>
     <div class="controls">
@@ -176,10 +195,11 @@
   <button id="copy-game" class="ghost" title="Copy this game as a UAI move list">Copy game (UAI)</button>
   <p class="legal">
     Stauf is <a href="https://github.com/scummvm/scummvm">ScummVM</a>'s <code>CellGame</code>,
-    <a href="./LICENSE.GPLv3">GPLv3</a> — so this page is GPLv3.
+    <a href="./LICENSE.GPLv3">GPLv3</a> - making this page GPLv3 too.<br>
     Everything else is <a href="./LICENSE.MIT">MIT</a>.
     <a href="https://github.com/ashnasbot/t7g-ml/blob/main/webapp/README-licensing.md">Source</a>.
   </p>
+  <p class="made">Made with ❤️ by @ashnas</p>
   <script type="module" src="./app.mjs"></script>
   <script>
     // app.mjs is a module: if anything in its import graph 404s, it never

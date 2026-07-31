@@ -48,7 +48,7 @@ const $ = (id) => document.getElementById(id);
 // move is on screen before the synchronous search setup can block the thread.
 const nextPaint = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 const boardEl = $('board'), statusEl = $('status'), scoreEl = $('score');
-const metaEl = $('meta'), opponentEl = $('opponent'), sideEl = $('side'), sideNoteEl = $('side-note');
+const metaEl = $('meta'), opponentEl = $('opponent'), sideEl = $('side');
 const veilEl = $('veil');
 
 let ort, mod, session, netReady = null;
@@ -207,11 +207,10 @@ function boot() {
 }
 
 // Push HUMAN into the parts of the page that name a colour: the switch's
-// pressed state, the subtitle, and --me, which tints the move markers so the
-// hints are in your colour rather than always blue.
+// pressed state, and --me, which tints the move markers so the hints are in
+// your colour rather than always blue.
 function syncSideUI() {
   document.body.dataset.side = HUMAN ? 'blue' : 'green';
-  sideNoteEl.textContent = `· you play ${colour(HUMAN)}`;
   for (const b of sideEl.querySelectorAll('button'))
     b.setAttribute('aria-pressed', String((b.dataset.side === 'blue') === HUMAN));
 }
