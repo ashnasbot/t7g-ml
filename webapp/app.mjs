@@ -49,7 +49,18 @@ const $ = (id) => document.getElementById(id);
 const nextPaint = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 const boardEl = $('board'), statusEl = $('status'), scoreEl = $('score');
 const metaEl = $('meta'), opponentEl = $('opponent'), sideEl = $('side');
-const veilEl = $('veil');
+const veilEl = $('veil'), veilMsgEl = $('veil-msg'), veilAboutEl = $('veil-about');
+
+// The veil doubles as the About panel: one overlay, two contents.
+let aboutPrev = null;
+const aboutBtn = $('about-btn');
+
+function setVeil(mode) {           // 'prompt' | 'about' | null (hidden)
+  veilEl.hidden = mode === null;
+  veilEl.classList.toggle('about', mode === 'about');
+  veilMsgEl.hidden = mode !== 'prompt';
+  veilAboutEl.hidden = mode !== 'about';
+}
 
 let ort, mod, session, netReady = null;
 let backend = null;               // 'webgpu' | 'wasm', reported in the move status
@@ -217,6 +228,10 @@ function syncSideUI() {
 
 function newGame() {
   gen++;
+  // New game also dismisses About; drop the snapshot so ? reopens rather than
+  // restoring a board that no longer exists.
+  aboutPrev = null;
+  aboutBtn.setAttribute('aria-expanded', 'false');
   anim.cancelAll();          // a stone may be mid-flight; gen++ makes it give up
   board = engine.newBoard(); displayBoard = board;
   turn = true; clock = 0; selected = null; gameOver = false; busy = false;
@@ -229,14 +244,14 @@ function newGame() {
   // busy keeps the cells inert, so the board can't be played against nobody.
   if (!opponent) {
     busy = true;
-    veilEl.hidden = false;
+    setVeil('prompt');
     metaEl.textContent = 'Pick an opponent to start a game.';
     render();
     setStatus('Select an opponent from the dropdown.');
     return;
   }
 
-  veilEl.hidden = true;
+  setVeil(null);
   metaEl.textContent = `${aiName()} · ${OPPONENTS[opponent].meta}`;
   render();
   // Blue always moves first, so as Green you are waiting on the AI, not on you.
@@ -463,7 +478,7 @@ function afterMove(fromAi = false) {
   if (term.terminal) return finish(term);
   if (turn === HUMAN && engine.legalMoves(board, turn).length === 0) {
     clearStatusHold();
-    setStatus('You have no moves — you pass.', STATUS_HOLD);
+    setStatus('You have no moves - you pass.', STATUS_HOLD);
     clock = engine.tickClock(clock, engine.PASS_ACTION);
     moves.push(engine.actionToUAI(engine.PASS_ACTION));
     turn = !turn; render();
@@ -478,7 +493,7 @@ function finish(term) {
   clearStatusHold();          // the result outranks whatever is on screen
   const { blue, green } = engine.countCells(board);
   const mine = HUMAN ? blue : green, theirs = HUMAN ? green : blue;
-  setStatus(mine === theirs ? `Draw — ${mine}–${theirs}.`
+  setStatus(mine === theirs ? `Draw - ${mine}–${theirs}.`
     : mine > theirs ? `You win ${mine}–${theirs}! 🎉`
     : `${aiName()} wins ${theirs}–${mine}.`);
 }
@@ -519,11 +534,34 @@ $('copy-game').addEventListener('click', async () => {
     document.body.appendChild(ta);
     ta.focus(); ta.select();
     ta.addEventListener('blur', () => ta.remove(), { once: true });
-    setStatus('Clipboard blocked — copy the text, then tap outside it.');
+    setStatus('Clipboard blocked - copy the text, then tap outside it.');
   }
 });
 
 $('new-game').addEventListener('click', newGame);
+
+// About is a toggle over whatever was on screen, so opening it snapshots the
+// three things it overwrites and closing puts them back.  Non-null == open.
+// Clicking the veil is deliberately not a dismiss: it carries links.
+function toggleAbout() {
+  clearStatusHold();
+  if (aboutPrev) {
+    const prev = aboutPrev; aboutPrev = null;
+    busy = prev.busy;
+    setVeil(prev.veil);
+    render();
+    setStatus(prev.status);
+  } else {
+    aboutPrev = { veil: opponent ? null : 'prompt', busy, status: statusEl.textContent };
+    busy = true;                   // the board behind must not take clicks
+    setVeil('about');
+    render();
+    setStatus('About - press ? again to go back.');
+  }
+  aboutBtn.setAttribute('aria-expanded', String(!!aboutPrev));
+}
+
+aboutBtn.addEventListener('click', toggleAbout);
 // Switching opponent restarts: Stauf's depth cycling is keyed to its own move
 // count, so handing it a game already in progress would misrepresent it.
 opponentEl.addEventListener('change', () => {

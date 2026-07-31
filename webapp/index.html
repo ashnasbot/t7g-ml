@@ -13,6 +13,13 @@
     /* Your colour, so the move hints match the stones you are actually moving.
        Repainted by app.mjs via body[data-side]. */
     --me: var(--blue); --me-soft: #4f8cff66;
+    /* One source of truth for the column: the panel is the board plus its 18px
+       padding and 1px border on each side. */
+    --board: min(86vw, 460px);
+    --panel-w: calc(var(--board) + 38px);
+    /* Every bar control is this tall.  Their paddings and font sizes differ, so
+       left to themselves they each compute a different height. */
+    --ctl-h: 38px;
   }
   body[data-side="green"] { --me: var(--green); --me-soft: #06c47e5c; }
   * { box-sizing: border-box; }
@@ -36,9 +43,23 @@
     background: #0f1117d9; color: var(--ink); font-weight: 600; line-height: 1.45;
   }
   #veil[hidden] { display: none; }
+  /* About mode: same overlay, prose instead of a one-liner.  `safe center` is the
+     centred pair -- plain centring would push the top of an overflowing block out
+     of reach of the scrollbar; parsers without `safe` keep the line above. */
+  #veil.about {
+    place-items: center;
+    place-items: safe center;
+    overflow-y: auto; overscroll-behavior: contain;
+    font-weight: 400; padding: 14px;
+  }
+  #veil-about { font-size: 12.5px; line-height: 1.55; }
+  #veil-about p { margin: 0 0 9px; }
+  #veil-about p:last-child { margin: 0; }
+  #veil-about a { color: #7fa6ff; }
+  #about-btn { padding: 6px 9px; }
   #board {
     display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px;
-    width: min(86vw, 460px); aspect-ratio: 1;
+    width: var(--board); aspect-ratio: 1;
     position: relative;             /* origin for the .fx animation overlay */
   }
   .cell {
@@ -86,14 +107,46 @@
     background: var(--me-soft); outline: 2px solid var(--me);
   }
   .cell.dest.jump::before { border-radius: 5px; }   /* square marker = jump (source vacated) */
+  /* The bar spans the panel, not the board: 38px wider (18px padding + 1px border
+     each side) and free, which is what lets the four controls hold one row. */
   .bar {
-    display: flex; align-items: center; gap: 10px 16px; width: min(86vw, 460px);
-    justify-content: space-between; flex-wrap: wrap;   /* three controls don't fit one phone row */
+    display: flex; align-items: center; gap: 10px; width: var(--panel-w);
+    justify-content: space-between;
+  }
+  .controls {
+    display: flex; gap: 8px; align-items: center;
+    flex-wrap: nowrap; justify-content: flex-end; min-width: 0;
+  }
+  /* Flex items shrink by default, which squeezed the score out of alignment and
+     wrapped "New game" onto two lines.  Only the select may give width back --
+     it is the one control that still reads when truncated. */
+  #score, #side, #new-game, #about-btn { flex-shrink: 0; }
+  #new-game, #about-btn { white-space: nowrap; }
+  #opponent { flex: 0 1 auto; min-width: 0; }
+  /* One height for the row.  box-sizing is border-box globally, so this absorbs
+     each control's own padding and border rather than adding to them. */
+  #side, #opponent, #new-game, #about-btn { height: var(--ctl-h); }
+  #new-game, #about-btn { display: inline-flex; align-items: center; justify-content: center; }
+  /* 14px, not the inherited 15px: the swatches cost ~32px the row has to find,
+     and the gap beside the score only covers part of it. */
+  #opponent, #new-game { font-size: 14px; }
+  /* Below this the row genuinely cannot fit, so break it deliberately rather
+     than letting flex wrap decide: score + colour above, the rest below. */
+  @media (max-width: 560px) {
+    .bar { display: grid; grid-template-columns: auto 1fr auto; }
+    .controls { display: contents; }
+    #score     { grid-area: 1 / 1; }
+    #side      { grid-area: 1 / 2; justify-self: start; }
+    #new-game  { grid-area: 1 / 3; }
+    #opponent  { grid-area: 2 / 1 / 3 / 3; }
+    /* Left to itself ? would be a lone 34px stub under a 95px button; sharing
+       the column makes the right-hand edge a stack of two equal buttons. */
+    #about-btn { grid-area: 2 / 3; }
   }
   #score { font-variant-numeric: tabular-nums; font-weight: 600; display: flex; align-items: center; }
-  .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin: 0 6px 0 2px; vertical-align: -1px; }
+  .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin: 0 5px 0 0; vertical-align: -1px; }
   .dot.blue { background: var(--blue); } .dot.green { background: var(--green); }
-  #status { color: var(--muted); min-height: 1.5em; text-align: center; width: min(86vw, 460px); }
+  #status { color: var(--muted); min-height: 1.5em; text-align: center; width: var(--board); }
   button {
     background: var(--blue); color: #fff; border: 0; border-radius: 9px; padding: 8px 14px;
     font: inherit; font-weight: 600; cursor: pointer;
@@ -104,31 +157,18 @@
     font-size: 13px; font-weight: 500; padding: 6px 12px;
   }
   button.ghost:hover { border-color: #3a4260; color: var(--ink); filter: none; }
-  .meta { color: var(--muted); font-size: 12px; text-align: center; width: min(86vw, 460px); }
+  .meta { color: var(--muted); font-size: 12px; text-align: center; width: var(--board); }
   .meta b { color: var(--ink); font-weight: 600; }
   .meta a { color: var(--muted); }
   select {
     background: var(--cell2); color: var(--ink); border: 1px solid var(--line);
-    border-radius: 9px; padding: 8px 10px; font: inherit; font-weight: 600; cursor: pointer;
+    border-radius: 9px; padding: 8px 9px; font: inherit; font-weight: 600; cursor: pointer;
   }
   select:hover { border-color: #3a4260; }
-  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
-  /* Phone: the three controls can't share a row, and left to wrap they drop
-     "New game" onto a line of its own.  display:contents lifts them into .bar's
-     grid so the break is placed deliberately -- score + colour above, opponent
-     + New game below, with the select taking up the slack. */
-  @media (max-width: 520px) {
-    .bar { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; }
-    .controls { display: contents; }
-    #score    { grid-area: 1 / 1; }
-    #side     { grid-area: 1 / 2 / 2 / 4; justify-self: end; }
-    #opponent { grid-area: 2 / 1 / 3 / 3; }
-    #new-game { grid-area: 2 / 3; }
-  }
   /* Segmented colour switch: two states, both visible, no menu to open. */
   .switch { display: flex; gap: 2px; padding: 2px; background: var(--cell2); border: 1px solid var(--line); border-radius: 9px; }
   .switch button {
-    background: transparent; color: var(--muted); border-radius: 7px; padding: 6px 10px;
+    background: transparent; color: var(--muted); border-radius: 7px; padding: 6px 9px;
     font-size: 13px; font-weight: 600; display: flex; align-items: center;
   }
   .switch button:hover { color: var(--ink); filter: none; }
@@ -173,19 +213,51 @@
       <!-- No opponent is selected by default: the game waits until you pick one.
            The placeholder is disabled so it can't be chosen again once you have. -->
       <select id="opponent" aria-label="Opponent">
-        <option value="" selected disabled>Choose opponent…</option>
+        <option value="" selected disabled>Opponent…</option>
         <option value="stauf-easy">Stauf (Easy)</option>
         <option value="stauf">Stauf</option>
         <option value="net">AshnasBot</option>
       </select>
       <button id="new-game">New game</button>
+      <button id="about-btn" class="ghost" type="button"
+              aria-label="About this page" aria-expanded="false">?</button>
     </div>
   </div>
   <!-- The veil is a sibling of #board, not a child: buildBoard() replaces the
        board's contents wholesale and would take it with them. -->
   <div class="panel">
     <div id="board"></div>
-    <div id="veil">Select an opponent<br>from the dropdown</div>
+    <div id="veil">
+      <div id="veil-msg">Select an opponent<br>from the dropdown</div>
+      <div id="veil-about" hidden>
+        <p>
+          This is The 7th Guest's "Microscope" puzzle, with the game's own AI - Stauf -
+          extracted and made to run in the browser.
+        </p>
+        <p>
+          You can use this to beat Stauf in the game itself. Set yourself to Green and
+          your opponent to AshnasBot - Stauf plays Green in T7G, so here you take his
+          side. Play AshnasBot's moves in the real game, then enter Stauf's replies
+          back here.
+        </p>
+        <p>
+          It started as a mini-solver for the puzzle. Stauf is deterministic, so it wasn't
+          too hard to out-compute with a decent minimaxer, and I moved on to more exotic
+          engines - working through
+          <a href="https://en.wikipedia.org/wiki/Proximal_policy_optimization">PPO</a> and
+          <a href="https://en.wikipedia.org/wiki/AlphaZero">AlphaZero</a> before ending up
+          on the current engine, a reasonably modern AlphaZero variant with a few upgrades.
+          The search uses a DAG instead of a tree, due to the massive move symmetries in
+          this game, and the non-net components are almost all in optimised C for
+          performance.
+        </p>
+        <p>
+          The model has trained on roughly 270,000 self-play games, and appears to be close
+          to saturating the signal we can squeeze from the game.
+        </p>
+        <p>I'd love to hear from you if you beat it!</p>
+      </div>
+    </div>
   </div>
   <!-- role=status so the move reports are announced.  Only worth having now
        that a line stays up long enough to be read rather than being replaced
