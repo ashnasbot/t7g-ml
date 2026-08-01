@@ -116,8 +116,7 @@ _NET_CACHE: dict = {}          # path -> MCGS agent (avoid reloading on revisit)
 
 def _load_network(checkpoint, device):
     """Load a checkpoint into the right architecture, auto-detected from the
-    state dict (t7g-net2 or the legacy DualHeadNetwork) -- so the bundled
-    ``best.pt`` and any historical net both load.  CPU inference: no compile."""
+    state dict (net2 or net2c).  CPU inference: no compile."""
     from lib.device_utils import load_compiled_network
     blob = torch.load(checkpoint, map_location=device, weights_only=False)
     state = blob["network"] if isinstance(blob, dict) and "network" in blob else blob

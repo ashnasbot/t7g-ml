@@ -100,13 +100,19 @@ run otherwise overwrites the previous run's history.
 | `--simulations` | 500 | MCTS simulations per move (`T7G_SIMULATIONS`) |
 | `--pool` | 512 | Concurrent self-play games / inference batch size (`T7G_POOL_SIZE`) |
 | `--pcr-fast-sims` | 100 | Playout-cap randomisation: sim budget for the cheap search that plays most moves |
-| `--blend-alpha` | 0.25 | Value-target blend; 1.0 = pure game outcome, lower mixes in gated root-Q |
 | `--lr` | 1e-4 | Learning rate (constant for the run) |
-| `--arch` | `net2` | Network architecture (`net2` or `old`) |
+| `--arch` | `net2` | Network architecture (`net2` or `net2c`) |
 | `--logdir` | `tblog/mcts` | TensorBoard log directory |
 | `--cudagraphs` | off | CUDA/HIP graph capture for inference; unvalidated on ROCm |
 
 Monitor with `tensorboard --logdir=tblog/`.
+
+Every fifth iteration the net is rated (`eval/elo`) against an anchor pool plus
+its own recent selves. The pool is described by `models/elo_pool/pool.json`;
+without that file — the case for a fresh clone, since `models/` is not in the
+repo — training falls back to the built-in minimax anchor, which needs no
+checkpoint. Net anchors listed in `pool.json` are skipped with a warning if
+their `.pt` is missing, so a partial `models/` works too.
 
 ---
 

@@ -22,88 +22,17 @@ UAI_ENGINES = {"autaxx", "autaxx-ab", "tiktaxx", "scarlettxx"}
 
 
 # ---------------------------------------------------------------------------
-# Value-target blending (Option A + B)
+# Value target
 # ---------------------------------------------------------------------------
 #
-# See docs/value_blending.md for the full rationale and the Option D swap-in
-# recipe.  Short version: the final value target is
-#
-#     value_target = α * terminal + (1 - α) * root_q
-#
-# The blend is applied in the LOSS (lib/training.py), not here: workers store
-# the pure terminal outcome plus (root_q, q_weight) per example, and the WDL
-# head trains on soft class targets  (1-w)*onehot(z) + w*[(1+q)/2, 0, (1-q)/2].
-# Pre-blending into one scalar would be quantized away by the hard ±0.33
-# class conversion (2026-07-12 audit).  The per-example weight w suppresses
-# Q influence in regimes where Q is known to be unreliable:
-#
-#   (A) Noise ramp: Q weight follows how UNPREDICTABLE the terminal outcome
-#       is at that ply.  Q earns its place by replacing a noisy label, so it
-#       is worth most in the opening and worth nothing once z is already
-#       exact.  Profile below is measured, not guessed.
-#
-#   (B) Visit concentration gate: if the root visit distribution is flat
-#       (MCTS uncertain), down-weight Q further.  Concentration is
-#       1 - normalised_entropy; a peaked distribution → 1, uniform → 0.
-#
-# The two gates combine multiplicatively: both must fire for Q to reach
-# full weight.
-#
-# (A) weights Q by where the terminal label z is actually noisy: irreducible
-# var(z) is ~0.92 in the opening (ply 0-20) and ~0.00 past ply 80, so the search
-# Q is most worth blending in early and least worth it late.  Temperature
-# affects which move is PLAYED, not the root's value backup, so it must not gate
-# the blend.  See memory/project_blend_gate_inverted.md + debug/target_noise_floor.py.
-#
-# Caution: un-gated heavy blending can drive the value head toward 0 everywhere.
-# ~0 IS correct in the opening on a 95%-noise label; the failure mode to watch
-# is value variance going flat across ALL plies, not just early ones.
+# The main value target is a lambda-return over each game's future MCTS root
+# values (value_lambda / value_q_weight, set in scripts/train_mcts.py).  It is
+# mixed with the terminal outcome z in the LOSS (lib/training.py), not here:
+# workers store the pure terminal outcome plus (root_q, q_weight) per example,
+# and the WDL head trains on soft class targets
+# (1-w)*onehot(z) + w*[(1+q)/2, 0, (1-q)/2].  Pre-blending into one scalar
+# would be quantized away by the hard ±0.33 class conversion.
 # ---------------------------------------------------------------------------
-
-# Irreducible var(z) by ply, from duplicate-position groups (2026-07-22,
-# debug/target_noise_floor.py), normalised by its own max to a weight in [0,1].
-# np.interp clamps outside the knots: full weight before ply 10, zero past 90.
-_NOISE_PLY = (10.0, 30.0, 50.0, 70.0, 90.0)
-_NOISE_VAR = (0.92, 0.85, 0.68, 0.28, 0.00)
-
-
-def _q_blend_weight(
-    move_idx: int,
-    policy_target: np.ndarray,
-    blend_alpha: float,
-) -> float:
-    """
-    Gated Q weight for one example's value target.
-
-    When blend_alpha == 1.0 returns 0.0 (blending off; no-op fast path).
-    Otherwise applies the noise × concentration gating described above.
-
-    Parameters
-    ----------
-    move_idx       : move number when the example was recorded
-    policy_target  : MCTS visit-weighted policy at the root (used for concentration)
-    blend_alpha    : maximum α used for pure terminal (1 - blend_alpha = max Q weight)
-
-    Returns
-    -------
-    q_weight in [0, 1 - blend_alpha]
-    """
-    if blend_alpha >= 1.0:
-        return 0.0
-
-    # (A) Noise ramp: how much of z is irreducible at this ply, normalised.
-    noise = float(np.interp(move_idx, _NOISE_PLY, _NOISE_VAR)) / _NOISE_VAR[0]
-
-    # (B) Concentration of MCTS visit distribution: 1.0 = one-hot, 0.0 = uniform.
-    support = policy_target[policy_target > 1e-8]
-    if support.size <= 1:
-        concentration = 1.0 if support.size == 1 else 0.0
-    else:
-        entropy     = float(-np.sum(support * np.log(support)))
-        max_entropy = float(np.log(support.size))
-        concentration = 1.0 - (entropy / max_entropy if max_entropy > 0 else 0.0)
-
-    return (1.0 - blend_alpha) * noise * concentration
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +88,6 @@ class _GameSlot:
 def _slot_result(
     slot: _GameSlot,
     winner: float,
-    blend_alpha: float = 1.0,
     value_lambda: float | None = None,
     value_q_weight: float | None = None,
 ) -> tuple:
@@ -176,8 +104,8 @@ def _slot_result(
         ownership is a (7,7) int8 map of the *final* board from the example's
         side-to-move perspective: 0=mine, 1=opponent's, 2=empty.
         value_target is the PURE terminal outcome; root_q (side-to-move
-        perspective) and its gated blend weight ride along separately so the
-        loss can mix them at the class-distribution level (see module header).
+        perspective) and its weight ride along separately so the loss can mix
+        them at the class-distribution level (see module header).
         st_targets is a (len(ST_LAMBDAS),) float32 array of lambda-averaged
         future MCTS root values (side-to-move perspective) for the t7g-net2
         short-term value heads:  s_i = (1-l)*sum_{j in [i,n)} l^(j-i)*q_j
@@ -239,10 +167,9 @@ def _slot_result(
             # slot is thresholded at +-0.33, which would quantize ~half of a
             # lambda-return away.  The slot therefore means "search-derived
             # value target here", not "root Q at this node".
-            # q_weight is a constant, NOT the noise-ramp gate: the ramp exists
-            # to down-weight Q where z is trustworthy, but the lambda-return is
-            # a better estimate of the outcome than z at every ply (measured:
-            # split-half fidelity 0.257-0.269 vs z's 0.198).  The residual
+            # q_weight is a constant: the lambda-return is a better estimate
+            # of the outcome than z at every ply (measured: split-half
+            # fidelity 0.257-0.269 vs z's 0.198).  The residual
             # 1 - value_q_weight stays on the true outcome, which anchors
             # against bootstrap drift and is the only teacher of DRAW mass
             # (q_dist assigns none).  PCR fast rows keep their value target --
@@ -251,20 +178,17 @@ def _slot_result(
             q_weight = value_q_weight
             if not full_move:
                 policy_target = np.zeros_like(policy_target)
-        elif full_move:
-            root_q = _root_q
-            q_weight = _q_blend_weight(
-                move_idx=move_idx, policy_target=policy_target,
-                blend_alpha=blend_alpha,
-            )
         else:
-            # Playout-cap-randomized fast move: the shallow search is good
-            # enough to play but not to teach - zero the policy target (masked
-            # out of the policy loss) and drop its root Q from the value blend.
-            # z / margin / ownership still train from these rows.
-            policy_target = np.zeros_like(policy_target)
-            root_q = 0.0
+            # value_lambda=None: pure terminal target.  The 1-step root Q
+            # rides along for telemetry but trains nothing (weight 0).
+            root_q = _root_q if full_move else 0.0
             q_weight = 0.0
+            if not full_move:
+                # Playout-cap-randomized fast move: the shallow search is good
+                # enough to play but not to teach - zero the policy target
+                # (masked out of the policy loss).  z / margin / ownership
+                # still train from these rows.
+                policy_target = np.zeros_like(policy_target)
         margin = margin_blue if example_turn else -margin_blue
         ownership = own_as_blue if example_turn else own_as_green
         examples.append((obs, policy_target, value_target, margin, ownership,
@@ -284,8 +208,8 @@ def _start_slot_search(
 
     Playout-cap randomization (KataGo): with probability pcr_p_full the move
     gets the full budget and yields a policy training target; otherwise it runs
-    a cheap pcr_fast_sims search whose example is value/aux-only (policy target
-    zeroed and Q-blend weight dropped in _slot_result).  pcr_p_full >= 1.0
+    a cheap pcr_fast_sims search whose example is value/aux-only (policy
+    target zeroed in _slot_result).  pcr_p_full >= 1.0
     disables the mechanism entirely (no C calls, byte-identical behaviour).
     """
     full = pcr_p_full >= 1.0 or np.random.random() < pcr_p_full
@@ -314,7 +238,6 @@ def _advance_group(
     target_games: int,
     games_started: int,
     temp_moves: int,
-    blend_alpha: float,
     full_sims: int = 0,
     pcr_p_full: float = 1.0,
     pcr_fast_sims: int = 100,
@@ -353,7 +276,7 @@ def _advance_group(
             if is_terminal:
                 assert terminal_value is not None
                 winner = terminal_value if slot.turn else -terminal_value
-                results.append(_slot_result(slot, winner, blend_alpha,
+                results.append(_slot_result(slot, winner,
                                             value_lambda, value_q_weight))
                 if games_started < target_games:
                     _reset_slot(slot)
@@ -380,7 +303,7 @@ def _advance_group(
                 slot.move_count += 1
                 slot.clock += 1
                 if slot.clock >= CLOCK_LIMIT:
-                    results.append(_slot_result(slot, 0.0, blend_alpha,
+                    results.append(_slot_result(slot, 0.0,
                                                 value_lambda, value_q_weight))
                     if games_started < target_games:
                         _reset_slot(slot)
@@ -428,7 +351,7 @@ def _advance_group(
             done = True
 
         if done:
-            results.append(_slot_result(slot, winner, blend_alpha,
+            results.append(_slot_result(slot, winner,
                                             value_lambda, value_q_weight))
             if games_started < target_games:
                 _reset_slot(slot)
@@ -454,7 +377,6 @@ def self_play_game_pool(
     target_games: int,
     mcts_pool: 'list[MCGS] | None' = None,
     temp_moves: int = 0,
-    blend_alpha: float = 1.0,
     pcr_p_full: float = 1.0,
     pcr_fast_sims: int = 100,
     value_lambda: float | None = None,
@@ -516,7 +438,7 @@ def self_play_game_pool(
         # GPU is busy with B's forward during the CPU work here.
         mcts._collect_and_commit(handle_a)
         active_a, games_started, results = _advance_group(
-            active_a, target_games, games_started, temp_moves, blend_alpha,
+            active_a, target_games, games_started, temp_moves,
             full_sims, pcr_p_full, pcr_fast_sims,
             value_lambda, value_q_weight,
         )
@@ -528,7 +450,7 @@ def self_play_game_pool(
         # --- Group B: same thing, with GPU now busy on A's next forward.
         mcts._collect_and_commit(handle_b)
         active_b, games_started, results = _advance_group(
-            active_b, target_games, games_started, temp_moves, blend_alpha,
+            active_b, target_games, games_started, temp_moves,
             full_sims, pcr_p_full, pcr_fast_sims,
             value_lambda, value_q_weight,
         )

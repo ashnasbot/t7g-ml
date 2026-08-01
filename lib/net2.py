@@ -1,12 +1,10 @@
 """
-t7g-net2: KataGo-family network (docs/net_rewrite_brief.md, 2026-07-17).
+t7g-net2: KataGo-family network.
 
-Replaces the 2017-A0 plain ResNet (lib/dual_network.py DualHeadNetwork) as the
-*training* architecture; the old class stays importable so historical
-checkpoints remain playable in the eval pool.  ``build_from_state_dict``
-dispatches between the two by checkpoint shape.
+``build_from_state_dict`` dispatches between this and net2c (lib/net2c.py)
+by checkpoint shape.
 
-Design (see the brief for rationale and sources):
+Design:
 - Trunk: nested-bottleneck residual blocks (1x1 down to C/2 -> two inner
   residual 3x3 pairs -> 1x1 up), fixed-variance init (He + 1/sqrt(2) scale
   after every skip-add, same scheme as the validated FixupResidualBlock),
@@ -30,8 +28,8 @@ Design (see the brief for rationale and sources):
   arch now; targets are plumbed with the first self-play run (loss weight 0
   until then).
 
-forward() keeps the (policy_logits, value, margin) 3-tuple contract of
-DualHeadNetwork — search, eval workers, and export code are unchanged.
+forward() returns a (policy_logits, value, margin) 3-tuple — the contract
+shared by search, eval workers, and export code.
 """
 import numpy as np
 import torch
@@ -40,7 +38,7 @@ import torch.nn.functional as F
 
 from lib.t7g import board_to_obs
 from lib.training import (_ACT_SRC, _ACT_DST, _ACT_INB, POLICY_MASK_VALUE,  # noqa: F401
-                          ST_HORIZONS, ST_LAMBDAS)
+                          ST_LAMBDAS)
 
 _INV_SQRT2 = 0.7071067811865476
 
@@ -102,7 +100,7 @@ class Net2(nn.Module):
     Args:
         num_actions:    must be 1225 (the attention head is built on the
                         49x25 from-to structure; kept as an arg for call-site
-                        uniformity with DualHeadNetwork).
+                        uniformity).
         channels:       trunk width C (bottleneck runs at C/2).
         num_blocks:     nested-bottleneck block count.
         gpool_blocks:   indices of blocks that get the gpool bias; None =
@@ -180,9 +178,8 @@ class Net2(nn.Module):
         return logits.masked_fill(self._oob, POLICY_MASK_VALUE)
 
     def forward(self, obs: torch.Tensor, full: bool = False):
-        """Same contract as DualHeadNetwork.forward:
-        (policy_logits, value, margin); full=True appends value_logits,
-        ownership_logits, soft_policy_logits, st_values."""
+        """Returns (policy_logits, value, margin); full=True appends
+        value_logits, ownership_logits, soft_policy_logits, st_values."""
         if obs.dim() == 4 and obs.shape[-1] == 4:
             x = obs.permute(0, 3, 1, 2).contiguous(
                 memory_format=torch.channels_last
@@ -227,7 +224,7 @@ class Net2(nn.Module):
 
     @torch.no_grad()
     def predict(self, board: np.ndarray, turn: bool) -> tuple[np.ndarray, float]:
-        """Single-state inference for MCTS — same contract as DualHeadNetwork."""
+        """Single-state inference for MCTS."""
         self.eval()
         obs = board_to_obs(board, turn)
         obs_tensor = torch.from_numpy(obs).unsqueeze(0).to(next(self.parameters()).device)
@@ -243,19 +240,12 @@ class Net2(nn.Module):
 
 
 def build_from_state_dict(state_dict: dict, num_actions: int = 1225) -> nn.Module:
-    """Construct the right network class (Net2 or legacy DualHeadNetwork) for
-    an arbitrary checkpoint and load its weights."""
+    """Construct the right network class (Net2 or Net2C) for an arbitrary
+    checkpoint and load its weights."""
     from lib.net2c import Net2C
-    from lib.net3 import Net3
-    if Net3.is_net3_state_dict(state_dict):
-        net = Net3(num_actions=num_actions, **Net3.infer_arch(state_dict))
-    elif Net2C.is_net2c_state_dict(state_dict):
+    if Net2C.is_net2c_state_dict(state_dict):
         net = Net2C(num_actions=num_actions, **Net2C.infer_arch(state_dict))
-    elif Net2.is_net2_state_dict(state_dict):
-        net = Net2(num_actions=num_actions, **Net2.infer_arch(state_dict))
     else:
-        from lib.dual_network import DualHeadNetwork
-        net = DualHeadNetwork(num_actions=num_actions,
-                              **DualHeadNetwork.infer_arch(state_dict))
+        net = Net2(num_actions=num_actions, **Net2.infer_arch(state_dict))
     net.load_state_dict(state_dict)
     return net

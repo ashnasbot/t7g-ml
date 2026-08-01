@@ -20,7 +20,7 @@ import pytest
 import torch
 
 sys.path.insert(0, ".")
-from lib.dual_network import DualHeadNetwork
+from lib.net2 import Net2
 from lib.mcgs import MCGS
 from lib.train_workers import self_play_game_pool
 
@@ -33,7 +33,7 @@ N_SIMS  = 8
 @pytest.fixture(scope="module")
 def mcts():
     torch.manual_seed(0)
-    net = DualHeadNetwork(num_actions=1225).to("cpu")
+    net = Net2(channels=32, num_blocks=2).to("cpu")
     net.eval()
     return MCGS(net, num_simulations=N_SIMS, c_puct=1.25, gumbel_k=4)
 
@@ -64,47 +64,8 @@ def test_value_targets_are_decisive(mcts):
 
 
 # ---------------------------------------------------------------------------
-# Gated root-Q value blending (VALUE_BLEND_ALPHA < 1)
+# Soft W/D/L value targets (lambda-return via the (root_q, q_weight) fields)
 # ---------------------------------------------------------------------------
-
-def test_q_blend_weight_gating():
-    """The gated Q weight must be 0 when disabled/ungated, (1-alpha) at full gate."""
-    from lib.train_workers import _q_blend_weight
-
-    onehot  = np.zeros(1225); onehot[0] = 1.0
-    uniform = np.ones(1225) / 1225
-
-    # alpha=1.0 disables blending regardless of gates.
-    assert _q_blend_weight(50, onehot, blend_alpha=1.0) == 0.0
-    # Uniform visit distribution -> zero concentration -> gate closed.
-    assert _q_blend_weight(50, uniform, blend_alpha=0.5) == pytest.approx(0.0)
-    # Early game with a one-hot policy: z is ~all noise, so Q gets FULL weight.
-    assert _q_blend_weight(10, onehot, blend_alpha=0.5) == pytest.approx(0.5)
-    assert _q_blend_weight(10, onehot, blend_alpha=0.7) == pytest.approx(0.3)
-    # Mid game: weight tracks the measured noise profile (0.68/0.92 at ply 50).
-    assert _q_blend_weight(50, onehot, blend_alpha=0.5) == pytest.approx(
-        0.5 * 0.68 / 0.92)
-    # Endgame: z is already exact, so Q is switched off entirely.
-    assert _q_blend_weight(95, onehot, blend_alpha=0.5) == pytest.approx(0.0)
-
-
-def test_q_blend_weight_is_not_inverted():
-    """Regression guard for the 2026-07-22 gate flip.
-
-    The predecessor gate ramped UP with move index, so it suppressed root Q
-    across the opening (where the terminal outcome is ~92% irreducible noise)
-    and ran at full weight in the endgame (where z is already exact).  Q weight
-    must now be monotonically non-increasing in ply.
-    """
-    from lib.train_workers import _q_blend_weight
-
-    onehot = np.zeros(1225); onehot[0] = 1.0
-    weights = [_q_blend_weight(p, onehot, blend_alpha=0.25)
-               for p in range(0, 120, 5)]
-    assert all(a >= b for a, b in zip(weights, weights[1:])), weights
-    assert weights[0] > weights[-1], "gate must favour the opening, not the endgame"
-    assert weights[0] == pytest.approx(0.75)
-
 
 def _train_once(examples):
     """One deterministic training pass over *examples* on a fresh WDL net."""
@@ -112,7 +73,7 @@ def _train_once(examples):
 
     torch.manual_seed(0)
     np.random.seed(0)
-    net = DualHeadNetwork(num_actions=1225, wdl=True, ownership=True).to("cpu")
+    net = Net2(channels=32, num_blocks=2).to("cpu")
     opt = torch.optim.Adam(net.parameters())
     buf = _IterBuffer(8)
     buf.append_batch(examples)

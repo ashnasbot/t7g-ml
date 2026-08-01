@@ -4,8 +4,7 @@ Playout-cap randomization (PCR) contract tests.
 Per MOVE, with probability pcr_p_full the search runs the full budget and the
 example keeps its policy target; otherwise a cheap pcr_fast_sims search is run
 and the example must train value/aux only: policy target zeroed (masked out of
-the policy CE by lib/training.py's has_policy check) and the root-Q blend
-weight dropped (a low-sim root is too noisy to teach the value head).
+the policy CE by lib/training.py's has_policy check).
 
 pcr_p_full=1.0 must be a strict no-op (the pre-PCR code path, no C calls).
 """
@@ -15,7 +14,7 @@ import pytest
 import torch
 
 sys.path.insert(0, ".")
-from lib.dual_network import DualHeadNetwork
+from lib.net2 import Net2
 from lib.mcgs import MCGS
 from lib.train_workers import self_play_game_pool
 
@@ -26,7 +25,7 @@ N_SIMS_FAST = 4
 @pytest.fixture(scope="module")
 def mcts():
     torch.manual_seed(0)
-    net = DualHeadNetwork(num_actions=1225).to("cpu")
+    net = Net2(channels=32, num_blocks=2).to("cpu")
     net.eval()
     return MCGS(net, num_simulations=N_SIMS_FULL, c_puct=1.25, gumbel_k=4)
 
@@ -44,7 +43,7 @@ def _collect(mcts, **pool_kwargs):
 def test_set_num_simulations():
     """The C-side budget setter must be exported and steer the next search."""
     torch.manual_seed(0)
-    net = DualHeadNetwork(num_actions=1225).to("cpu")
+    net = Net2(channels=32, num_blocks=2).to("cpu")
     net.eval()
     m = MCGS(net, num_simulations=N_SIMS_FULL, c_puct=1.25, gumbel_k=4)
     m.set_num_simulations(N_SIMS_FAST)
@@ -63,12 +62,12 @@ def test_pcr_disabled_all_rows_have_policy(mcts):
 
 
 def test_pcr_fast_rows_masked_and_unblended(mcts):
-    """Fast rows: zero policy + zero q_weight (even with blending wide open);
-    full rows keep normalized policies.  Split fraction ~ pcr_p_full."""
+    """Fast rows: zero policy + zero q_weight; full rows keep normalized
+    policies.  Split fraction ~ pcr_p_full."""
     np.random.seed(0)
     mcts.set_num_simulations(N_SIMS_FULL)
     examples = _collect(mcts, pcr_p_full=0.5, pcr_fast_sims=N_SIMS_FAST,
-                        temp_moves=0, blend_alpha=0.5)
+                        temp_moves=0)
     # 9-tuple layout: 1=policy, 2=z, 7=root_q, 8=q_weight
     fast = [ex for ex in examples if not np.any(ex[1])]
     full = [ex for ex in examples if np.any(ex[1])]

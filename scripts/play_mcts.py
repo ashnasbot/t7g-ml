@@ -12,10 +12,9 @@ Usage:
     python scripts/play_mcts.py --checkpoint models/mcts/final.pt --simulations 50
 """
 import argparse
-import os
 
-from lib.dual_network import DualHeadNetwork
 from lib.mcgs import MCGS
+from lib.net2 import build_from_state_dict
 from lib.t7g import new_board, apply_move, check_terminal, find_best_move, count_cells, show_board, action_to_move
 
 import torch
@@ -147,13 +146,13 @@ def main():
                         help="Watch a single game with board output")
     args = parser.parse_args()
 
-    # Load network
+    # Load network (arch inferred from the checkpoint shape)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    network = DualHeadNetwork(num_actions=1225).to(device)
 
     print(f"Loading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, weights_only=False)
-    network.load_state_dict(checkpoint['network'])
+    state_dict = checkpoint['network'] if 'network' in checkpoint else checkpoint
+    network = build_from_state_dict(state_dict).to(device)
     network.eval()
     print(f"Device: {device}")
 

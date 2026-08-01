@@ -279,7 +279,7 @@ class Net2C(nn.Module):
 
     @torch.no_grad()
     def predict(self, board: np.ndarray, turn: bool) -> tuple[np.ndarray, float]:
-        """Single-state inference for MCTS — same contract as DualHeadNetwork."""
+        """Single-state inference for MCTS."""
         self.eval()
         obs = board_to_obs(board, turn)
         obs_tensor = torch.from_numpy(obs).unsqueeze(0).to(next(self.parameters()).device)

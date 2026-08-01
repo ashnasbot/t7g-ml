@@ -37,8 +37,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lib.device_utils import get_gpu_stats                          # noqa: E402
-from lib.dual_network import DualHeadNetwork                         # noqa: E402
+from lib.device_utils import get_gpu_stats, build_inference_network  # noqa: E402
 from lib.net2 import Net2                                            # noqa: E402
 from lib.evaluation import (                                         # noqa: E402
     evaluate_vs_noisy_minimax, rate_vs_pool, _calibrate_ladder,
@@ -101,16 +100,10 @@ NET_ARCH             = "net2"   # "net2" = t7g-net2 (lib/net2.py, KataGo-family)
                                 # soft-policy and short-term-value heads removed,
                                 # ownership rebranched off the trunk.  net2c is
                                 # NOT weight-compatible with net2: fresh run only.
-                                # "net3" = t7g-net3 (lib/net3.py) - Lc0-BT-style
-                                # transformer over the 49 squares, net2c's heads
-                                # on a conv-free trunk.  Also fresh-run only, and
-                                # ~2x the GPU time per forward at pool batch
-                                # sizes: read that file's docstring first.
-                                # "old" = legacy DualHeadNetwork
 SOFT_POLICY_COEF     = 0.0      # net2 aux soft policy head: OFF - ablation
                                 # showed KataGo's nominal 8.0 bought zero policy
                                 # CE (the attention head owns the win) at ~0.01
-                                # holdout value CE.  No-op for the old arch.
+                                # holdout value CE.
 ST_VALUE_COEF        = 0.0      # OFF.  The short-term value heads existed to
                                 # sharpen LATE-game value, but irreducible var(z)
                                 # is already 0.279 at ply 60-80 and 0.000 at 80+ -
@@ -123,15 +116,14 @@ ST_VALUE_COEF        = 0.0      # OFF.  The short-term value heads existed to
                                 # value_wdl.  net2c has no such head at all; this
                                 # only still applies to net2.
 VALUE_TARGET_LAMBDA  = 0.9375   # main value target = lambda-return over FUTURE
-                                # root Q, not the 1-step root Q.  None restores
-                                # the old blend (VALUE_BLEND_ALPHA path).
+                                # root Q, not the 1-step root Q.  None = pure
+                                # game-outcome target z.
                                 # Why: z is one label per GAME (ICC 1.000 ->
                                 # n_eff 4000 in a 392k-row set); a target that
                                 # varies within a game breaks that clustering.
                                 # Measured on stored data, lambda=0.9375 gives
                                 # n_eff 6769 AND split-half fidelity to the true
-                                # outcome 0.265 vs the blend's 0.254 and z's
-                                # 0.198 - it dominates the blend on BOTH axes.
+                                # outcome 0.265 vs z's 0.198.
                                 # 0.9375 = ST_HORIZONS' old middle horizon (16
                                 # plies); the fidelity optimum is 0.9-0.95.
 VALUE_Q_WEIGHT_START = 0.1      # q_weight on ITERATION 1, ramped linearly to
@@ -155,23 +147,14 @@ VALUE_Q_WEIGHT_RAMP_ITERS = 10  # short on purpose.  The bar is not "the net is
                                 # spend iterations training on the z target the
                                 # lambda-return is meant to replace.
 VALUE_Q_WEIGHT       = 0.9      # FINAL weight on that target when
-                                # VALUE_TARGET_LAMBDA is set (replaces the
-                                # noise-ramp gate, which exists to protect z
-                                # where z is trustworthy - moot when the
-                                # lambda-return beats z at every ply).  The
-                                # residual 0.1 stays on the true outcome: it
-                                # anchors against bootstrap drift and is the
-                                # ONLY teacher of draw mass.
-VALUE_BLEND_ALPHA    = 0.25     # α=1 → pure terminal target (blending off).
-                                # α<1 mixes gated root-Q into the value target
-                                # AT THE LOSS as soft WDL class probabilities
+                                # VALUE_TARGET_LAMBDA is set.  Mixed at the
+                                # LOSS as soft WDL class probabilities
                                 # (1-w)*onehot(z) + w*[(1+q)/2, 0, (1-q)/2] -
                                 # pre-blending the scalar would be quantized
                                 # away by the hard ±0.33 class thresholds.
-                                # α=0.25 (max Q weight 0.75) is where the
-                                # measured target SNR peaks while split-half
-                                # fidelity to the true outcome is still rising;
-                                # it collapses at α=0 (pure self-distillation).
+                                # The residual 0.1 stays on the true outcome:
+                                # it anchors against bootstrap drift and is
+                                # the ONLY teacher of draw mass.
 VALUE_COEF           = 1.0      # value-loss weight; bumped to rebalance against
                                 # policy CE's 1225-class gradient magnitude
 MARGIN_COEF          = 0.0      # OFF.  debug/aux_noise_floor.py measured the
@@ -180,10 +163,6 @@ MARGIN_COEF          = 0.0      # OFF.  debug/aux_noise_floor.py measured the
                                 # outcome.  At 0.4 it was the second-heaviest term
                                 # in the loss.  net2c removes the head outright;
                                 # this zeroes it for net2 too.
-WDL_VALUE            = True     # 3-way W/D/L cross-entropy value head - avoids
-                                # the tanh+MSE saturation pathology (confidently
-                                # wrong positions with ~zero gradient to unlearn)
-OWNERSHIP_AUX        = True     # per-cell final-ownership aux head (KataGo);
 OWNERSHIP_COEF       = 2.0      # Aux TRAINING signal only - never enters search
                                 # utility or move selection.  Raised from 0.15:
                                 # ownership carries ~4x z's learnable signal, 75%
@@ -218,13 +197,11 @@ COMPLETION_N0        = 50.0     # visit-shrinkage prior strength in the complete
                                 # winner.
 SELF_PLAY_TEMP_MOVES = 16       # sigma-scaled Gumbel targets need less temperature
                                 # forcing than a longer temp window would add
-ENTROPY_COEFF        = 0.00
 
 # Playout-cap randomization (KataGo): per MOVE, with prob PCR_P_FULL run the
 # full --simulations budget and keep the policy target; otherwise run a cheap
 # PCR_FAST_SIMS search whose example trains value/margin/ownership only
-# (policy target zeroed -> masked out of the policy CE; root-Q blend weight
-# dropped too - a 100-sim root is too noisy to teach).  Decouples the two data
+# (policy target zeroed -> masked out of the policy CE).  Decouples the two data
 # appetites: policy needs deep searches, value needs MANY GAMES.  At p=0.25
 # a game costs ~0.4x the sims, so the example budget above buys ~2.5x the
 # distinct games/outcomes per iteration.  PCR_P_FULL = 1.0 disables.
@@ -254,6 +231,16 @@ EVAL_ADVANCE_THRESHOLD   = 0.90
 EVAL_ADVANCE_CONSECUTIVE = 2
 # Elo anchor pool (see models/elo_pool/pool.json for how anchors were rated)
 ELO_POOL_PATH          = "models/elo_pool/pool.json"
+# Fallback pool, used when ELO_POOL_PATH is absent - a fresh checkout has no
+# models/ directory, so the only anchors that can be assumed present are the
+# engines, which are code (lib/micro3) and need no checkpoint.  MM5's Elo is on
+# the canonical Stauf=1000 gauge (derived by the deterministic engine-vs-engine
+# ladder in debug/eval_db/RESULTS.md, same provenance as the MM7=1392 pin), so
+# a pool-less checkout still reads Elo on the same scale as pool.json - just
+# with a single, easily-swept anchor and correspondingly wide error bars.
+DEFAULT_ELO_POOL: list = [
+    {"name": "MM5", "kind": "mm", "depth": 5, "elo": 1237, "fixed": True},
+]
 ELO_GAMES_PER_OPPONENT = 16     # 8 games/opponent is too noisy to read a real
                                 # ~100-Elo move off; this is a measurement now,
                                 # it gates nothing
@@ -318,7 +305,6 @@ def generate_self_play_data(
         for game_examples, winner, moves, gtime, legal_counts in (
             self_play_game_pool(mcts, POOL_SIZE, num_games, mcts_pool,
                                 temp_moves=temp_moves,
-                                blend_alpha=VALUE_BLEND_ALPHA,
                                 value_lambda=VALUE_TARGET_LAMBDA,
                                 value_q_weight=value_q_weight,
                                 pcr_p_full=PCR_P_FULL,
@@ -355,7 +341,7 @@ def generate_self_play_data(
 # ============================================================
 
 def main():
-    global VALUE_BLEND_ALPHA, POOL_SIZE, PCR_FAST_SIMS, TARGET_EXAMPLES_ITER
+    global POOL_SIZE, PCR_FAST_SIMS, TARGET_EXAMPLES_ITER
     global CHECKPOINT_DIR, VALUE_Q_WEIGHT, VALUE_Q_WEIGHT_RAMP_ITERS, WEIGHT_DECAY
     parser = argparse.ArgumentParser(description="AlphaZero MCTS Training")
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -379,10 +365,6 @@ def main():
                         help=f"where iter_*.pt / promoted_*.pt / final.pt go "
                              f"(default: {CHECKPOINT_DIR}); set this per run or "
                              f"a new run overwrites the previous run's history")
-    parser.add_argument("--blend-alpha", type=float, default=VALUE_BLEND_ALPHA,
-                        help=f"Value-target blend: 1.0 = pure game outcome, "
-                             f"<1 mixes gated root-Q into soft WDL targets, "
-                             f"max Q weight = 1-alpha (default: {VALUE_BLEND_ALPHA})")
     parser.add_argument("--pcr-fast-sims", type=int, default=PCR_FAST_SIMS,
                         help=f"PCR fast-move sim budget: the cheap search that "
                              f"plays most moves and trains value/margin/ownership "
@@ -427,18 +409,12 @@ def main():
     parser.add_argument("--completion-n0", type=float, default=COMPLETION_N0,
                         help=f"completed-Q visit-shrinkage prior. Scale WITH the "
                              f"sim budget (default: {COMPLETION_N0})")
-    parser.add_argument("--optimizer", choices=["adam", "adamw", "muon"], default="adam",
-                        help="muon = orthogonalized momentum on the trunk matrices, "
-                             "Adam on heads/biases/norms (lib/muon.py).  Muon's LR "
-                             "is a separate scale: set --muon-lr, not --lr.  "
-                             "adamw = DECOUPLED weight decay: plain Adam adds the "
+    parser.add_argument("--optimizer", choices=["adam", "adamw"], default="adam",
+                        help="adamw = DECOUPLED weight decay: plain Adam adds the "
                              "L2 term to the gradient, so it is amplified by 1/sqrt(v) "
                              "and bites hardest in low-gradient directions -- measured "
                              "2026-07-26 as a uniform 37%% trunk-norm loss over 120 iters")
-    parser.add_argument("--muon-lr", type=float, default=5e-4,
-                        help="Muon LR (default 5e-4: interior optimum of the "
-                             "2026-07-24 offline sweep, warm-start net2)")
-    parser.add_argument("--arch", choices=["net2", "net2c", "net3", "old"], default=NET_ARCH,
+    parser.add_argument("--arch", choices=["net2", "net2c"], default=NET_ARCH,
                         help=f"network architecture (default: {NET_ARCH})")
     parser.add_argument("--cudagraphs", action="store_true",
                         help="compile inference nets with mode='reduce-overhead' "
@@ -449,7 +425,6 @@ def main():
                              "before use there.")
     args = parser.parse_args()
 
-    VALUE_BLEND_ALPHA = args.blend_alpha
     CHECKPOINT_DIR    = args.checkpoint_dir
     POOL_SIZE = args.pool
     PCR_FAST_SIMS = args.pcr_fast_sims
@@ -464,21 +439,13 @@ def main():
     print(f"Device: {device}")
 
     num_actions = 1225
-    if args.arch == "net3":
-        from lib.net3 import Net3
-        def _make_net():
-            return Net3(num_actions=num_actions)
-    elif args.arch == "net2c":
+    if args.arch == "net2c":
         from lib.net2c import Net2C
         def _make_net():
             return Net2C(num_actions=num_actions)
-    elif args.arch == "net2":
-        def _make_net():
-            return Net2(num_actions=num_actions)
     else:
         def _make_net():
-            return DualHeadNetwork(num_actions=num_actions,
-                                   wdl=WDL_VALUE, ownership=OWNERSHIP_AUX)
+            return Net2(num_actions=num_actions)
     _compile_kwargs = {"mode": "reduce-overhead"} if args.cudagraphs else {}
     if args.cudagraphs:
         import lib.mcgs as _mcgs_mod
@@ -492,13 +459,7 @@ def main():
     # Constant LR: the pipeline is run in chunks (resume via --checkpoint), so
     # a per-run schedule would sawtooth on every restart.  Lower manually with
     # --lr between runs if eval goes flat while losses oscillate.
-    if args.optimizer == "muon":
-        from lib.muon import MuonAdam
-        optimizer = MuonAdam(network, muon_lr=args.muon_lr, adam_lr=args.lr,
-                             weight_decay=WEIGHT_DECAY)
-        print(f"Optimizer:        muon lr={args.muon_lr:.1e} (trunk matrices) + "
-              f"adam lr={args.lr:.1e} (heads/norms)  [{optimizer.report}]")
-    elif args.optimizer == "adamw":
+    if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(network.parameters(), lr=args.lr,
                                       weight_decay=WEIGHT_DECAY)
         print(f"Optimizer:        adamw lr={args.lr:.1e} wd={WEIGHT_DECAY:.1e} "
@@ -506,7 +467,6 @@ def main():
     else:
         optimizer = torch.optim.Adam(network.parameters(), lr=args.lr,
                                      weight_decay=WEIGHT_DECAY)
-    scheduler = None
 
     replay_buffer = _IterBuffer(maxiters=REPLAY_BUFFER_ITERS)
 
@@ -521,40 +481,19 @@ def main():
             _same_arch = False
         if _same_arch:
             if 'optimizer' in checkpoint:
-                # A Muon checkpoint is {"muon":..., "adam":...}; a plain Adam one
-                # is a flat optimizer state.  Restoring the wrong shape would
-                # throw, so only load when the saved kind matches the built kind.
-                _saved_muon = isinstance(checkpoint['optimizer'], dict) and \
-                    set(checkpoint['optimizer']) == {"muon", "adam"}
-                if _saved_muon != (args.optimizer == "muon"):
-                    print(f"  Optimizer state skipped: checkpoint holds "
-                          f"{'muon+adam' if _saved_muon else 'adam'} but "
-                          f"--optimizer {args.optimizer} was requested")
-                else:
-                    optimizer.load_state_dict(checkpoint['optimizer'])
-                    # load_state_dict restores param_groups WHOLESALE from the
-                    # checkpoint, so every hyperparameter silently reverts to
-                    # whatever the run that wrote the file used.  That voided the
-                    # 2026-07-27 overnight arm 3: --weight-decay 3e-2 was
-                    # discarded in favour of the checkpoint's 1e-4, and the arm
-                    # ran an exact duplicate of arm 2.  Re-assert everything the
-                    # CLI can set, not just the LR.
-                    if args.optimizer == "muon":
-                        # Two scales: don't clobber the Muon group with the Adam LR.
-                        for pg in optimizer.muon.param_groups:
-                            pg['lr'] = args.muon_lr
-                            pg['weight_decay'] = WEIGHT_DECAY
-                        for pg in optimizer.adam.param_groups:
-                            pg['lr'] = args.lr
-                            pg['weight_decay'] = WEIGHT_DECAY
-                        print(f"  Restored optimizer state (muon LR {args.muon_lr}, "
-                              f"adam LR {args.lr}, wd {WEIGHT_DECAY:.1e})")
-                    else:
-                        for pg in optimizer.param_groups:
-                            pg['lr'] = args.lr
-                            pg['weight_decay'] = WEIGHT_DECAY
-                        print(f"  Restored optimizer state (LR overridden to "
-                              f"{args.lr}, wd to {WEIGHT_DECAY:.1e})")
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                # load_state_dict restores param_groups WHOLESALE from the
+                # checkpoint, so every hyperparameter silently reverts to
+                # whatever the run that wrote the file used.  That voided the
+                # 2026-07-27 overnight arm 3: --weight-decay 3e-2 was
+                # discarded in favour of the checkpoint's 1e-4, and the arm
+                # ran an exact duplicate of arm 2.  Re-assert everything the
+                # CLI can set, not just the LR.
+                for pg in optimizer.param_groups:
+                    pg['lr'] = args.lr
+                    pg['weight_decay'] = WEIGHT_DECAY
+                print(f"  Restored optimizer state (LR overridden to "
+                      f"{args.lr}, wd to {WEIGHT_DECAY:.1e})")
         else:
             # Cross-architecture warm start (e.g. legacy tanh-value checkpoint
             # into a wdl/ownership net): transfer every shape-compatible
@@ -598,25 +537,41 @@ def main():
     # net always has an opponent near its own strength and the rating can't
     # saturate.  The current net's Elo is solved against the whole pool each eval.
     # Members carry "fixed": True (never evicted) or False (rolling self-anchor).
+    # Every net anchor is optional: a checkout without our checkpoints (or a
+    # pool file pointing at a net this code can no longer build) drops that
+    # member and rates against whatever is left, rather than failing the run.
     elo_pool: list = []
     rolling_window = ELO_ROLLING_WINDOW
     if os.path.exists(ELO_POOL_PATH):
         with open(ELO_POOL_PATH) as _f:
             _pool_cfg = json.load(_f)
         rolling_window = _pool_cfg.get("rolling_window", ELO_ROLLING_WINDOW)
-        for _m in _pool_cfg["members"]:
-            if _m["kind"] == "net":
+        _members = _pool_cfg["members"]
+    else:
+        print(f"Elo pool: {ELO_POOL_PATH} not found; using the built-in engine anchors")
+        _members = DEFAULT_ELO_POOL
+    for _m in _members:
+        if _m["kind"] == "net":
+            try:
                 _blob = torch.load(_m["path"], map_location="cpu", weights_only=True)
                 _payload = _blob["network"] if "network" in _blob else _blob
-            else:
-                _payload = _m["depth"]
-            elo_pool.append({"name": _m["name"], "kind": _m["kind"],
-                             "payload": _payload, "elo": _m["elo"],
-                             "fixed": _m.get("fixed", True)})
+                # Buildable-for-play check now, not at the first eval hours in.
+                # Anchors are only ever played, so this accepts legacy
+                # dual-head nets that training itself cannot use.
+                build_inference_network(_payload)   # discard the module
+            except (OSError, KeyError, RuntimeError, ValueError) as _e:
+                print(f"  skipping Elo anchor {_m['name']}: {type(_e).__name__}: {_e}")
+                continue
+        else:
+            _payload = _m["depth"]
+        elo_pool.append({"name": _m["name"], "kind": _m["kind"],
+                         "payload": _payload, "elo": _m["elo"],
+                         "fixed": _m.get("fixed", True)})
+    if elo_pool:
         print(f"Elo pool: {', '.join(m['name'] for m in elo_pool)} "
               f"(rolling window {rolling_window} self-anchors)")
     else:
-        print(f"Elo pool: none ({ELO_POOL_PATH} not found; eval/elo disabled)")
+        print("Elo pool: no usable anchors; eval/elo disabled")
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -661,9 +616,7 @@ def main():
               f"over {VALUE_Q_WEIGHT_RAMP_ITERS} iters "
               f"({1.0 - VALUE_Q_WEIGHT:.2f} final anchor on the true outcome)")
     else:
-        print(f"Value blend:      alpha={VALUE_BLEND_ALPHA}"
-              + ("  (pure terminal)" if VALUE_BLEND_ALPHA >= 1.0
-                 else f"  (max Q weight {1.0 - VALUE_BLEND_ALPHA:.2f}, gated)"))
+        print("Value target:     pure game outcome z")
     print(f"Eval ladder:      {' > '.join(lbl for _, _, lbl in EVAL_LADDER)} > retire")
     print("=" * 60)
 
@@ -843,7 +796,6 @@ def main():
         losses = train_network(
             network, replay_buffer, optimizer,
             batch_size=BATCH_SIZE, epochs=EPOCHS_PER_ITERATION, device=device,
-            entropy_coeff=ENTROPY_COEFF,
             value_coef=VALUE_COEF,
             margin_coef=MARGIN_COEF,
             ownership_coef=OWNERSHIP_COEF,
@@ -859,9 +811,6 @@ def main():
               f"  sign {losses['sign_acc']:.1%}  draw {losses['draw_frac']:.1%}"
               f"  vdec {losses['value_ce_decisive']:.4f}"
               f"  vdrw {losses['value_ce_draw']:.4f}  {train_time:.0f}s")
-
-        if scheduler is not None:
-            scheduler.step()
 
         writer.add_scalar("train/policy_loss",    losses['policy_loss'], step)
         writer.add_scalar("train/value_loss",     losses['value_loss'],  step)

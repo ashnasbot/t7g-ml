@@ -28,6 +28,22 @@ def get_device() -> torch.device:
         return torch.device("cpu")
 
 
+def build_inference_network(state_dict: dict, num_actions: int = 1225) -> nn.Module:
+    """Build a network for PLAY from any checkpoint we have ever rated.
+
+    Dispatch by checkpoint shape: net2/net2c (the trainable families) or the
+    legacy pre-net2 dual-head net, which lib/dual_network.py can only play.
+    Training deliberately does not come through here - it builds from
+    ``--arch`` and loads weights into that - so a legacy checkpoint can be
+    rated and played but never resumed into the optimizer.
+    """
+    from lib.dual_network import DualHeadNetwork, is_legacy_state_dict
+    if is_legacy_state_dict(state_dict):
+        return DualHeadNetwork.from_state_dict(state_dict, num_actions=num_actions)
+    from lib.net2 import build_from_state_dict
+    return build_from_state_dict(state_dict, num_actions=num_actions)
+
+
 def load_compiled_network(
     state_dict: dict,
     device: torch.device,
@@ -46,11 +62,10 @@ def load_compiled_network(
         The uncompiled network - required for in-place ``load_state_dict``
         updates that preserve CUDA-graph tensor addresses.
     """
-    # Dispatch by checkpoint shape so legacy (tanh value), wdl/ownership and
-    # t7g-net2 checkpoints all load - the Elo anchor pool keeps old nets
-    # playable alongside new-architecture training nets.
-    from lib.net2 import build_from_state_dict
-    net = build_from_state_dict(state_dict, num_actions=num_actions)
+    # Dispatch by checkpoint shape so net2, net2c and legacy dual-head
+    # checkpoints all load - the Elo anchor pool and the offline rating DB keep
+    # older nets playable alongside training nets.
+    net = build_inference_network(state_dict, num_actions=num_actions)
     net.to(device)
     net.eval()
     # channels_last memory format: cuDNN + Tensor Cores operate in NHWC

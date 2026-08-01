@@ -113,12 +113,11 @@ def train_network(
     head with per-cell cross-entropy.  Shorter tuples (BC warmup, MM-mix) are
     masked out of the corresponding losses.
 
-    Value loss depends on the network's head: wdl nets get 3-way
-    cross-entropy on win/draw/loss classes derived from the value target;
-    legacy tanh nets keep MSE.  Examples carrying (root_q, q_weight) fields
-    with q_weight > 0 (VALUE_BLEND_ALPHA < 1 at generation) train toward the
-    soft mix (1-w)*onehot(z) + w*[(1+q)/2, 0, (1-q)/2]; scalar heads blend
-    (1-w)*z + w*q instead.  ``sign_acc`` always scores against the pure
+    Value loss is a 3-way cross-entropy on win/draw/loss classes derived
+    from the value target.  Examples carrying (root_q, q_weight) fields
+    with q_weight > 0 (the lambda-return target) train toward the soft mix
+    (1-w)*onehot(z) + w*[(1+q)/2, 0, (1-q)/2].  ``sign_acc`` always scores
+    against the pure
     terminal outcome z so the metric stays comparable across configs, and only
     over decisive examples (z != 0): a draw target can never match the sign of
     the continuous value output, so including draws would just re-measure the
@@ -150,8 +149,6 @@ def train_network(
     n = len(buffer_list)
 
     epoch_losses: list[dict[str, float]] = []
-
-    use_full = hasattr(network, "forward_full")
 
     epoch_iter = tqdm(range(epochs), desc=desc, unit="epoch") if desc else range(epochs)
     for _ in epoch_iter:
@@ -190,9 +187,9 @@ def train_network(
             base_has_own = np.array(
                 [1.0 if len(buffer_list[i]) > 4 else 0.0 for i in replay_idx],
                 dtype=np.float32)
-            # Gated root-Q value blending (VALUE_BLEND_ALPHA < 1): examples
-            # without the fields (BC, MM-mix, old buffers) get weight 0 =
-            # pure terminal target.
+            # Search-derived value target (lambda-return): examples without
+            # the fields (BC, MM-mix, old buffers) get weight 0 = pure
+            # terminal target.
             base_q      = np.array(
                 [buffer_list[i][5] if len(buffer_list[i]) > 6 else 0.0
                  for i in replay_idx], dtype=np.float32)
@@ -244,17 +241,13 @@ def train_network(
                 t_has_st = torch.from_numpy(np.tile(base_has_st, 8)).to(device)
 
             optimizer.zero_grad()
-            if use_full:
-                out = network.forward_full(t_obs)
-                pred_logits = out["policy_logits"]
-                pred_value  = out["value"]
-                pred_margin = out["margin"]
-                v_logits    = out["value_logits"]
-                own_logits  = out["ownership_logits"]
-                soft_logits = out.get("soft_policy_logits")
-            else:
-                pred_logits, pred_value, pred_margin = network(t_obs)
-                v_logits = own_logits = soft_logits = None
+            out = network.forward_full(t_obs)
+            pred_logits = out["policy_logits"]
+            pred_value  = out["value"]
+            pred_margin = out["margin"]
+            v_logits    = out["value_logits"]
+            own_logits  = out["ownership_logits"]
+            soft_logits = out.get("soft_policy_logits")
 
             # Zero that still carries a gradient path, standing in for the heads
             # a given architecture does not have (net2c drops margin and soft
@@ -294,35 +287,29 @@ def train_network(
             else:
                 soft_policy_loss = zero
 
-            if v_logits is not None:
-                # W/D/L cross-entropy: classes from the scalar target
-                # (0=win, 1=draw, 2=loss, side-to-move perspective)
-                t_cls = torch.where(
-                    t_value.squeeze(-1) > 0.33,
-                    torch.zeros_like(t_value.squeeze(-1), dtype=torch.long),
-                    torch.where(t_value.squeeze(-1) < -0.33,
-                                torch.full_like(t_value.squeeze(-1), 2, dtype=torch.long),
-                                torch.ones_like(t_value.squeeze(-1), dtype=torch.long)))
-                if bool((t_qw > 0).any()):
-                    # Gated root-Q blend as SOFT class targets: mixing must
-                    # happen at the distribution level or the hard ±0.33
-                    # thresholds above quantize it away.  Q contributes no
-                    # draw mass - the game outcome is the only draw teacher.
-                    onehot = F.one_hot(t_cls, num_classes=3).float()
-                    tq = t_q.clamp(-1.0, 1.0)
-                    q_dist = torch.stack(
-                        [(1.0 + tq) / 2.0, torch.zeros_like(tq), (1.0 - tq) / 2.0],
-                        dim=-1)
-                    w = t_qw.unsqueeze(-1)
-                    value_loss = F.cross_entropy(
-                        v_logits, (1.0 - w) * onehot + w * q_dist)
-                else:
-                    value_loss = F.cross_entropy(v_logits, t_cls)
+            # W/D/L cross-entropy: classes from the scalar target
+            # (0=win, 1=draw, 2=loss, side-to-move perspective)
+            t_cls = torch.where(
+                t_value.squeeze(-1) > 0.33,
+                torch.zeros_like(t_value.squeeze(-1), dtype=torch.long),
+                torch.where(t_value.squeeze(-1) < -0.33,
+                            torch.full_like(t_value.squeeze(-1), 2, dtype=torch.long),
+                            torch.ones_like(t_value.squeeze(-1), dtype=torch.long)))
+            if bool((t_qw > 0).any()):
+                # Search-derived value target as SOFT class targets: mixing
+                # must happen at the distribution level or the hard ±0.33
+                # thresholds above quantize it away.  Q contributes no
+                # draw mass - the game outcome is the only draw teacher.
+                onehot = F.one_hot(t_cls, num_classes=3).float()
+                tq = t_q.clamp(-1.0, 1.0)
+                q_dist = torch.stack(
+                    [(1.0 + tq) / 2.0, torch.zeros_like(tq), (1.0 - tq) / 2.0],
+                    dim=-1)
+                w = t_qw.unsqueeze(-1)
+                value_loss = F.cross_entropy(
+                    v_logits, (1.0 - w) * onehot + w * q_dist)
             else:
-                # Scalar (tanh) head: blend directly in scalar space.
-                t_value_eff = ((1.0 - t_qw) * t_value.squeeze(-1)
-                               + t_qw * t_q).unsqueeze(-1)
-                value_loss = F.mse_loss(pred_value, t_value_eff)
+                value_loss = F.cross_entropy(v_logits, t_cls)
 
             # Masked MSE: only examples that carry a margin target contribute.
             # net2c has no margin head (the target restates z -- see lib/net2c.py).
@@ -339,7 +326,7 @@ def train_network(
             else:
                 ownership_loss = zero
 
-            st_preds = out.get("st_values") if use_full else None
+            st_preds = out.get("st_values")
             if st_preds is not None and st_value_coef > 0:
                 # Masked MSE over the short-term value heads, mean across
                 # horizons so the coef weighs the group, not each head.
@@ -368,12 +355,11 @@ def train_network(
                     ((pred_value.squeeze(-1).sign() == z.sign()) & decisive).sum())
                 ep_n_dec += int(decisive.sum())
                 ep_n_drw += int((~decisive).sum())
-                if v_logits is not None:
-                    # CE split vs the hard outcome class: separates "targets got
-                    # harder" (draw share rising) from "head got worse".
-                    ce = F.cross_entropy(v_logits, t_cls, reduction="none")
-                    ep_ce_dec += float(ce[decisive].sum())
-                    ep_ce_drw += float(ce[~decisive].sum())
+                # CE split vs the hard outcome class: separates "targets got
+                # harder" (draw share rising) from "head got worse".
+                ce = F.cross_entropy(v_logits, t_cls, reduction="none")
+                ep_ce_dec += float(ce[decisive].sum())
+                ep_ce_drw += float(ce[~decisive].sum())
 
             ep_policy   += policy_loss.item()
             ep_value    += value_loss.item()

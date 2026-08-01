@@ -372,8 +372,9 @@ class MCGS:
         if completion_n0 is not None:
             _lib.mcgs_set_completion_n0(self._ptr, ctypes.c_float(completion_n0))
         if clock_obs is None:
-            # Auto: net2 nets train with the halfmove clock in obs ch3; legacy
-            # nets trained with an all-zero plane and must keep seeing zeros.
+            # Auto: net2 nets train with the halfmove clock in obs ch3; net2c
+            # nets train with an all-zero plane and must keep seeing zeros
+            # (see lib/net2c.py on why that plane stays zero).
             # (Unwrap torch.compile's OptimizedModule before the arch check.)
             from lib.net2 import Net2
             clock_obs = isinstance(getattr(network, '_orig_mod', network), Net2)
@@ -429,7 +430,7 @@ class MCGS:
 
     def set_clock_obs(self, enable: bool) -> None:
         """Expose the halfmove clock as obs channel 3 (clock/100).  Keep off
-        for legacy nets, which were trained with an all-zero channel 3."""
+        for net2c nets, which were trained with an all-zero channel 3."""
         _lib.mcgs_set_clock_obs(self._ptr, 1 if enable else 0)
 
     def start_search(

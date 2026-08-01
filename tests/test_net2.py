@@ -118,13 +118,6 @@ def test_checkpoint_roundtrip_and_dispatch(tmp_path):
     assert torch.allclose(a[0], b[0]) and torch.allclose(a[1], b[1])
 
 
-def test_dispatch_legacy_checkpoint():
-    from lib.dual_network import DualHeadNetwork
-    old = DualHeadNetwork(wdl=True, ownership=True)
-    net = build_from_state_dict(old.state_dict())
-    assert isinstance(net, DualHeadNetwork) and net.wdl and net.ownership
-
-
 def test_predict_matches_board_legality():
     net = Net2()
     probs, value = net.predict(new_board(), True)
@@ -193,29 +186,3 @@ def test_st_targets_match_naive_sum():
                 want += (1 - lam) * lam ** (j - i) * q_p
             want += lam ** (n - i) * (winner if turns[i] else -winner)
             assert st[k] == pytest.approx(want, abs=1e-5)
-
-
-def test_old_net_training_unaffected_by_soft_coef_default():
-    """Old-arch nets through the new train_network: soft loss reports 0 and
-    the returned losses are identical with/without the new code path active."""
-    from lib.dual_network import DualHeadNetwork
-    torch.manual_seed(0)
-    np.random.seed(0)
-    obs = _rand_obs(8, seed=2)
-    own = np.zeros((7, 7), dtype=np.int8)
-    buffer = [(obs[i], np.full(1225, 1 / 1225, dtype=np.float32),
-               1.0 if i % 2 == 0 else -1.0, 0.1, own, 0.0, 0.0) for i in range(8)]
-
-    def run():
-        torch.manual_seed(1)
-        np.random.seed(1)
-        net = DualHeadNetwork(wdl=True, ownership=True)
-        opt = torch.optim.Adam(net.parameters(), lr=1e-3)
-        return train_network(net, buffer, opt, batch_size=8, epochs=1, device="cpu",
-                             value_coef=1.0, margin_coef=0.4, ownership_coef=0.15,
-                             mask_illegal=True)
-
-    a, b = run(), run()
-    assert a["soft_policy_loss"] == 0.0
-    for k in ("policy_loss", "value_loss", "margin_loss", "ownership_loss"):
-        assert a[k] == pytest.approx(b[k])

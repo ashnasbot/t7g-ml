@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 import torch
 
-from lib.dual_network import DualHeadNetwork
+from lib.net2 import Net2
 from lib.mcgs import MCGS
 from lib.t7g import (
     new_board, apply_move, action_masks, check_terminal,
@@ -63,7 +63,7 @@ def advance_n_moves(mcts, board, turn, n):
 def network():
     """Randomly-initialised network on CPU - sufficient for structural tests."""
     torch.manual_seed(42)
-    net = DualHeadNetwork(num_actions=1225).to("cpu")
+    net = Net2(channels=32, num_blocks=2).to("cpu")
     net.eval()
     return net
 
@@ -273,10 +273,10 @@ def test_value_targets_are_current_player_relative():
     point the value head in the wrong direction.
     """
     from lib.train_workers import _slot_result, _GameSlot
-    from lib.dual_network import DualHeadNetwork
+    from lib.net2 import Net2
 
     torch.manual_seed(0)
-    net = DualHeadNetwork(num_actions=1225).to("cpu")
+    net = Net2(channels=32, num_blocks=2).to("cpu")
     slot = _GameSlot(MCGS(net, num_simulations=16))
 
     # Manually craft one example: Blue's turn, Blue wins (+1 from Blue's perspective).
@@ -286,11 +286,11 @@ def test_value_targets_are_current_player_relative():
     slot.examples = [(obs, np.ones(1225) / 1225, True, board.copy(), 0.0, 0, True)]
 
     # winner=+1.0 means Blue won.
-    examples, _, _, _, _, _ = _slot_result(slot, winner=1.0)
+    examples, *_ = _slot_result(slot, winner=1.0)
     (obs_out, policy_out, value_out, margin_out, own_out,
      _, _, root_q_out, qw_out, st_out) = examples[0]
 
-    # Default blend_alpha=1.0: blending off, q_weight must be exactly 0.
+    # No value_lambda: pure terminal target, q_weight must be exactly 0.
     assert qw_out == 0.0
 
     assert value_out == 1.0, (
@@ -306,7 +306,7 @@ def test_value_targets_are_current_player_relative():
     # Same board, Green's turn, Blue still wins (winner=+1 from Blue).
     slot.examples = [(board_to_obs(board, turn=False), np.ones(1225) / 1225,
                       False, board.copy(), 0.0, 0, True)]
-    examples, _, _, _, _, _ = _slot_result(slot, winner=1.0)
+    examples, *_ = _slot_result(slot, winner=1.0)
     (_, _, value_out_green, margin_out_green, own_out_green,
      _, _, _, _, st_out_green) = examples[0]
 
