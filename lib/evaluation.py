@@ -1,74 +1,19 @@
 """
-Evaluation workers and functions for AlphaZero MCTS training.
+Evaluation functions for AlphaZero MCTS training.
 
-Contains the multiprocessing worker globals, initializers, and evaluation
-routines for playing vs minimax and vs the best network.
+Every routine here plays its games through lib.train_workers.tournament_pool -
+one process, all games concurrent, inference batched across games.  The older
+multiprocessing-per-game path was ~2.5k sim/s against self-play's 80k+ (a
+500-sim search issues ~147 forwards of ~3 leaves, so it was pure launch
+latency) and made eval ~38% of run wall-clock; batching removes that without
+changing per-game search semantics.
 """
 import math
-import multiprocessing
 
 import numpy as np
 from tqdm import tqdm
 
-from lib.mcgs import MCGS
-from lib.train_workers import play_eval_game, play_net_vs_net_game
-
-
-# ---------------------------------------------------------------------------
-# Per-process globals (multiprocessing spawn requires module-level state)
-# ---------------------------------------------------------------------------
-
-_local_network        = None   # compiled model used for inference in workers
-_base_network         = None   # uncompiled reference for in-place weight updates
-_weight_queue         = None   # receives weight broadcasts from the main process
-_worker_mcts_cls      = None   # MCGS subclass - set in _worker_init
-_worker_mcts_kwargs: dict = {}
-
-
-# ---------------------------------------------------------------------------
-# Worker initializers
-# ---------------------------------------------------------------------------
-
-def _worker_init(state_dict, weight_queue=None, num_actions=1225, mcts_cls=None,
-                 mcts_kwargs=None):
-    """Initialise a self-play or evaluation worker process."""
-    global _local_network, _base_network, _weight_queue, _worker_mcts_cls, _worker_mcts_kwargs
-    import torch as _torch
-    from lib.device_utils import get_device as _get_device
-    try:
-        device = _get_device()
-    except Exception:
-        device = _torch.device("cpu")
-    if device.type == "cpu":
-        _torch.set_num_threads(1)
-    from lib.device_utils import load_compiled_network as _lcn
-    _local_network, _base_network = _lcn(
-        state_dict, device, num_actions=num_actions, compile_net=False,
-    )
-    _weight_queue = weight_queue
-    _worker_mcts_cls    = mcts_cls if mcts_cls is not None else MCGS
-    _worker_mcts_kwargs = mcts_kwargs or {}
-
-
-
-
-# ---------------------------------------------------------------------------
-# Worker game functions
-# ---------------------------------------------------------------------------
-
-def _worker_eval_game(args):
-    """Evaluation worker: play one game vs minimax/stauf."""
-    num_simulations, minimax_depth, noise, engine, vary_depth, mcts_is_blue = args
-    _local_network.eval()  # type: ignore[union-attr]
-    mcts = _worker_mcts_cls(
-        _local_network,  # type: ignore[arg-type]
-        num_simulations=num_simulations,
-        **{k: v for k, v in _worker_mcts_kwargs.items() if k != 'num_simulations'},
-    )
-    result, end_reason, _margin, _moves = play_eval_game(
-        mcts, minimax_depth, noise, engine, vary_depth, mcts_is_blue,
-    )
-    return result, mcts_is_blue, end_reason
+from lib.train_workers import tournament_pool
 
 
 # ---------------------------------------------------------------------------
@@ -83,10 +28,8 @@ def evaluate_vs_noisy_minimax(
     num_simulations: int = 100,
     engine: str = 'minimax',
     vary_depth: bool = False,
-    num_actions: int = 1225,
-    mcts_cls=None,
     mcts_kwargs: dict | None = None,
-    num_workers: int = 4,
+    pool_size: int = 32,
 ) -> tuple[float, dict]:
     """
     Evaluate MCTS agent against a minimax opponent.
@@ -94,11 +37,16 @@ def evaluate_vs_noisy_minimax(
     Half the games are played as Blue, half as Green.
     Returns (win_rate, {wins, losses, draws, wr_as_blue, wr_as_green, ...}).
     """
-    _mcts_cls    = mcts_cls or MCGS
-    _mcts_kw     = mcts_kwargs or {}
-    state_dict = {k: v.cpu() for k, v in network.state_dict().items()}
-    task_args = [
-        (num_simulations, minimax_depth, noise, engine, vary_depth, game_idx % 2 == 0)
+    network.eval()
+    mcts_kw = dict(mcts_kwargs or {}, num_simulations=num_simulations)
+    opponent = ("engine", minimax_depth, noise, engine, vary_depth)
+    subject  = ("net", "cur")
+    # Blue always moves first from the standard start (play_eval_game's rule);
+    # colour balance comes from alternating which side the subject plays.
+    games = [
+        ((game_idx % 2 == 0),
+         *((subject, opponent) if game_idx % 2 == 0 else (opponent, subject)),
+         True)
         for game_idx in range(num_games)
     ]
     engine_label = (
@@ -112,34 +60,33 @@ def evaluate_vs_noisy_minimax(
     pbar = tqdm(total=num_games, desc=f"Eval vs {engine_label} (noise={noise:.0%})",
                 unit="game", leave=False)
     try:
-        with multiprocessing.Pool(
-            processes=min(num_workers, num_games),
-            initializer=_worker_init,
-            initargs=(state_dict, None, num_actions, _mcts_cls, _mcts_kw),
-        ) as pool:
-            for result, is_blue, end_reason in pool.imap_unordered(_worker_eval_game, task_args):
-                if result > 0:
-                    wins += 1
-                    if is_blue:
-                        wins_b += 1
-                    else:
-                        wins_g += 1
-                elif result < 0:
-                    losses += 1
-                    if is_blue:
-                        losses_b += 1
-                    else:
-                        losses_g += 1
+        for r in tournament_pool({"cur": network}, games, mcts_kw,
+                                 pool_size=pool_size):
+            is_blue = r["tag"]
+            result = r["blue_result"] if is_blue else -r["blue_result"]
+            end_reason = r["end_reason"]
+            if result > 0:
+                wins += 1
+                if is_blue:
+                    wins_b += 1
                 else:
-                    draws += 1
-                if end_reason == "clock":
-                    n_clock += 1
-                elif end_reason == "truncated":
-                    n_truncated += 1
+                    wins_g += 1
+            elif result < 0:
+                losses += 1
+                if is_blue:
+                    losses_b += 1
                 else:
-                    n_terminal += 1
-                pbar.update(1)
-                pbar.set_postfix(win_rate=f"{wins / (wins + losses + draws):.0%}")
+                    losses_g += 1
+            else:
+                draws += 1
+            if end_reason == "clock":
+                n_clock += 1
+            elif end_reason == "truncated":
+                n_truncated += 1
+            else:
+                n_terminal += 1
+            pbar.update(1)
+            pbar.set_postfix(win_rate=f"{wins / (wins + losses + draws):.0%}")
     finally:
         pbar.close()
     games_b = num_games // 2
@@ -158,49 +105,29 @@ def evaluate_vs_noisy_minimax(
 # Elo rating vs a fixed anchor pool
 # ---------------------------------------------------------------------------
 
-_pool_players: list = []   # [('net', network) | ('mm', depth), ...] per worker
+def _anchor_agents(pool: list, num_actions: int, device=None) -> tuple[dict, list]:
+    """Build {net key: module} and the per-member agent spec for an Elo pool.
 
-
-def _worker_pool_init(cur_state_dict, pool_specs, num_actions=1225, mcts_kwargs=None):
-    """Initialise a pool-rating worker: current net + every anchor net."""
-    global _local_network, _pool_players, _worker_mcts_cls, _worker_mcts_kwargs
-    import torch as _torch
-    from lib.device_utils import get_device as _get_device
-    try:
-        device = _get_device()
-    except Exception:
-        device = _torch.device("cpu")
-    if device.type == "cpu":
-        _torch.set_num_threads(1)
-    from lib.device_utils import load_compiled_network as _lcn
-    _local_network, _ = _lcn(cur_state_dict, device,
-                             num_actions=num_actions, compile_net=False)
-    _pool_players = []
-    for kind, payload in pool_specs:
-        if kind == "net":
-            net, _ = _lcn(payload, device, num_actions=num_actions, compile_net=False)
-            _pool_players.append(("net", net))
+    Net anchors arrive as state_dicts (the pool file stores weights, not live
+    modules) and are instantiated once per call.
+    """
+    from lib.device_utils import get_device, load_compiled_network
+    dev = device if device is not None else get_device()
+    nets: dict = {}
+    agents: list = []
+    for i, m in enumerate(pool):
+        if m["kind"] == "net":
+            net, _ = load_compiled_network(m["payload"], dev,
+                                           num_actions=num_actions, compile_net=False)
+            net.eval()
+            key = ("anchor", i)
+            nets[key] = net
+            agents.append(("net", key))
         else:
-            _pool_players.append(("mm", payload))
-    _worker_mcts_cls    = MCGS
-    _worker_mcts_kwargs = mcts_kwargs or {}
-
-
-def _worker_pool_game(args):
-    """Play one game: current network vs pool member opp_idx."""
-    opp_idx, cur_is_blue = args
-    _local_network.eval()  # type: ignore[union-attr]
-    kind, payload = _pool_players[opp_idx]
-    # Fresh MCGS per game so transposition tables never leak between games.
-    mcts_cur = _worker_mcts_cls(_local_network, **_worker_mcts_kwargs)  # type: ignore[call-arg]
-    if kind == "mm":
-        result, _, margin, moves = play_eval_game(
-            mcts_cur, payload, 0.0, "micro3", False, cur_is_blue)
-    else:
-        payload.eval()
-        mcts_opp = _worker_mcts_cls(payload, **_worker_mcts_kwargs)  # type: ignore[call-arg]
-        result, margin, moves = play_net_vs_net_game(mcts_cur, mcts_opp, cur_is_blue)
-    return opp_idx, result, margin, moves
+            # Elo anchors are played at zero noise, fixed depth, micro3 - the
+            # config the fixed anchor ratings were fitted under.
+            agents.append(("engine", m["payload"], 0.0, "micro3", False))
+    return nets, agents
 
 
 def rate_vs_pool(
@@ -209,7 +136,7 @@ def rate_vs_pool(
     games_per_opponent: int = 8,
     num_actions: int = 1225,
     mcts_kwargs: dict | None = None,
-    num_workers: int = 4,
+    pool_size: int = 32,
     virtual_draws: float = 1.0,
 ) -> tuple[float, dict]:
     """
@@ -231,10 +158,21 @@ def rate_vs_pool(
     this understates uncertainty (no anchor-rating error propagated), but
     it's directly comparable across iterations of the same pool.
     """
-    cur_state = {k: v.cpu() for k, v in network.state_dict().items()}
-    specs = [(m["kind"], m["payload"]) for m in pool]
-    task_args = [(i, g % 2 == 0)
-                 for i in range(len(pool)) for g in range(games_per_opponent)]
+    network.eval()
+    mcts_kw = dict(mcts_kwargs or {})
+    anchor_nets, anchor_agents = _anchor_agents(pool, num_actions)
+    subject = ("net", "cur")
+    games = []
+    for i, agent in enumerate(anchor_agents):
+        for g in range(games_per_opponent):
+            cur_is_blue = g % 2 == 0
+            blue, green = (subject, agent) if cur_is_blue else (agent, subject)
+            # Net-vs-net games randomise who moves first (play_net_vs_net_game);
+            # games against an engine anchor always start with Blue to move
+            # (play_eval_game).  Both are part of what the anchors were rated
+            # under, so keep them distinct.
+            first_turn = bool(np.random.randint(2)) if agent[0] == "net" else True
+            games.append(((i, cur_is_blue), blue, green, first_turn))
     results: dict[str, list] = {m["name"]: [0, 0, 0] for m in pool}
     # Game-shape aggregates: how the rating was earned, not just the score.
     # A dominant sweep (big margins, short decisive games) and a marginal one
@@ -243,24 +181,19 @@ def rate_vs_pool(
     loss_margins: list = []
     draw_margins: list = []
     all_moves: list = []
-    pbar = tqdm(total=len(task_args), desc="Elo vs pool", unit="game", leave=False)
+    pbar = tqdm(total=len(games), desc="Elo vs pool", unit="game", leave=False)
     try:
-        # Explicit spawn context: the default on Python <=3.13 is fork, which
-        # deadlocks when the parent holds torch/CUDA thread state (observed
-        # locally on 3.12 - workers hang on futexes mid-tournament).
-        with multiprocessing.get_context("spawn").Pool(
-            processes=min(num_workers, len(task_args)),
-            initializer=_worker_pool_init,
-            initargs=(cur_state, specs, num_actions, mcts_kwargs or {}),
-        ) as mp_pool:
-            for opp_idx, result, margin, moves in mp_pool.imap_unordered(
-                    _worker_pool_game, task_args):
-                slot = 0 if result > 0 else (2 if result < 0 else 1)
-                results[pool[opp_idx]["name"]][slot] += 1
-                (win_margins if result > 0 else
-                 loss_margins if result < 0 else draw_margins).append(margin)
-                all_moves.append(moves)
-                pbar.update(1)
+        for r in tournament_pool({"cur": network, **anchor_nets}, games, mcts_kw,
+                                 pool_size=pool_size):
+            opp_idx, cur_is_blue = r["tag"]
+            result = r["blue_result"] if cur_is_blue else -r["blue_result"]
+            margin = r["blue_margin"] if cur_is_blue else -r["blue_margin"]
+            slot = 0 if result > 0 else (2 if result < 0 else 1)
+            results[pool[opp_idx]["name"]][slot] += 1
+            (win_margins if result > 0 else
+             loss_margins if result < 0 else draw_margins).append(margin)
+            all_moves.append(r["moves"])
+            pbar.update(1)
     finally:
         pbar.close()
 
@@ -309,131 +242,15 @@ def rate_vs_pool(
 
 
 # ---------------------------------------------------------------------------
-# Promotion gate: adaptive head-to-head vs the incumbent generator
-# ---------------------------------------------------------------------------
-
-def _wilson_bounds(s: float, n: int, z: float) -> tuple[float, float]:
-    """Wilson score interval for a mean score s over n games (draws = 0.5)."""
-    z2 = z * z
-    center = (s + z2 / (2.0 * n)) / (1.0 + z2 / n)
-    half = z * math.sqrt(s * (1.0 - s) / n + z2 / (4.0 * n * n)) / (1.0 + z2 / n)
-    return center - half, center + half
-
-
-def gate_decision(
-    w: int, d: int, l: int, *,
-    s_margin: float,
-    z_promote: float = 1.282,
-    z_retain: float = 0.842,
-    equal_cut_games: int = 32,
-) -> str:
-    """
-    Decide the ratchet gate from a head-to-head record vs the incumbent.
-
-    Promote only when the candidate is confidently (one-sided z_promote)
-    better than equal AND its point score clears s_margin; retain early when
-    even an optimistic bound (z_retain) can't reach the margin, or when the
-    score is still <= 50% after equal_cut_games (a true improvement should
-    not look like a coin flip for that long).  Anything else is a genuine
-    close call: "extend" asks for another block of games.
-    """
-    n = w + d + l
-    s = (w + 0.5 * d) / n
-    lo, _ = _wilson_bounds(s, n, z_promote)
-    _, hi = _wilson_bounds(s, n, z_retain)
-    if lo > 0.5 and s >= s_margin:
-        return "promote"
-    if hi < s_margin:
-        return "retain"
-    if n >= equal_cut_games and s <= 0.5:
-        return "retain"
-    return "extend"
-
-
-def h2h_gate(
-    candidate,
-    incumbent,
-    *,
-    s_margin: float,
-    seed_record: 'tuple[int, int, int] | None' = None,
-    block_games: int = 16,
-    max_games: int = 96,
-    z_promote: float = 1.282,
-    z_retain: float = 0.842,
-    equal_cut_games: int = 32,
-    num_actions: int = 1225,
-    mcts_kwargs: dict | None = None,
-    num_workers: int = 4,
-) -> tuple[str, tuple[int, int, int], float]:
-    """
-    Gate the candidate against the incumbent by direct head-to-head play,
-    extending in blocks of block_games (colour-balanced) only while the
-    record is too close to call, up to max_games total.  Budget exhaustion
-    retains (conservative - the candidate is re-gated a few iterations
-    later anyway).
-
-    seed_record: (w, d, l) vs the incumbent already played under identical
-    conditions this eval (the gauntlet's games when the incumbent is pinned
-    in the pool).  A clear seed decides the gate with ZERO fresh games; the
-    worker pool is only spawned for genuine close calls.
-
-    Returns (decision, (w, d, l), score) from the candidate's perspective,
-    seed games included.
-    """
-    w, d, l = seed_record if seed_record is not None else (0, 0, 0)
-    played = w + d + l
-    decision = ("extend" if played == 0 else
-                gate_decision(w, d, l, s_margin=s_margin, z_promote=z_promote,
-                              z_retain=z_retain, equal_cut_games=equal_cut_games))
-    if decision == "extend" and played < max_games:
-        cur_state = {k: v.cpu() for k, v in candidate.state_dict().items()}
-        inc_state = {k: v.cpu() for k, v in incumbent.state_dict().items()}
-        pbar = tqdm(total=max_games - played, desc="Gate vs best",
-                    unit="game", leave=False)
-        try:
-            with multiprocessing.get_context("spawn").Pool(
-                processes=min(num_workers, block_games),
-                initializer=_worker_pool_init,
-                initargs=(cur_state, [("net", inc_state)], num_actions,
-                          mcts_kwargs or {}),
-            ) as mp_pool:
-                while decision == "extend" and played < max_games:
-                    block = min(block_games, max_games - played)
-                    task_args = [(0, (played + g) % 2 == 0)
-                                 for g in range(block)]
-                    for _idx, result, _margin, _moves in mp_pool.imap_unordered(
-                            _worker_pool_game, task_args):
-                        if result > 0:
-                            w += 1
-                        elif result < 0:
-                            l += 1
-                        else:
-                            d += 1
-                        pbar.update(1)
-                    played += block
-                    decision = gate_decision(
-                        w, d, l, s_margin=s_margin, z_promote=z_promote,
-                        z_retain=z_retain, equal_cut_games=equal_cut_games)
-        finally:
-            pbar.close()
-    if decision == "extend":
-        decision = "retain"
-    score = (w + 0.5 * d) / played
-    return decision, (w, d, l), score
-
-
-# ---------------------------------------------------------------------------
 # Ladder calibration (resume only)
 # ---------------------------------------------------------------------------
 
 def _calibrate_ladder(
     network,
-    num_actions: int,
-    mcts_cls,
     mcts_kwargs: dict,
     eval_ladder: list,
     eval_simulations: int,
-    num_workers: int = 4,
+    pool_size: int = 32,
 ) -> tuple[int, float]:
     """Quickly find the right ladder starting point on resume.
 
@@ -449,8 +266,7 @@ def _calibrate_ladder(
         wr, _ = evaluate_vs_noisy_minimax(
             network, minimax_depth=depth, noise=noise,
             num_games=10, num_simulations=eval_simulations,
-            num_actions=num_actions, mcts_cls=mcts_cls, mcts_kwargs=mcts_kwargs,
-            engine='micro3', num_workers=num_workers,
+            mcts_kwargs=mcts_kwargs, engine='micro3', pool_size=pool_size,
         )
         print(f"  Calibrate  {label}  {wr:.0%}")
         return wr

@@ -156,7 +156,7 @@ clean-wasm:
 # publishes.  `make model` re-exports net2.onnx from a checkpoint (CKPT=...).
 SPA       := webapp
 PUBLIC    := public
-CKPT      ?= export/models/run_net2b/promoted_iter0085.pt
+CKPT      ?= models/run_qw07b/promoted_iter0100.pt
 ORT_VER   ?= 1.20.1
 
 .PHONY: pages model dev-vendor clean-pages

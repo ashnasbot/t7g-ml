@@ -9,7 +9,7 @@ beat run A", and clean progress plots.
 
     # play games: each net vs its temporal neighbours + the MM7 anchor
     python scripts/eval_db.py add models/run_selfgate/iter_00*.pt --mm 7 \\
-        --vs neighbors --games 12 --workers 6
+        --vs neighbors --games 12 --pool-size 64
 
     # fit ratings (default: independent Bradley-Terry; pass --w to smooth)
     python scripts/eval_db.py fit --anchor MM7=1235
@@ -32,6 +32,7 @@ import argparse
 import itertools
 import multiprocessing
 import os
+import random
 import re
 import sys
 import time
@@ -42,78 +43,43 @@ from tqdm import tqdm
 sys.path.insert(0, ".")
 
 from lib import eval_db as edb                                     # noqa: E402
-from lib.mcgs import MCGS                                          # noqa: E402
-from lib.train_workers import (play_eval_game, play_net_vs_net_game,   # noqa: E402
-                               play_engine_vs_engine)
+from lib.train_workers import (play_engine_vs_engine,              # noqa: E402
+                               tournament_pool)
 
 
-# ---------------------------------------------------------------------------
-# Spawn-safe game workers (pattern from lib/evaluation.rate_vs_pool: fork
-# deadlocks when the parent holds torch/CUDA thread state).
-# ---------------------------------------------------------------------------
-
-_players: list = []          # [('net', network) | ('mm', depth), ...]
-_mcts_kwargs: dict = {}
-_engine: str = "micro3"
-
-
-def _worker_init(player_specs, mcts_kwargs, engine, num_actions):
-    global _players, _mcts_kwargs, _engine
-    import torch
-    from lib.device_utils import get_device, load_compiled_network
+def _env_int(name: str, default: int) -> int:
     try:
-        device = get_device()
-    except Exception:
-        device = torch.device("cpu")
-    if device.type == "cpu":
-        torch.set_num_threads(1)
-    _players = []
-    for kind, payload in player_specs:
-        if kind == "net":
-            net, _ = load_compiled_network(payload, device,
-                                           num_actions=num_actions, compile_net=False)
-            _players.append(("net", net))
-        else:                              # deterministic anchor: "mm" or "stauf"
-            _players.append((kind, payload))
-    _mcts_kwargs = mcts_kwargs
-    _engine = engine
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
 
 
-def _fresh_mcts(net):
-    """One MCGS per game so the transposition table never leaks between games."""
-    return MCGS(net, **_mcts_kwargs)
+# ---------------------------------------------------------------------------
+# Agent construction for tournament_pool.
+#
+# `add` plays every scheduled game in ONE in-process batched pool rather than
+# one-game-per-worker across a spawn Pool.  A 500-sim search costs the same
+# number of *sequential* forwards however many games are in flight, and a
+# forward carrying 200 leaves costs about what one carrying 10 does (it is
+# latency-bound), so concurrency is nearly free -- see the tournament_pool
+# docstring in lib/train_workers.py.  Search semantics per game are unchanged,
+# so ratings stay on the same scale as previously banked games.
+# ---------------------------------------------------------------------------
 
+def _pool_agent(pid, reg, engine):
+    """tournament_pool agent tuple for a registered player.
 
-def _anchor_engine(kind):
-    """Engine + depth-arg convention for a deterministic anchor opponent."""
-    return "stauf" if kind == "stauf" else _engine
-
-
-def _worker_game(args):
-    """Play one game between players a and b; return result from a's perspective.
-
-    Handles net-vs-net (both MCTS) and net-vs-anchor (MCTS vs a deterministic
-    engine: minimax at a depth, or the stauf original-game AI).  Anchor-vs-anchor
-    is never scheduled (both deterministic; MM depths are placed relative to
-    stauf transitively through their shared net opponents).
+    Anchors are played at zero noise, fixed depth -- the config the fixed
+    anchor ratings were fitted under.  Anchor-vs-anchor is never scheduled
+    (both deterministic; MM depths are placed relative to stauf transitively
+    through their shared net opponents).
     """
-    ia, ib, a_is_blue = args
-    kind_a, pa = _players[ia]
-    kind_b, pb = _players[ib]
-    if kind_a == "net" and kind_b == "net":
-        result, _, _ = play_net_vs_net_game(_fresh_mcts(pa), _fresh_mcts(pb), a_is_blue)
-    elif kind_a == "net":                     # net vs deterministic anchor
-        result, _, _, _ = play_eval_game(_fresh_mcts(pa), pb, 0.0,  # pb = depth (stauf=6)
-                                         _anchor_engine(kind_b), False, a_is_blue)
-    elif kind_b == "net":                     # anchor vs net: flip perspective
-        result, _, _, _ = play_eval_game(_fresh_mcts(pb), pa, 0.0,
-                                         _anchor_engine(kind_a), False, not a_is_blue)
-        result = -result
-    else:                                     # anchor vs anchor: not scheduled
-        return ia, ib, 0, a_is_blue
-    # Discretise the material-ratio truncation result to a win/draw/loss.
-    disc = 1 if result > 1e-9 else (-1 if result < -1e-9 else 0)
-    return ia, ib, disc, a_is_blue
+    kind = reg[pid]["kind"]
+    if kind == "mm":
+        return ("engine", reg[pid]["depth"], 0.0, engine, False)
+    if kind == "stauf":
+        return ("engine", reg[pid].get("depth", edb.STAUF_DEPTH), 0.0, "stauf", False)
+    return ("net", pid)
 
 
 # ---------------------------------------------------------------------------
@@ -251,61 +217,70 @@ def cmd_add(args):
               f">= {args.games} games -- nothing to play.")
         return
 
-    # Assemble the worker player table (only players actually needed).
+    # Instantiate the players actually needed.  Nets are loaded ONCE, in this
+    # process, and shared by every pool slot that plays them.
     needed = sorted({p for a, b, _ in to_play for p in (a, b)})
     reg = edb.load_players()
-    specs, index = [], {}
+    from lib.device_utils import get_device, load_compiled_network
+    device = get_device()
+    nets, agents = {}, {}
     for pid in needed:
-        index[pid] = len(specs)
-        kind = reg[pid]["kind"]
-        if kind == "mm":
-            specs.append(("mm", reg[pid]["depth"]))
-        elif kind == "stauf":
-            specs.append(("stauf", reg[pid].get("depth", edb.STAUF_DEPTH)))
-        else:
+        agents[pid] = _pool_agent(pid, reg, engine)
+        if agents[pid][0] == "net":
             blob = torch.load(net_paths[pid], map_location="cpu", weights_only=True)
             state = blob["network"] if isinstance(blob, dict) and "network" in blob else blob
-            specs.append(("net", state))
+            net, _ = load_compiled_network(state, device,
+                                           num_actions=args.num_actions, compile_net=False)
+            net.eval()
+            nets[pid] = net
 
-    # Build the task list (alternate colours) and shuffle so partial runs cover
-    # all pairs.
-    tasks = []
+    # Build the game list (alternate colours) and shuffle so a partial run
+    # covers all pairs.  Net-vs-net randomises who moves first; games against
+    # an engine anchor always start with Blue to move -- both are part of what
+    # the anchors were rated under, so keep them distinct (as rate_vs_pool does).
+    rng = random.Random(0)
+    games = []
     for a, b, need in to_play:
         for g in range(need):
-            tasks.append((index[a], index[b], g % 2 == 0))
-    np.random.default_rng(0).shuffle(tasks)
+            a_is_blue = g % 2 == 0
+            blue, green = (a, b) if a_is_blue else (b, a)
+            both_nets = agents[a][0] == "net" and agents[b][0] == "net"
+            first_turn = bool(rng.getrandbits(1)) if both_nets else True
+            games.append(((a, b, a_is_blue), agents[blue], agents[green], first_turn))
+    rng.shuffle(games)
 
-    id_by_index = {v: k for k, v in index.items()}
     n_pairs = len(to_play)
     total_new = sum(n for _, _, n in to_play)
+    pool_size = min(args.pool_size, len(games))
     print(f"config {chash}: {n_pairs} pairs need games, {total_new} to play, "
-          f"{args.sims} sims/move, {args.workers} workers")
+          f"{args.sims} sims/move, {pool_size} games in flight", flush=True)
 
     rows, t0, done = [], time.time(), 0
     tqdm_disabled = bool(os.environ.get("TQDM_DISABLE"))
-    with multiprocessing.get_context("spawn").Pool(
-        processes=min(args.workers, len(tasks)),
-        initializer=_worker_init,
-        initargs=(specs, mcts_kwargs, engine, args.num_actions),
-    ) as pool:
-        for ia, ib, disc, a_is_blue in tqdm(
-                pool.imap_unordered(_worker_game, tasks),
-                total=len(tasks), unit="game", desc="Playing"):
-            rows.append({
-                "a": id_by_index[ia], "b": id_by_index[ib],
-                "a_is_blue": bool(a_is_blue), "result": int(disc),
-                "config_hash": chash,
-            })
-            done += 1
-            if len(rows) >= 20:                      # periodic flush (crash-safe;
-                edb.append_matches(rows)             # engine games can be ~1 min
-                rows = []                            # each, keep the loss window small)
-            if tqdm_disabled and done % 25 == 0:     # heartbeat for redirected logs
-                dt = time.time() - t0
-                print(f"  {done}/{len(tasks)} games  {dt/done:.1f}s/game  "
-                      f"eta {(len(tasks)-done)*dt/done/60:.0f}m", flush=True)
+    for r in tqdm(tournament_pool(nets, games, mcts_kwargs, pool_size=pool_size),
+                  total=len(games), unit="game", desc="Playing"):
+        a_id, b_id, a_is_blue = r["tag"]
+        # Pool results are Blue-perspective; sign to a, then discretise the
+        # material-ratio truncation result to a win/draw/loss.
+        result = r["blue_result"] if a_is_blue else -r["blue_result"]
+        disc = 1 if result > 1e-9 else (-1 if result < -1e-9 else 0)
+        rows.append({
+            "a": a_id, "b": b_id,
+            "a_is_blue": bool(a_is_blue), "result": int(disc),
+            "config_hash": chash,
+        })
+        done += 1
+        if len(rows) >= 20:                      # periodic flush (crash-safe;
+            edb.append_matches(rows)             # engine games can be ~1 min
+            rows = []                            # each, keep the loss window small)
+        if tqdm_disabled and done % 25 == 0:     # heartbeat for redirected logs
+            dt = time.time() - t0
+            print(f"  {done}/{len(games)} games  {dt/done:.2f}s/game  "
+                  f"eta {(len(games)-done)*dt/done/60:.0f}m", flush=True)
     edb.append_matches(rows)
-    print(f"Played {total_new} games in {time.time() - t0:.0f}s -> {edb.MATCHES_PATH}")
+    dt = time.time() - t0
+    print(f"Played {total_new} games in {dt:.0f}s ({dt/max(1,total_new):.2f}s/game) "
+          f"-> {edb.MATCHES_PATH}")
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +520,11 @@ def main():
     a.add_argument("--vs", default="neighbors", choices=["neighbors", "net", "all"])
     a.add_argument("--games", type=int, default=12, help="target games per pair (default 12)")
     a.add_argument("--sims", type=int, default=edb.DEFAULT_CONFIG["sims"])
-    a.add_argument("--workers", type=int, default=6)
+    a.add_argument("--pool-size", type=int, default=_env_int("T7G_EVAL_POOL", 64),
+                   help="concurrent games batched into each forward pass "
+                        "(default 64, or T7G_EVAL_POOL).  Extra concurrency is "
+                        "near-free in wall-clock; the cap is arena memory -- "
+                        "each slot holds one MCGS per net it plays")
     a.add_argument("--num-actions", type=int, default=1225)
     a.set_defaults(func=cmd_add)
 

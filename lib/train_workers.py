@@ -3,6 +3,7 @@ Game-logic helpers for AlphaZero self-play training.
 
 Stateless (no module-level globals) to allow multiprocessing.
 """
+import os
 import time
 
 import numpy as np
@@ -109,11 +110,35 @@ def _q_blend_weight(
 # In-process game pool - batched inference across concurrent games
 # ---------------------------------------------------------------------------
 
+# Self-play has no move cap: the halfmove clock terminates every game.  Only a
+# clone resets the clock (tick_clock), only a clone adds a piece, and the board
+# holds 49 from a start of 4 -- so a game admits at most 45 clock resets and must
+# end within ~46 * CLOCK_LIMIT plies.  This valve is an order of magnitude above
+# that bound and exists solely to stop a rules bug from hanging a training run;
+# it is not a data-shaping parameter.  (Rating paths keep their own 200-move cap
+# -- see _t_apply -- because the eval DB's ratings were measured under it.)
+MOVE_SAFETY_VALVE = 50_000
+
+# Count of positions where the search returned an all-zero policy despite legal
+# moves existing -- the slab-overflow signature (see the recovery in
+# _advance_group).  Recovery is silent by design, so without this counter the
+# only symptom is a sub-0.1 dip in examples-per-game, which rounds away in the
+# logs.  Read and reset once per iteration via take_spurious_zero_count().
+_SPURIOUS_ZERO_COUNT = 0
+
+
+def take_spurious_zero_count() -> int:
+    """Return the spurious-all-zero (slab overflow) count and reset it."""
+    global _SPURIOUS_ZERO_COUNT
+    n, _SPURIOUS_ZERO_COUNT = _SPURIOUS_ZERO_COUNT, 0
+    return n
+
+
 class _GameSlot:
     """State for one concurrent game inside self_play_game_pool."""
 
     __slots__ = [
-        'board', 'turn', 'examples', 'move_count', 'truncated',
+        'board', 'turn', 'examples', 'move_count',
         'clock', 'legal_move_counts', 'game_start',
         'search', 'mcts', 'full_move',
     ]
@@ -124,7 +149,6 @@ class _GameSlot:
         self.turn = bool(np.random.randint(2))
         self.examples: list = []
         self.move_count = 0
-        self.truncated = False
         self.clock = 0     # halfmove clock: plies since the last clone move
         self.legal_move_counts: list = []
         self.game_start = time.time()
@@ -136,6 +160,8 @@ def _slot_result(
     slot: _GameSlot,
     winner: float,
     blend_alpha: float = 1.0,
+    value_lambda: float | None = None,
+    value_q_weight: float | None = None,
 ) -> tuple:
     """Package a finished slot into a result tuple matching self_play_game_pool's yield contract.
 
@@ -159,10 +185,11 @@ def _slot_result(
         game end, so s -> z as l -> 1 and late positions approach z.  Fast
         (PCR) moves contribute their shallow root Q: individually noisy but
         damped by the average.
-    winner            : +1.0 Blue / −1.0 Green / material ratio for truncated games
+    winner            : +1.0 Blue / −1.0 Green / 0.0 draw.  Always a genuine
+        rules outcome -- self-play has no move cap, so there is no
+        material-ratio approximation here (see MOVE_SAFETY_VALVE).
     move_count        : number of half-moves played
     elapsed           : wall time in seconds
-    truncated         : True if the 200-move cap triggered
     legal_move_counts : per-position branching factor samples
     """
     blue, green = count_cells(slot.board)
@@ -183,22 +210,48 @@ def _slot_result(
     # (perspective flips between examples are just sign flips there), one
     # column per lambda.  acc starts at the terminal outcome = the value of
     # every ply beyond game end.
+    # One backward pass covers the aux short-term horizons AND (when enabled)
+    # the main value target's lambda -- it is the same recursion, so the main
+    # target rides along as an extra column rather than a second sweep.
     n_ex = len(slot.examples)
-    lambdas = np.asarray(ST_LAMBDAS, dtype=np.float32)
-    st_blue = np.empty((n_ex, len(ST_LAMBDAS)), dtype=np.float32)
-    acc = np.full(len(ST_LAMBDAS), winner, dtype=np.float32)
+    n_st = len(ST_LAMBDAS)
+    all_lams = list(ST_LAMBDAS) + ([value_lambda] if value_lambda is not None else [])
+    lambdas = np.asarray(all_lams, dtype=np.float32)
+    st_blue = np.empty((n_ex, len(all_lams)), dtype=np.float32)
+    acc = np.full(len(all_lams), winner, dtype=np.float32)
     for j in range(n_ex - 1, -1, -1):
         _, _, j_turn, _, j_q, _, _ = slot.examples[j]
         q_blue = j_q if j_turn else -j_q
         acc = (1.0 - lambdas) * q_blue + lambdas * acc
         st_blue[j] = acc
+    vt_blue = st_blue[:, n_st] if value_lambda is not None else None
+    st_blue = st_blue[:, :n_st]
 
     examples = []
     for i, (obs, policy_target, example_turn, ex_board, _root_q, move_idx, full_move) in \
             enumerate(slot.examples):
         value_target = winner if example_turn else -winner
         st_targets = st_blue[i] if example_turn else -st_blue[i]
-        if full_move:
+        if value_lambda is not None:
+            # Main value target = lambda-return over future root Q.  It rides
+            # the root_q slot because lib/training.py already routes that slot
+            # through the SOFT W/D/L distribution [(1+v)/2, 0, (1-v)/2]; the z
+            # slot is thresholded at +-0.33, which would quantize ~half of a
+            # lambda-return away.  The slot therefore means "search-derived
+            # value target here", not "root Q at this node".
+            # q_weight is a constant, NOT the noise-ramp gate: the ramp exists
+            # to down-weight Q where z is trustworthy, but the lambda-return is
+            # a better estimate of the outcome than z at every ply (measured:
+            # split-half fidelity 0.257-0.269 vs z's 0.198).  The residual
+            # 1 - value_q_weight stays on the true outcome, which anchors
+            # against bootstrap drift and is the only teacher of DRAW mass
+            # (q_dist assigns none).  PCR fast rows keep their value target --
+            # only the policy target is zeroed for them.
+            root_q = float(vt_blue[i] if example_turn else -vt_blue[i])
+            q_weight = value_q_weight
+            if not full_move:
+                policy_target = np.zeros_like(policy_target)
+        elif full_move:
             root_q = _root_q
             q_weight = _q_blend_weight(
                 move_idx=move_idx, policy_target=policy_target,
@@ -217,7 +270,7 @@ def _slot_result(
         examples.append((obs, policy_target, value_target, margin, ownership,
                          ex_board, example_turn, root_q, q_weight, st_targets))
     elapsed = time.time() - slot.game_start
-    return examples, winner, slot.move_count, elapsed, slot.truncated, slot.legal_move_counts
+    return examples, winner, slot.move_count, elapsed, slot.legal_move_counts
 
 
 def _start_slot_search(
@@ -250,7 +303,6 @@ def _reset_slot(slot: _GameSlot) -> None:
     slot.turn = bool(np.random.randint(2))
     slot.examples = []
     slot.move_count = 0
-    slot.truncated = False
     slot.clock = 0
     slot.legal_move_counts = []
     slot.game_start = time.time()
@@ -266,6 +318,8 @@ def _advance_group(
     full_sims: int = 0,
     pcr_p_full: float = 1.0,
     pcr_fast_sims: int = 100,
+    value_lambda: float | None = None,
+    value_q_weight: float | None = None,
 ) -> tuple[list, int, list]:
     """
     Step each slot's search once, handle completed searches (apply MCTS move,
@@ -299,7 +353,8 @@ def _advance_group(
             if is_terminal:
                 assert terminal_value is not None
                 winner = terminal_value if slot.turn else -terminal_value
-                results.append(_slot_result(slot, winner, blend_alpha))
+                results.append(_slot_result(slot, winner, blend_alpha,
+                                            value_lambda, value_q_weight))
                 if games_started < target_games:
                     _reset_slot(slot)
                     _start_slot_search(slot, full_sims, pcr_p_full, pcr_fast_sims)
@@ -311,6 +366,8 @@ def _advance_group(
             if np.any(action_masks(slot.board, slot.turn)):
                 # Spurious all-zero: recover with uniform over legal moves;
                 # skip adding this position as a training example.
+                global _SPURIOUS_ZERO_COUNT
+                _SPURIOUS_ZERO_COUNT += 1
                 masks = action_masks(slot.board, slot.turn)
                 action_probs = masks.astype(np.float32)
                 action_probs /= action_probs.sum()
@@ -323,18 +380,8 @@ def _advance_group(
                 slot.move_count += 1
                 slot.clock += 1
                 if slot.clock >= CLOCK_LIMIT:
-                    results.append(_slot_result(slot, 0.0, blend_alpha))
-                    if games_started < target_games:
-                        _reset_slot(slot)
-                        _start_slot_search(slot, full_sims, pcr_p_full, pcr_fast_sims)
-                        next_active.append(slot)
-                        games_started += 1
-                elif slot.move_count > 200:
-                    blue, green = count_cells(slot.board)
-                    winner = (float(blue - green) / float(blue + green)
-                              if blue + green > 0 else 0.0)
-                    slot.truncated = True
-                    results.append(_slot_result(slot, winner, blend_alpha))
+                    results.append(_slot_result(slot, 0.0, blend_alpha,
+                                                value_lambda, value_q_weight))
                     if games_started < target_games:
                         _reset_slot(slot)
                         _start_slot_search(slot, full_sims, pcr_p_full, pcr_fast_sims)
@@ -374,14 +421,15 @@ def _advance_group(
         elif slot.clock >= CLOCK_LIMIT:
             winner = 0.0  # halfmove clock expired = draw (libataxx rule)
             done = True
-        elif slot.move_count > 200:
-            blue, green = count_cells(slot.board)
-            winner = float(blue - green) / float(blue + green) if blue + green > 0 else 0.0
-            slot.truncated = True
+        elif slot.move_count > MOVE_SAFETY_VALVE:
+            # Unreachable under the rules (see MOVE_SAFETY_VALVE); a hit means a
+            # clock/rules bug, so score it a draw rather than spin forever.
+            winner = 0.0
             done = True
 
         if done:
-            results.append(_slot_result(slot, winner, blend_alpha))
+            results.append(_slot_result(slot, winner, blend_alpha,
+                                            value_lambda, value_q_weight))
             if games_started < target_games:
                 _reset_slot(slot)
                 _start_slot_search(slot, full_sims, pcr_p_full, pcr_fast_sims)
@@ -409,6 +457,8 @@ def self_play_game_pool(
     blend_alpha: float = 1.0,
     pcr_p_full: float = 1.0,
     pcr_fast_sims: int = 100,
+    value_lambda: float | None = None,
+    value_q_weight: float | None = None,
 ):
     """
     Play target_games games concurrently with batched network inference.
@@ -431,7 +481,7 @@ def self_play_game_pool(
     previous call's last move, so the driver's is the authoritative one).
 
     Yields result tuples as each game completes:
-        (training_examples, winner, move_count, elapsed, truncated, legal_move_counts)
+        (training_examples, winner, move_count, elapsed, legal_move_counts)
     """
     full_sims = mcts.num_simulations
     if mcts_pool is not None:
@@ -468,6 +518,7 @@ def self_play_game_pool(
         active_a, games_started, results = _advance_group(
             active_a, target_games, games_started, temp_moves, blend_alpha,
             full_sims, pcr_p_full, pcr_fast_sims,
+            value_lambda, value_q_weight,
         )
         for r in results:
             yield r
@@ -479,11 +530,459 @@ def self_play_game_pool(
         active_b, games_started, results = _advance_group(
             active_b, target_games, games_started, temp_moves, blend_alpha,
             full_sims, pcr_p_full, pcr_fast_sims,
+            value_lambda, value_q_weight,
         )
         for r in results:
             yield r
         handle_b = (mcts._launch_forward([s.search for s in active_b])
                     if active_b else None)
+
+
+# ---------------------------------------------------------------------------
+# In-process tournament pool - batched inference across concurrent eval games
+# ---------------------------------------------------------------------------
+#
+# The single-game path below (play_eval_game / play_net_vs_net_game) drives one
+# search at a time: measured 147 forward passes per 500-sim move with a mean
+# batch of 3.35 pending leaves, i.e. ~2.5k sim/s against self-play's 80k+.  Eval
+# was ~38% of run wall-clock at that rate.  This pool plays MANY eval games
+# concurrently and batches their pending leaves into one forward per network per
+# step, exactly like self_play_game_pool - same double-buffered launch/collect,
+# so CPU work on one half overlaps the GPU pass on the other.
+#
+# Search semantics per game are UNCHANGED (same sims, same start_search /
+# step / commit mechanism the single-game path already uses through
+# _expand_batch); only the batch grows.  Anchor Elos therefore stay valid.
+#
+# Engine (minimax/Stauf) moves run SERIALLY in the driver thread on purpose:
+# the C solvers in src/bb_core.h share a module-global transposition table and
+# history-heuristic array, so find_best_move is not reentrant and must never be
+# called from a worker thread.  Serial also keeps the TT access pattern the same
+# as the per-process single-game path.  The cost hides behind the other half's
+# in-flight forward pass.
+#
+# Agents are:
+#     ("net", key)                                 - MCGS player on nets[key]
+#     ("engine", depth, noise, engine, vary_depth) - CPU player
+# Games are (tag, blue_agent, green_agent, first_turn); `tag` is opaque to the
+# pool and comes back on the result so callers can attribute the game.
+
+class _TourneySlot:
+    """State for one concurrent game inside tournament_pool."""
+
+    __slots__ = [
+        'tag', 'blue', 'green', 'board', 'turn', 'clock', 'move_count',
+        'stauf_moves', 'search', 'mover', 'mcts', 'result', 'end_reason',
+    ]
+
+    def __init__(self) -> None:
+        self.mcts: dict = {}      # net key -> MCGS instance (reused per slot)
+        self.tag = None
+        self.blue: tuple = ()
+        self.green: tuple = ()
+        self.board = new_board()
+        self.turn = True
+        self.clock = 0
+        self.move_count = 0
+        self.stauf_moves = 0
+        self.search: MCGSSearch | None = None
+        self.mover = None         # net key whose search is in flight
+        self.result = 0.0         # Blue-perspective result
+        self.end_reason = "terminal"
+
+
+def _t_settle(slot: _TourneySlot) -> bool:
+    """Advance `slot` past terminal checks and forced passes.
+
+    Returns True if the game ended (slot.result / slot.end_reason set), False if
+    the side to move has a legal move and must now choose one.  Mirrors the top
+    of play_eval_game's and play_net_vs_net_game's while-loop exactly: terminal
+    first, then the halfmove clock, then a pass - on which the turn flips and
+    the clock ticks but move_count does NOT advance.
+    """
+    while True:
+        is_terminal, terminal_value = check_terminal(slot.board, slot.turn)
+        if is_terminal:
+            assert terminal_value is not None
+            slot.result = terminal_value if slot.turn else -terminal_value
+            slot.end_reason = "terminal"
+            return True
+        if slot.clock >= CLOCK_LIMIT:
+            slot.result = 0.0     # halfmove clock expired = draw (libataxx rule)
+            slot.end_reason = "clock"
+            return True
+        if not np.any(action_masks(slot.board, slot.turn)):
+            slot.turn = not slot.turn
+            slot.clock += 1
+            continue
+        return False
+
+
+def _t_apply(slot: _TourneySlot, action: int) -> bool:
+    """Play `action` on `slot`; return True if the 200-move cap ended the game."""
+    slot.board = apply_move(slot.board, action, slot.turn)
+    slot.turn = not slot.turn
+    slot.move_count += 1
+    slot.clock = tick_clock(slot.clock, action)
+    if slot.move_count > 200:
+        blue, green = count_cells(slot.board)
+        slot.result = (float(blue - green) / float(blue + green)
+                       if blue + green > 0 else 0.0)
+        slot.end_reason = "truncated"
+        return True
+    return False
+
+
+def _t_engine_move(slot: _TourneySlot, agent: tuple) -> bool:
+    """Play one engine move on `slot`; return True if the game ended.
+
+    Faithful to play_eval_game's opponent branch, including drawing the noise
+    coin unconditionally and treating a -1/1225 return as a pass.  Single-slot
+    path; the pool uses _t_engine_moves to batch these across slots.
+    """
+    action = _t_engine_moves([(slot, agent)], 0)[0]
+    if action is None:
+        slot.turn = not slot.turn
+        slot.clock += 1
+        return False
+    return _t_apply(slot, action)
+
+
+# A minimax move is the most expensive single thing in an eval and it is pure
+# CPU: measured 117 ms/move for micro3 at depth 7 in the midgame (218 ms average
+# over a whole game), so the 16 MM7 games in one Elo phase are minutes of work
+# that would otherwise stall the pool one move at a time.
+#
+# It cannot simply be threaded: bb_core.h keeps the transposition table and
+# history heuristic in module-global state, so one loaded copy of a solver is
+# not reentrant.  dlopen'ing distinct COPIES of the .so gives each thread its
+# own globals, and ctypes releases the GIL around the call - verified to return
+# bit-identical moves to the shared-library path, at ~2.3x on 8 threads (the
+# per-copy 2^20-entry TT limits scaling; it is not linear).
+#
+# Depth <= 4 costs a few ms, below the hand-off, so those stay inline.
+_ENGINE_MIN_DEPTH_THREADED = 5
+# Absolute throughput on one board kept improving with fleet size on an 8-core
+# desktop (74 -> 50 -> 42 ms/move at 4/8/16 threads), so size from the machine.
+# Eval is the only thing running at eval time, so taking the cores is free.
+_ENGINE_MAX_THREADS = min(os.cpu_count() or 4, 16)
+
+# engine name -> (.so basename, symbol).  Only the (board, depth, as_blue) ->
+# int solvers can join a fleet; Stauf takes an extra move index and the UAI
+# engines are subprocess-backed, so both stay on the inline path.
+_FLEET_ENGINES = {
+    "micro3":  ("micro3", "find_best_move"),
+    "micro4":  ("micro4", "find_best_move"),
+    "minimax": ("micro4", "find_best_move"),
+}
+_solver_fleets: dict = {}       # (engine, n) -> [callable, ...]
+_solver_executor = None
+
+
+def _get_solver_fleet(engine: str, n: int) -> list:
+    """Return n independently-loaded solver entry points for `engine`.
+
+    Cached module-level: the copies and their TTs are reused by every eval phase
+    for the life of the process.
+    """
+    import shutil
+    import tempfile
+    key = (engine, n)
+    fleet = _solver_fleets.get(key)
+    if fleet is None:
+        import ctypes
+        from lib.t7g import _find_dll
+        basename, symbol = _FLEET_ENGINES[engine]
+        src = str(_find_dll(basename))
+        tmpdir = tempfile.mkdtemp(prefix="t7g_solver_fleet_")
+        fleet = []
+        for i in range(n):
+            copy = f"{tmpdir}/{basename}_{i}.so"
+            shutil.copy(src, copy)
+            lib = ctypes.CDLL(copy)
+            fn = getattr(lib, symbol)
+            fn.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_bool]
+            fn.restype = ctypes.c_int
+            fleet.append(fn)
+        _solver_fleets[key] = fleet
+    return fleet
+
+
+def _get_solver_executor(n: int):
+    global _solver_executor
+    if _solver_executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _solver_executor = ThreadPoolExecutor(max_workers=n,
+                                              thread_name_prefix="t7g-solver")
+    return _solver_executor
+
+
+def _t_engine_moves(reqs: list, threads: int) -> list:
+    """Resolve one engine move for each (slot, agent) in `reqs`.
+
+    Returns a list of actions positionally matching `reqs`, with None meaning
+    "no move available - pass".  Noise coins, depth jitter and Stauf's move
+    index are all drawn HERE so the threaded solvers stay pure functions of
+    their arguments and the RNG stream stays in the driver.
+    """
+    out: list = [None] * len(reqs)
+    farmed: dict = {}       # engine -> [(out_idx, board_bytes, depth, turn), ...]
+    for i, (slot, agent) in enumerate(reqs):
+        _, depth, noise, engine, vary_depth = agent
+        legal = np.where(action_masks(slot.board, slot.turn))[0]
+        if np.random.random() < noise:
+            out[i] = int(np.random.choice(legal))
+            continue
+        d = int(np.random.choice([4, depth])) if vary_depth else depth
+        if engine in UAI_ENGINES:
+            from lib.uai_engine import get_worker_engine
+            out[i] = get_worker_engine(engine).find_best_move(slot.board, d, slot.turn)
+            continue
+        if (threads > 1 and d >= _ENGINE_MIN_DEPTH_THREADED
+                and engine in _FLEET_ENGINES):
+            farmed.setdefault(engine, []).append(
+                (i, slot.board.tobytes(), d, slot.turn))
+            continue
+        if engine == 'stauf':
+            # Canonical Stauf: pass the cumulative move index so its internal
+            # depths[] cycle matches the real game (see play_eval_game).
+            out[i] = find_best_move(slot.board.tobytes(), d, slot.turn, engine,
+                                    slot.stauf_moves)
+            slot.stauf_moves += 1
+        else:
+            out[i] = find_best_move(slot.board.tobytes(), d, slot.turn, engine)
+    for engine, batch in farmed.items():
+        fleet = _get_solver_fleet(engine, threads)
+        ex = _get_solver_executor(threads)
+        # Chunked to len(fleet): each in-flight call must own a private copy of
+        # the solver, or the shared TT race is back.
+        for start in range(0, len(batch), len(fleet)):
+            chunk = batch[start:start + len(fleet)]
+            for (i, *_), action in zip(chunk, ex.map(
+                    lambda a: a[0](a[1], a[2], a[3]),
+                    [(fleet[j], bb, d, t) for j, (_, bb, d, t) in enumerate(chunk)])):
+                out[i] = action
+    return [None if a in (-1, 1225) else a for a in out]
+
+
+def _t_result(slot: _TourneySlot) -> dict:
+    """Package a finished slot.  Results are Blue-perspective; the caller signs
+    them for whichever side it cares about."""
+    blue, green = count_cells(slot.board)
+    return {
+        "tag": slot.tag,
+        "blue_result": slot.result,
+        "blue_margin": int(blue - green),
+        "moves": slot.move_count,
+        "end_reason": slot.end_reason,
+    }
+
+
+def tournament_pool(
+    nets: dict,
+    games: list,
+    mcts_kwargs: dict,
+    pool_size: int = 64,
+    engine_threads: int | None = None,
+):
+    """
+    Play a list of eval games concurrently, batching inference across games.
+
+    nets:  {key: nn.Module} covering every ("net", key) agent in `games`.
+    games: [(tag, blue_agent, green_agent, first_turn), ...] - see the module
+           section header for the agent forms.  first_turn is the side to move
+           from the standard start position (play_eval_game uses True; the
+           net-vs-net gate randomises it).
+    pool_size: concurrent games.  A 500-sim search needs ~147 sequential
+           forwards no matter how many games are in flight, and each forward
+           costs about the same whether it carries 10 leaves or 200 (it is
+           latency-bound, not throughput-bound), so wall time is set by the
+           NUMBER of forwards and every extra concurrent game rides along for
+           free.  The cap is memory: each slot holds one MCGS per net it plays
+           and an arena at 500 sims touches tens of MB over a full game.
+    engine_threads: threads for expensive minimax moves, each with its own
+           dlopen'd copy of the solver (None = auto, 0/1 = inline in the
+           driver).
+
+    Yields one dict per finished game (see _t_result) in completion order.
+    """
+    if not games:
+        return
+    drivers = {k: MCGS(net, **mcts_kwargs) for k, net in nets.items()}
+    any_driver = next(iter(drivers.values()), None)
+    n_slots = min(pool_size, len(games))
+    slots = [_TourneySlot() for _ in range(n_slots)]
+    queue = iter(range(len(games)))
+
+    # Thread the engine moves out only when some engine in this tournament is
+    # deep enough to be worth it (see _ENGINE_MIN_DEPTH_THREADED).
+    if engine_threads is None:
+        deep = any(a[0] == "engine" and a[1] >= _ENGINE_MIN_DEPTH_THREADED
+                   and a[3] in _FLEET_ENGINES
+                   for _, blue, green, _ in games for a in (blue, green))
+        engine_threads = min(n_slots, _ENGINE_MAX_THREADS) if deep else 0
+
+    def _begin(slot: _TourneySlot, gi: int) -> None:
+        tag, blue, green, first_turn = games[gi]
+        slot.tag, slot.blue, slot.green = tag, blue, green
+        slot.board = new_board()
+        slot.turn = bool(first_turn)
+        slot.clock = 0
+        slot.move_count = 0
+        slot.stauf_moves = 0
+        slot.search = None
+        slot.mover = None
+        slot.result = 0.0
+        slot.end_reason = "terminal"
+        for agent in (blue, green):
+            if agent[0] == "net":
+                key = agent[1]
+                if key not in slot.mcts:
+                    slot.mcts[key] = MCGS(nets[key], **mcts_kwargs)
+                # Fresh tree per game: the TT persists across moves, so it must
+                # be cleared between games (the single-game path built a new
+                # MCGS per game for exactly this reason).
+                slot.mcts[key].clear()
+
+    def _start_next_game(slot: _TourneySlot) -> bool:
+        """Put the next queued game on `slot` (undriven).  False if none left."""
+        for gi in queue:
+            _begin(slot, gi)
+            return True
+        return False
+
+    # Slots owing an engine move, parked until a fleet-sized batch accumulates.
+    # Resolving them the moment they appear is what made the thread fleet
+    # useless in the first place: searches drift out of phase within a few
+    # plies, so only 0-2 slots ever want an engine move at the same instant
+    # (measured mean batch 0.6) and the deep-minimax games ran serially.
+    waiting: list = []
+    flush_at = max(1, engine_threads)
+
+    def _drive(work: list) -> tuple[list, list]:
+        """Settle each slot in `work`, then either start its search or park it.
+
+        Returns (slots now holding a live search, results for games that ended).
+        """
+        active: list = []
+        results: list = []
+        for slot in work:
+            while True:
+                if _t_settle(slot):
+                    results.append(_t_result(slot))
+                    if _start_next_game(slot):
+                        continue            # same slot, next queued game
+                    break
+                agent = slot.blue if slot.turn else slot.green
+                if agent[0] == "net":
+                    slot.mover = agent[1]
+                    slot.search = slot.mcts[agent[1]].start_search(
+                        slot.board, slot.turn, clock=slot.clock)
+                    active.append(slot)
+                else:
+                    waiting.append((slot, agent))
+                break
+        return active, results
+
+    def _flush_engine() -> tuple[list, list]:
+        """Resolve every parked engine move in one batch, then re-drive."""
+        batch, waiting[:] = list(waiting), []
+        results: list = []
+        work: list = []
+        for (slot, agent), action in zip(batch,
+                                         _t_engine_moves(batch, engine_threads)):
+            if action is None:                  # no legal move: pass
+                slot.turn = not slot.turn
+                slot.clock += 1
+            elif _t_apply(slot, action):        # move cap ended the game
+                results.append(_t_result(slot))
+                if not _start_next_game(slot):
+                    continue
+            work.append(slot)
+        active, more = _drive(work)
+        return active, results + more
+
+    def _launch(group: list) -> list:
+        """One forward per distinct network to move in `group`.
+
+        The count of these calls is what eval wall-clock is made of (each costs
+        ~1.3-1.8 ms of dispatch regardless of batch size), so the pool keeps
+        every slot in ONE stage and issues the minimum: one launch per network
+        that has a search waiting.  With both players' games phase-aligned that
+        is usually 1-2 per step for the whole pool.
+        """
+        by_net: dict = {}
+        for slot in group:
+            by_net.setdefault(slot.mover, []).append(slot.search)
+        return [drivers[k]._launch_forward(v) for k, v in by_net.items()]
+
+    def _advance(group: list) -> tuple[list, list]:
+        """Step every search, play the moves that completed, re-drive their slots."""
+        rerun: list = []
+        keep: list = []
+        done_flags = step_searches([slot.search for slot in group])
+        for slot, search_done in zip(group, done_flags):
+            if not search_done:
+                keep.append(slot)
+                continue
+            action_probs = slot.search.result
+            best_action = slot.search.best_action
+            if not np.any(action_probs):
+                # Slab overflow: recover with uniform-over-legal, same as the
+                # self-play pool.  A genuine pass or terminal cannot appear here
+                # - _drive only starts a search when a legal move exists.
+                masks = action_masks(slot.board, slot.turn).astype(np.float32)
+                action_probs = masks / masks.sum()
+                best_action = -1
+            action = drivers[slot.mover].select_action(
+                action_probs, board=slot.board, turn=slot.turn,
+                temperature=0, best_action=best_action,
+            )
+            slot.search = None
+            rerun.append((slot, _t_apply(slot, action)))
+        results: list = []
+        work: list = []
+        for slot, ended in rerun:
+            if ended:
+                results.append(_t_result(slot))
+                if not _start_next_game(slot):
+                    continue
+            work.append(slot)
+        active, more = _drive(work)
+        return keep + active, results + more
+
+    try:
+        work = []
+        for slot in slots:
+            if _start_next_game(slot):
+                work.append(slot)
+        active, results = _drive(work)
+        for r in results:
+            yield r
+
+        handles = _launch(active) if active else []
+        while active or waiting:
+            if handles:
+                for h in handles:
+                    any_driver._collect_and_commit(h)  # handle carries its slabs
+                active, results = _advance(active)
+                for r in results:
+                    yield r
+            # Flush when a full batch has piled up, or when the search side has
+            # nothing left to do (which is also what guarantees progress).
+            if waiting and (len(waiting) >= flush_at or not active):
+                more_active, results = _flush_engine()
+                active = active + more_active
+                for r in results:
+                    yield r
+            handles = _launch(active) if active else []
+    finally:
+        # Free the arenas promptly - at 500 sims a full game touches tens of MB
+        # per instance, and the self-play pool's 256-512 instances are still
+        # alive alongside these.
+        for slot in slots:
+            slot.mcts.clear()
+        drivers.clear()
 
 
 # ---------------------------------------------------------------------------

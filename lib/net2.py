@@ -245,7 +245,13 @@ class Net2(nn.Module):
 def build_from_state_dict(state_dict: dict, num_actions: int = 1225) -> nn.Module:
     """Construct the right network class (Net2 or legacy DualHeadNetwork) for
     an arbitrary checkpoint and load its weights."""
-    if Net2.is_net2_state_dict(state_dict):
+    from lib.net2c import Net2C
+    from lib.net3 import Net3
+    if Net3.is_net3_state_dict(state_dict):
+        net = Net3(num_actions=num_actions, **Net3.infer_arch(state_dict))
+    elif Net2C.is_net2c_state_dict(state_dict):
+        net = Net2C(num_actions=num_actions, **Net2C.infer_arch(state_dict))
+    elif Net2.is_net2_state_dict(state_dict):
         net = Net2(num_actions=num_actions, **Net2.infer_arch(state_dict))
     else:
         from lib.dual_network import DualHeadNetwork

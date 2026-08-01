@@ -256,6 +256,11 @@ def train_network(
                 pred_logits, pred_value, pred_margin = network(t_obs)
                 v_logits = own_logits = soft_logits = None
 
+            # Zero that still carries a gradient path, standing in for the heads
+            # a given architecture does not have (net2c drops margin and soft
+            # policy).  Defined here so every loss branch below can reach it.
+            zero = pred_value.sum() * 0.0
+
             if mask_illegal and pred_logits.shape[-1] == 1225:
                 # Illegal logits get -inf pre-softmax: zero gradient on them,
                 # and the softmax normalizes over legal moves only.  Inference
@@ -287,7 +292,7 @@ def train_network(
                 else:
                     soft_policy_loss = t_policy.sum() * 0.0
             else:
-                soft_policy_loss = pred_margin.sum() * 0.0
+                soft_policy_loss = zero
 
             if v_logits is not None:
                 # W/D/L cross-entropy: classes from the scalar target
@@ -320,15 +325,19 @@ def train_network(
                 value_loss = F.mse_loss(pred_value, t_value_eff)
 
             # Masked MSE: only examples that carry a margin target contribute.
-            m_sq        = (pred_margin - t_margin) ** 2 * t_has_m
-            margin_loss = m_sq.sum() / t_has_m.sum().clamp(min=1.0)
+            # net2c has no margin head (the target restates z -- see lib/net2c.py).
+            if pred_margin is not None and margin_coef > 0:
+                m_sq        = (pred_margin - t_margin) ** 2 * t_has_m
+                margin_loss = m_sq.sum() / t_has_m.sum().clamp(min=1.0)
+            else:
+                margin_loss = zero
 
             if own_logits is not None and ownership_coef > 0:
                 own_cell = F.cross_entropy(own_logits, t_own, reduction="none")  # (B,7,7)
                 own_ex   = own_cell.mean(dim=(1, 2)) * t_has_own
                 ownership_loss = own_ex.sum() / t_has_own.sum().clamp(min=1.0)
             else:
-                ownership_loss = pred_margin.sum() * 0.0
+                ownership_loss = zero
 
             st_preds = out.get("st_values") if use_full else None
             if st_preds is not None and st_value_coef > 0:
@@ -337,7 +346,7 @@ def train_network(
                 st_sq = ((st_preds - t_st) ** 2).mean(dim=-1) * t_has_st
                 st_value_loss = st_sq.sum() / t_has_st.sum().clamp(min=1.0)
             else:
-                st_value_loss = pred_margin.sum() * 0.0
+                st_value_loss = zero
 
             entropy     = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1).mean()
 
