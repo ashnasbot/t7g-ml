@@ -104,6 +104,10 @@ const aiName = () => OPPONENTS[opponent]?.label ?? 'Opponent';
 // number, and drop to wasm if the answer is wrong.
 //
 // Two distinct positions, batched, each compared against itself run alone.
+// The second is deliberately a DENSE board: net2c routes its value readout
+// through phase buckets picked from board occupancy, so a near-empty pair would
+// only ever exercise bucket 0 and an EP that got the routing wrong would pass
+// this check while playing nonsense from the midgame on.
 async function batchIsSane() {
   const one = () => {
     const o = new Float32Array(196);
@@ -111,7 +115,8 @@ async function batchIsSane() {
     return o;
   };
   const a = one(), b = one();
-  b[0] = 1; b[4 * 4 + 1] = 1;                        // two stones, so b differs from a
+  a[0] = 1; a[4 * 4 + 1] = 1;                        // opening-ish: two stones
+  for (let c = 0; c < 42; c++) b[c * 4 + (c & 1)] = 1;  // 42 stones -> the last bucket
   const pair = new Float32Array(392);
   pair.set(a, 0); pair.set(b, 196);
 
